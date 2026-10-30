@@ -15,6 +15,7 @@ Run:  python3 pingmonitor.py [--host 127.0.0.1] [--port 8080] [--db pingmonitor.
 """
 import argparse
 import asyncio
+import base64
 import getpass
 import hashlib
 import hmac
@@ -51,7 +52,7 @@ try:
 except ImportError:  # pragma: no cover
     ZoneInfo = None
 
-from flask import (Flask, abort, flash, jsonify, redirect, render_template_string,
+from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_from_directory, session, url_for)
 
 VERSION = "2.1"
@@ -1413,10 +1414,26 @@ _login_fail = {}
 
 
 def client_ip():
-    # Trust Cloudflare's header only when the request comes from the local cloudflared
-    if request.remote_addr in ("127.0.0.1", "::1") and request.headers.get("CF-Connecting-IP"):
-        return request.headers["CF-Connecting-IP"]
-    return request.remote_addr
+    """Address used for the login lockout.
+
+    The service listens on every interface. Two kinds of visitor reach it:
+
+    * A PC on the LAN connects directly. ``remote_addr`` is that PC. A forged
+      ``CF-Connecting-IP`` header is ignored, so the lockout follows the PC.
+    * cloudflared on this machine connects to 127.0.0.1 (or ::1) and sets
+      ``CF-Connecting-IP`` to the real visitor. Only then is that header used,
+      and only when it is a single valid IP address.
+    """
+    peer = request.remote_addr or ""
+    if peer in ("127.0.0.1", "::1"):
+        hdr = (request.headers.get("CF-Connecting-IP") or "").strip()
+        if hdr:
+            try:
+                ipaddress.ip_address(hdr)
+            except ValueError:
+                return peer
+            return hdr
+    return peer
 
 
 def csrf_token():
@@ -1481,7 +1498,8 @@ app.jinja_env.globals.update(csrf_token=csrf_token, DEVICE_TYPES=DEVICE_TYPES, m
 CSS = """
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f1f4f9;color:#1c2b4a}
 header{background:#0b2a55;color:#fff;padding:12px 24px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
-header h1{font-size:19px;margin:0}header small{opacity:.75;font-weight:400}header a{color:#cfe1ff;text-decoration:none;margin-left:16px}
+header h1{font-size:19px;margin:0;display:flex;align-items:center;gap:10px}header small{opacity:.75;font-weight:400}header a{color:#cfe1ff;text-decoration:none;margin-left:16px}
+header .logo{height:44px;width:44px;border-radius:50%;object-fit:cover;background:#fff;flex:none}
 main{max-width:1240px;margin:0 auto;padding:20px}
 .summary{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
 .pill{padding:9px 16px;border-radius:10px;color:#fff;font-weight:700;font-size:17px}
@@ -1500,7 +1518,12 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:6px;borde
 input,select,button{font-size:14px;padding:7px 9px;border-radius:8px;border:1px solid #cbd5e1;font-family:inherit}
 button{background:#1d5fbf;color:#fff;border:none;cursor:pointer}button.sec{background:#e2e8f0;color:#1c2b4a}button.del{background:#fff;color:#dc2626;border:1px solid #fca5a5}
 .flash{background:#e0ecff;padding:10px;border-radius:8px;margin-bottom:12px}
-.form-grid{display:grid;grid-template-columns:220px 1fr;gap:8px 14px;align-items:center;max-width:820px}
+.form-grid{display:grid;grid-template-columns:220px 1fr;gap:10px 14px;align-items:start;max-width:860px}
+.form-grid>label{padding-top:7px}
+.section-intro{margin:0 0 12px;font-size:13px;color:#475569;line-height:1.45}
+.help-list{margin:0 0 12px;padding-left:18px;font-size:12px;color:#64748b;line-height:1.45}
+.help-list li{margin:3px 0}
+.form-grid .hint{display:block;margin:4px 0 0;line-height:1.4}
 .form-grid input[type=text],.form-grid input[type=password],.form-grid input[type=number],.form-grid input[type=url],.form-grid select{width:100%}
 .nav a{display:inline-block;margin:0 6px 8px 0;padding:6px 10px;background:#fff;border-radius:8px;text-decoration:none;color:#1d5fbf;font-size:13px;box-shadow:0 1px 2px rgba(0,0,0,.06)}
 .thumb{height:44px;border-radius:4px}a{color:#1d5fbf}.hint{font-size:12px;color:#64748b}
@@ -1511,9 +1534,10 @@ code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
 
 LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 {% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
+<link rel="icon" href="{{ url_for('brand_logo') }}" type="image/jpeg">
 <title>{{ s.site_name }} - Ping Monitor</title><style>""" + CSS + """</style>
 {% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body>
-<header><h1>Wirewave Ping Monitor <small>· {{ s.site_name }}</small></h1><div>
+<header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>Wirewave Ping Monitor <small>· {{ s.site_name }}</small></span></h1><div>
 <a href="{{ url_for('index') }}">Dashboard</a>
 {% if role() == 'admin' %}<a href="{{ url_for('settings') }}">Settings</a>{% endif %}
 {% if role() %}<a href="{{ url_for('logout') }}">Logout ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">Login</a>{% endif %}
@@ -1761,10 +1785,32 @@ def healthz():
     return "ok"
 
 
+# Used only when assets/wirewave_logo.jpg is not next to this script.
+LOGO_FALLBACK_B64 = "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"
+
+
+def _logo_file():
+    base = os.path.dirname(os.path.abspath(__file__))
+    for rel in ("assets/wirewave_logo.jpg", "wirewave_logo.jpg"):
+        path = os.path.join(base, rel)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+@app.route("/favicon.ico")
+@app.route("/logo.jpg")
+def brand_logo():
+    """Logo next to the script, or the copy baked into this file if that is missing."""
+    path = _logo_file()
+    if path:
+        return send_from_directory(os.path.dirname(path), os.path.basename(path),
+                                   mimetype="image/jpeg", max_age=86400)
+    return Response(base64.b64decode(LOGO_FALLBACK_B64), mimetype="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 # ----------------------------------------------------------------------------- settings page
-CSRF = '<input type="hidden" name="csrf" value="{{ csrf_token() }}">'
-
-
 def _secret_input(name):
     return ('<input type="password" name="' + name + '" autocomplete="new-password" placeholder="'
             '{{ (\'saved \' + mask(s.' + name + ') + \' - leave empty to keep\') if s.' + name + ' else \'not set\' }}">')
@@ -1775,6 +1821,15 @@ SETTINGS_BODY = """
 <a href="#receiver">Incoming e-mail (devices)</a><a href="#snmp">SNMP + traps</a><a href="#webhook">Webhook</a><a href="#api">API</a><a href="#password">Passwords</a></div>
 
 <div class="card" id="hosts"><h2>Hosts</h2>
+<p class="section-intro">Each row is one device this monitor pings. Add a camera, router, access point or server you want to watch. Save a row after you change it.</p>
+<ul class="help-list">
+<li><b>Name</b> — label on the dashboard and in alerts. Example: <code>Reception NVR</code>. Use a name you will recognise in a message.</li>
+<li><b>IP / hostname</b> — address that is pinged. Example: <code>192.168.1.50</code> or <code>nvr.lan</code>. Use the address of the device on this LAN.</li>
+<li><b>Group / location</b> — groups the cards on the dashboard. Example: <code>Cameras</code>, <code>Wi-Fi</code>, <code>Network</code>. Leave it blank on a very small site.</li>
+<li><b>Device type</b> — badge colour, and a hint when an alarm e-mail is parsed. Example: Hikvision camera / NVR. Pick the closest brand.</li>
+<li><b>On</b> — untick to stop pinging without deleting history. Use it while a device is powered off for maintenance.</li>
+<li><b>SNMP</b> — opens that host's SNMP page (community or v3 user, which ports to graph). Use it when the device answers SNMP.</li>
+</ul>
 <table><tr><th>Name</th><th>IP / hostname</th><th>Group / location</th><th>Device type</th><th>On</th><th>Status</th><th>SNMP</th><th></th></tr>
 {% for h in hosts %}<tr>
 <td><input type="text" form="hf{{ h.id }}" name="name" value="{{ h.name }}" required maxlength="60" style="width:150px"></td>
@@ -1784,8 +1839,8 @@ SETTINGS_BODY = """
 <td><input type="checkbox" form="hf{{ h.id }}" name="enabled" value="1" {{ 'checked' if h.enabled }}></td>
 <td><span class="badge {{ STATE_CLS.get(h.state,'p') if h.enabled else 'p' }}">{{ STATE_TXT.get(h.state, h.state) if h.enabled else 'OFF' }}</span></td>
 <td><a href="{{ url_for('host_snmp', hid=h.id) }}">{{ ('v' + h.scfg.version) if h.scfg.enabled else 'off' }} ⚙</a></td>
-<td style="white-space:nowrap"><form id="hf{{ h.id }}" method="post" action="{{ url_for('host_save', hid=h.id) }}" style="display:inline">""" + CSRF + """<button>Save</button></form>
-<form method="post" action="{{ url_for('host_delete', hid=h.id) }}" style="display:inline" onsubmit="return confirm('Delete {{ h.name }} and its history?')">""" + CSRF + """<button class="del">Delete</button></form></td></tr>
+<td style="white-space:nowrap"><form id="hf{{ h.id }}" method="post" action="{{ url_for('host_save', hid=h.id) }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>Save</button></form>
+<form method="post" action="{{ url_for('host_delete', hid=h.id) }}" style="display:inline" onsubmit="return confirm('Delete {{ h.name }} and its history?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del">Delete</button></form></td></tr>
 {% endfor %}
 <tr>
 <td><input type="text" form="hadd" name="name" placeholder="e.g. Reception NVR" required maxlength="60" style="width:150px"></td>
@@ -1793,104 +1848,165 @@ SETTINGS_BODY = """
 <td><input type="text" form="hadd" name="grp" placeholder="e.g. Cameras" maxlength="60" style="width:120px"></td>
 <td><select form="hadd" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}">{{ v[0] }}</option>{% endfor %}</select></td>
 <td><input type="checkbox" form="hadd" name="enabled" value="1" checked></td><td></td><td class="hint">after adding</td>
-<td><form id="hadd" method="post" action="{{ url_for('host_add') }}">""" + CSRF + """<button>+ Add</button></form></td></tr></table></div>
+<td><form id="hadd" method="post" action="{{ url_for('host_add') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>+ Add</button></form></td></tr></table></div>
 
-<div class="card" id="general"><h2>General</h2><form method="post" action="{{ url_for('save_section', section='general') }}">""" + CSRF + """
+<div class="card" id="general"><h2>General</h2>
+<p class="section-intro">Name of this site, how often it pings, and who may open the dashboard. The address the web page itself listens on (the LAN and localhost together, or localhost only) is set by the installer, not here.</p>
+<form method="post" action="{{ url_for('save_section', section='general') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>Site / client name</label><input type="text" name="site_name" value="{{ s.site_name }}" required maxlength="80">
-<label>Timezone</label><input type="text" name="timezone" value="{{ s.timezone }}" list="tzs"><datalist id="tzs">{% for z in tzs %}<option>{{ z }}</option>{% endfor %}</datalist>
-<label>Ping interval (seconds)</label><input type="number" name="ping_interval" min="10" max="3600" value="{{ s.ping_interval }}">
-<label>Ping timeout (seconds)</label><input type="number" name="ping_timeout" min="1" max="10" value="{{ s.ping_timeout }}">
-<label>Failed pings before alert</label><input type="number" name="fail_threshold" min="1" max="20" value="{{ s.fail_threshold }}">
-<label>Keep history (days)</label><input type="number" name="retention_days" min="1" max="365" value="{{ s.retention_days }}">
-<label>Ping method</label><select name="ping_method">{% for m in ['auto','icmplib','system'] %}<option {{ 'selected' if s.ping_method==m }}>{{ m }}</option>{% endfor %}</select>
-<label>Public URL (optional)</label><input type="url" name="public_url" value="{{ s.public_url }}" placeholder="https://hotel.monitor.example.com">
-<label>Dashboard access</label><select name="dashboard_access"><option value="login" {{ 'selected' if s.dashboard_access=='login' }}>Login required (admin or viewer password)</option>
+<label>Site / client name</label><div><input type="text" name="site_name" value="{{ s.site_name }}" required maxlength="80">
+<p class="hint">Put at the start of every alert so you can tell sites apart. Example: <code>Hotel Nikiana</code>. Set one name per installation.</p></div>
+<label>Timezone</label><div><input type="text" name="timezone" value="{{ s.timezone }}" list="tzs"><datalist id="tzs">{% for z in tzs %}<option>{{ z }}</option>{% endfor %}</datalist>
+<p class="hint">Clock used for the dashboard, events and alert times. Example: <code>Europe/Athens</code>. Pick the zone where the devices are. The installer does not change this; set the PC clock with <code>timedatectl</code> as well.</p></div>
+<label>Ping interval (seconds)</label><div><input type="number" name="ping_interval" min="10" max="3600" value="{{ s.ping_interval }}">
+<p class="hint">How often each host is pinged. Example: <code>60</code>. Use 30 on a small site, or 120 if you watch a lot of devices.</p></div>
+<label>Ping timeout (seconds)</label><div><input type="number" name="ping_timeout" min="1" max="10" value="{{ s.ping_timeout }}">
+<p class="hint">How long one ping may take before it counts as a miss. Example: <code>2</code>. Raise it only on a slow or lossy link.</p></div>
+<label>Failed pings before alert</label><div><input type="number" name="fail_threshold" min="1" max="20" value="{{ s.fail_threshold }}">
+<p class="hint">Misses in a row before a DOWN alert. Example: <code>3</code>. Use 2 for a fast alert, or 5 so a short blip stays quiet.</p></div>
+<label>Keep history (days)</label><div><input type="number" name="retention_days" min="1" max="365" value="{{ s.retention_days }}">
+<p class="hint">How long ping and SNMP samples are kept. Example: <code>30</code>. Use fewer days on a small disk.</p></div>
+<label>Ping method</label><div><select name="ping_method">{% for m in ['auto','icmplib','system'] %}<option {{ 'selected' if s.ping_method==m }}>{{ m }}</option>{% endfor %}</select>
+<p class="hint"><code>auto</code> tries a raw ICMP library, then the system <code>ping</code> command. Use <code>system</code> on Windows, or if raw ICMP is blocked. Use <code>icmplib</code> when you want the library only.</p></div>
+<label>Public URL (optional)</label><div><input type="url" name="public_url" value="{{ s.public_url }}" placeholder="https://hotel.monitor.example.com">
+<p class="hint">Address written into alert links. Example: <code>https://hotel-monitor.example.com</code>. Set this to the Cloudflare Tunnel hostname. Leave it empty if you only open the page on the LAN.</p></div>
+<label>Dashboard access</label><div><select name="dashboard_access"><option value="login" {{ 'selected' if s.dashboard_access=='login' }}>Login required (admin or viewer password)</option>
 <option value="public" {{ 'selected' if s.dashboard_access=='public' }}>Public read-only (no login)</option></select>
+<p class="hint"><b>Login required</b> is the right choice on a LAN. <b>Public read-only</b> shows the dashboard to anyone who can open the page; Settings still needs the admin password. Use public only for a wall display.</p></div>
 <label>Viewer password (dashboard only)</label><div><input type="password" name="viewer_password" autocomplete="new-password" placeholder="{{ 'set - leave empty to keep' if s.viewer_hash else 'not set' }}" style="width:60%">
-<label class="hint"><input type="checkbox" name="viewer_clear" value="1"> remove viewer password</label></div>
+<label class="hint"><input type="checkbox" name="viewer_clear" value="1"> remove viewer password</label>
+<p class="hint">Optional second password that can see the dashboard but not change settings. Example: a password for reception. At least 6 characters. Leave it empty to keep the current one. Tick remove to clear it.</p></div>
 <span></span><div><button>Save general settings</button> <span class="hint">Ping method in use: {{ ping_name }}</span></div></div></form></div>
 
-<div class="card" id="telegram"><h2>Telegram</h2><form method="post" action="{{ url_for('save_section', section='telegram') }}">""" + CSRF + """
+<div class="card" id="telegram"><h2>Telegram</h2>
+<p class="section-intro">Sends a Telegram message when a host goes down or comes back, and for device or SNMP alerts that are set to be forwarded.</p>
+<form method="post" action="{{ url_for('save_section', section='telegram') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>Enabled</label><input type="checkbox" name="telegram_enabled" value="1" {{ 'checked' if s.telegram_enabled }}>
-<label>Bot token</label>""" + _secret_input("telegram_token") + """
-<label>Chat ID</label><input type="text" name="telegram_chat_id" value="{{ s.telegram_chat_id }}" placeholder="123456789 or -100...">
-<label>Send camera snapshots</label><input type="checkbox" name="telegram_photos" value="1" {{ 'checked' if s.telegram_photos }}>
+<label>Enabled</label><div><input type="checkbox" name="telegram_enabled" value="1" {{ 'checked' if s.telegram_enabled }}>
+<p class="hint">Turn Telegram alerts on or off. Turn it on after the token and chat ID are saved and a test message arrives.</p></div>
+<label>Bot token</label><div>""" + _secret_input("telegram_token") + """
+<p class="hint">From @BotFather, command <code>/newbot</code>. Example: <code>123456789:AAH...</code>. Leave this blank when saving to keep the token already stored. Use it when you create the bot.</p></div>
+<label>Chat ID</label><div><input type="text" name="telegram_chat_id" value="{{ s.telegram_chat_id }}" placeholder="123456789 or -100...">
+<p class="hint">Where the messages go. Example: <code>123456789</code> for a person, or <code>-1001234567890</code> for a group. Open the bot, press Start, then read the id from getUpdates.</p></div>
+<label>Send camera snapshots</label><div><input type="checkbox" name="telegram_photos" value="1" {{ 'checked' if s.telegram_photos }}>
+<p class="hint">Attach the picture from a camera alarm e-mail. Leave it on for cameras. Turn it off if the chat should stay text only.</p></div>
 <span></span><div><button>Save</button> <button formaction="{{ url_for('test_channel', ch='telegram') }}" class="sec">Save + send test</button></div></div></form></div>
 
-<div class="card" id="email"><h2>Outgoing e-mail (alerts to you, via SMTP)</h2><form method="post" action="{{ url_for('save_section', section='email') }}">""" + CSRF + """
+<div class="card" id="email"><h2>Outgoing e-mail (alerts to you, via SMTP)</h2>
+<p class="section-intro">Mail this monitor sends to you. It is not the mail cameras send in (that is the next section).</p>
+<form method="post" action="{{ url_for('save_section', section='email') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>Enabled</label><input type="checkbox" name="email_enabled" value="1" {{ 'checked' if s.email_enabled }}>
-<label>SMTP server</label><input type="text" name="smtp_host" value="{{ s.smtp_host }}" placeholder="smtp.gmail.com">
-<label>Port</label><input type="number" name="smtp_port" value="{{ s.smtp_port }}" min="1" max="65535">
-<label>Security</label><select name="smtp_security">{% for k, v in [('none','None (plain, port 25)'),('starttls','STARTTLS (port 587)'),('ssl','SSL/TLS (port 465)')] %}<option value="{{ k }}" {{ 'selected' if s.smtp_security==k }}>{{ v }}</option>{% endfor %}</select>
-<label>Username</label><input type="text" name="smtp_user" value="{{ s.smtp_user }}" autocomplete="off" placeholder="empty = no login">
-<label>Password</label>""" + _secret_input("smtp_password") + """
-<label>From</label><input type="text" name="smtp_from" value="{{ s.smtp_from }}" placeholder="monitor@yourdomain">
-<label>To (comma separated)</label><input type="text" name="smtp_to" value="{{ s.smtp_to }}" placeholder="you@x.gr, tech@x.gr">
+<label>Enabled</label><div><input type="checkbox" name="email_enabled" value="1" {{ 'checked' if s.email_enabled }}>
+<p class="hint">Send alert e-mail. Turn it on after the server, the From address and the To address are filled in, then use the test button.</p></div>
+<label>SMTP server</label><div><input type="text" name="smtp_host" value="{{ s.smtp_host }}" placeholder="smtp.gmail.com">
+<p class="hint">Your provider's outgoing server. Example: <code>smtp.gmail.com</code> or <code>smtp.office365.com</code>. Use the server that hosts the From mailbox.</p></div>
+<label>Port</label><div><input type="number" name="smtp_port" value="{{ s.smtp_port }}" min="1" max="65535">
+<p class="hint">Match the security below. Example: <code>587</code> for STARTTLS, <code>465</code> for SSL, <code>25</code> for plain SMTP.</p></div>
+<label>Security</label><div><select name="smtp_security">{% for k, v in [('none','None (plain, port 25)'),('starttls','STARTTLS (port 587)'),('ssl','SSL/TLS (port 465)')] %}<option value="{{ k }}" {{ 'selected' if s.smtp_security==k }}>{{ v }}</option>{% endfor %}</select>
+<p class="hint">How the connection is encrypted. Use STARTTLS on port 587 for Gmail and Microsoft 365. Use SSL on port 465 if the provider asks for it.</p></div>
+<label>Username</label><div><input type="text" name="smtp_user" value="{{ s.smtp_user }}" autocomplete="off" placeholder="empty = no login">
+<p class="hint">Login for that server. Example: <code>monitor@yourdomain.gr</code>. Leave it empty only if the server does not ask you to log in.</p></div>
+<label>Password</label><div>""" + _secret_input("smtp_password") + """
+<p class="hint">Mailbox password, or an app password when the provider requires one. Leave it blank when saving to keep the password already stored.</p></div>
+<label>From</label><div><input type="text" name="smtp_from" value="{{ s.smtp_from }}" placeholder="monitor@yourdomain">
+<p class="hint">Address the alert is sent from. Example: <code>monitor@yourdomain.gr</code>. Often the same as the username.</p></div>
+<label>To (comma separated)</label><div><input type="text" name="smtp_to" value="{{ s.smtp_to }}" placeholder="you@x.gr, tech@x.gr">
+<p class="hint">Who receives the alerts. Example: <code>you@example.com, tech@example.com</code>. Separate several people with commas.</p></div>
 <span></span><div><button>Save</button> <button formaction="{{ url_for('test_channel', ch='email') }}" class="sec">Save + send test e-mail</button></div></div></form></div>
 
 <div class="card" id="receiver"><h2>Incoming e-mail receiver (alerts FROM cameras, NVRs, controllers)</h2>
+<p class="section-intro">Cameras and recorders send their alarm mail to this machine. The monitor reads the message, shows it on the dashboard, and can forward it.</p>
 <p class="hint">Point Hikvision / Dahua / UniFi / Omada / MikroTik e-mail settings at this box (its LAN IP) and this port.
 Mails are parsed (motion, HDD error, video loss, device offline, ...), shown on the dashboard and forwarded to your channels.
 Status: <b>{{ rx_status }}</b></p>
-<form method="post" action="{{ url_for('save_section', section='receiver') }}">""" + CSRF + """
+<form method="post" action="{{ url_for('save_section', section='receiver') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>Enabled</label><input type="checkbox" name="rx_enabled" value="1" {{ 'checked' if s.rx_enabled }}>
-<label>Listen address</label><input type="text" name="rx_host" value="{{ s.rx_host }}" placeholder="0.0.0.0 = all LAN interfaces">
-<label>Port</label><input type="number" name="rx_port" value="{{ s.rx_port }}" min="1" max="65535">
-<label>Security</label><select name="rx_security">{% for k, v in [('none','None - plain SMTP (old devices)'),('starttls','STARTTLS offered (plain still allowed)'),('ssl','SSL/TLS (implicit, like port 465)')] %}<option value="{{ k }}" {{ 'selected' if s.rx_security==k }}>{{ v }}</option>{% endfor %}</select>
-<label>Require login (AUTH)</label><input type="checkbox" name="rx_require_auth" value="1" {{ 'checked' if s.rx_require_auth }}>
-<label>Username</label><input type="text" name="rx_user" value="{{ s.rx_user }}">
-<label>Password</label>""" + _secret_input("rx_password") + """
-<label>Allowed sender networks</label><input type="text" name="rx_allowed_nets" value="{{ s.rx_allowed_nets }}">
-<label>Forward to Telegram/e-mail/webhook</label><select name="rx_forward_min">{% for k, v in [('info','Everything (incl. motion)'),('warning','Warnings + critical (no motion)'),('critical','Critical only'),('none','Nothing (dashboard only)')] %}<option value="{{ k }}" {{ 'selected' if s.rx_forward_min==k }}>{{ v }}</option>{% endfor %}</select>
-<label>Max 1 forward per device+type every (s)</label><input type="number" name="rx_rate_limit" value="{{ s.rx_rate_limit }}" min="0" max="86400">
+<label>Enabled</label><div><input type="checkbox" name="rx_enabled" value="1" {{ 'checked' if s.rx_enabled }}>
+<p class="hint">Accept alarm e-mail from devices. Turn it on when the cameras are set to use this machine as their SMTP server.</p></div>
+<label>Listen address</label><div><input type="text" name="rx_host" value="{{ s.rx_host }}" placeholder="0.0.0.0 = all LAN interfaces">
+<p class="hint">Interface that waits for device mail. Example: <code>0.0.0.0</code> so every LAN device can connect. Use <code>127.0.0.1</code> only for a test on this PC.</p></div>
+<label>Port</label><div><input type="number" name="rx_port" value="{{ s.rx_port }}" min="1" max="65535">
+<p class="hint">Port the devices must use. Example: <code>2525</code>. Put the same number in the camera's SMTP settings. Port 25 also works; the service may bind low ports.</p></div>
+<label>Security</label><div><select name="rx_security">{% for k, v in [('none','None - plain SMTP (old devices)'),('starttls','STARTTLS offered (plain still allowed)'),('ssl','SSL/TLS (implicit, like port 465)')] %}<option value="{{ k }}" {{ 'selected' if s.rx_security==k }}>{{ v }}</option>{% endfor %}</select>
+<p class="hint">Encryption the camera must speak. Example: <code>None</code> for most old Hikvision and Dahua cameras. Use STARTTLS or SSL only when the device supports it.</p></div>
+<label>Require login (AUTH)</label><div><input type="checkbox" name="rx_require_auth" value="1" {{ 'checked' if s.rx_require_auth }}>
+<p class="hint">Ask the device for the username and password below. Turn it on if this port is reachable from outside a trusted LAN. Leave it off for old cameras that cannot log in.</p></div>
+<label>Username</label><div><input type="text" name="rx_user" value="{{ s.rx_user }}">
+<p class="hint">SMTP user the camera must send. Example: <code>alerts</code>. It is used only when login is required. Type the same user into the camera.</p></div>
+<label>Password</label><div>""" + _secret_input("rx_password") + """
+<p class="hint">SMTP password the camera must send. Leave it blank when saving to keep the stored password. Set it when login is required.</p></div>
+<label>Allowed sender networks</label><div><input type="text" name="rx_allowed_nets" value="{{ s.rx_allowed_nets }}">
+<p class="hint">Mail from any other network is refused. Example: <code>192.168.0.0/16, 10.0.0.0/8</code>. Keep your LAN ranges. The same list is used for SNMP traps.</p></div>
+<label>Forward to Telegram/e-mail/webhook</label><div><select name="rx_forward_min">{% for k, v in [('info','Everything (incl. motion)'),('warning','Warnings + critical (no motion)'),('critical','Critical only'),('none','Nothing (dashboard only)')] %}<option value="{{ k }}" {{ 'selected' if s.rx_forward_min==k }}>{{ v }}</option>{% endfor %}</select>
+<p class="hint">Which device mails are also sent out. Example: Warnings + critical, so motion stays on the dashboard and disk or offline alarms are forwarded.</p></div>
+<label>Max 1 forward per device+type every (s)</label><div><input type="number" name="rx_rate_limit" value="{{ s.rx_rate_limit }}" min="0" max="86400">
+<p class="hint">Quiet period so one camera cannot flood you. Example: <code>300</code> (5 minutes) per device and event type. Use <code>0</code> to forward every message.</p></div>
 <span></span><div><button>Save + restart receiver</button></div></div></form></div>
 
 <div class="card" id="snmp"><h2>SNMP polling + trap receiver</h2>
-<p class="hint">SNMP is set per host (click <b>⚙</b> in the hosts table: community or v3 user, interfaces to graph). These are the global options.
-Trap receiver status: <b>{{ trap_status }}</b>{% if not snmp_ok %} · <b style="color:#dc2626">pysnmp not installed</b>{% endif %}</p>
-<form method="post" action="{{ url_for('save_section', section='snmp') }}">""" + CSRF + """
+<p class="section-intro">Polling asks each device for CPU, memory and interfaces. Traps are messages the device sends on its own, for example when a port goes down. Per-device community and v3 passwords are on each host's SNMP page (the gear icon in the hosts table).</p>
+<p class="hint">Trap receiver status: <b>{{ trap_status }}</b>{% if not snmp_ok %} · <b style="color:#dc2626">pysnmp not installed</b>{% endif %}</p>
+<form method="post" action="{{ url_for('save_section', section='snmp') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>SNMP polling enabled</label><input type="checkbox" name="snmp_enabled" value="1" {{ 'checked' if s.snmp_enabled }}>
-<label>Poll interval (seconds)</label><input type="number" name="snmp_interval" value="{{ s.snmp_interval }}" min="30" max="3600">
-<label>Timeout (seconds)</label><input type="number" name="snmp_timeout" value="{{ s.snmp_timeout }}" min="1" max="10">
-<label>High CPU alert at (%)</label><input type="number" name="snmp_cpu_threshold" value="{{ s.snmp_cpu_threshold }}" min="0" max="100"><span></span><span class="hint">0 = off. Alert after 2 polls in a row above it.</span>
-<label>Alert on interface down</label><input type="checkbox" name="snmp_alert_ifdown" value="1" {{ 'checked' if s.snmp_alert_ifdown }}>
-<label>Alert on device reboot</label><input type="checkbox" name="snmp_alert_reboot" value="1" {{ 'checked' if s.snmp_alert_reboot }}>
-<label>Forward SNMP poll alerts</label><select name="snmp_forward_min">{% for k, v in [('info','Everything (incl. link up / CPU ok)'),('warning','Warnings + critical'),('critical','Critical only'),('none','Nothing (dashboard only)')] %}<option value="{{ k }}" {{ 'selected' if s.snmp_forward_min==k }}>{{ v }}</option>{% endfor %}</select>
-<label><b>Trap receiver enabled</b></label><input type="checkbox" name="trap_enabled" value="1" {{ 'checked' if s.trap_enabled }}>
-<label>Listen address</label><input type="text" name="trap_host" value="{{ s.trap_host }}" placeholder="0.0.0.0">
-<label>UDP port</label><input type="number" name="trap_port" value="{{ s.trap_port }}" min="1" max="65535"><span></span><span class="hint">162 = standard (service has CAP_NET_BIND_SERVICE). 1162 avoids needing it - set the same port on the devices.</span>
-<label>Accepted communities</label><input type="text" name="trap_community" value="{{ s.trap_community }}" placeholder="empty = any; e.g. public,wirewave"><span></span><span class="hint">Traps v1/v2c. Sender must also be in the "Allowed sender networks" of the e-mail receiver.</span>
-<label>Forward traps</label><select name="trap_forward_min">{% for k, v in [('info','Everything (incl. linkUp)'),('warning','Warnings + critical'),('critical','Critical only (linkDown, coldStart)'),('none','Nothing (dashboard only)')] %}<option value="{{ k }}" {{ 'selected' if s.trap_forward_min==k }}>{{ v }}</option>{% endfor %}</select>
+<label>SNMP polling enabled</label><div><input type="checkbox" name="snmp_enabled" value="1" {{ 'checked' if s.snmp_enabled }}>
+<p class="hint">Master switch for reading devices. Leave it on if any host has SNMP turned on. Turn it off to stop all polling.</p></div>
+<label>Poll interval (seconds)</label><div><input type="number" name="snmp_interval" value="{{ s.snmp_interval }}" min="30" max="3600">
+<p class="hint">How often each SNMP host is read. Example: <code>300</code> (5 minutes). Use 60–120 for a few devices, 300 for a large site.</p></div>
+<label>Timeout (seconds)</label><div><input type="number" name="snmp_timeout" value="{{ s.snmp_timeout }}" min="1" max="10">
+<p class="hint">How long to wait for one SNMP reply. Example: <code>2</code>. Raise it if a device is slow to answer.</p></div>
+<label>High CPU alert at (%)</label><div><input type="number" name="snmp_cpu_threshold" value="{{ s.snmp_cpu_threshold }}" min="0" max="100">
+<p class="hint">CPU percent that counts as high. Example: <code>90</code>. An alert is sent after two polls in a row above it. Use <code>0</code> to turn this alert off.</p></div>
+<label>Alert on interface down</label><div><input type="checkbox" name="snmp_alert_ifdown" value="1" {{ 'checked' if s.snmp_alert_ifdown }}>
+<p class="hint">Message when an interface you marked Alert goes from up to down. Turn it on for WAN and uplink ports. Choose those ports on the host's SNMP page.</p></div>
+<label>Alert on device reboot</label><div><input type="checkbox" name="snmp_alert_reboot" value="1" {{ 'checked' if s.snmp_alert_reboot }}>
+<p class="hint">Message when the device's uptime jumps backwards, which means it rebooted. Useful for routers and switches.</p></div>
+<label>Forward SNMP poll alerts</label><div><select name="snmp_forward_min">{% for k, v in [('info','Everything (incl. link up / CPU ok)'),('warning','Warnings + critical'),('critical','Critical only'),('none','Nothing (dashboard only)')] %}<option value="{{ k }}" {{ 'selected' if s.snmp_forward_min==k }}>{{ v }}</option>{% endfor %}</select>
+<p class="hint">Which poll alerts are also sent to Telegram, e-mail and the webhook. Example: Warnings + critical. Dashboard-only keeps them on this page.</p></div>
+<label><b>Trap receiver enabled</b></label><div><input type="checkbox" name="trap_enabled" value="1" {{ 'checked' if s.trap_enabled }}>
+<p class="hint">Listen for traps (link down, cold start, and similar). Turn it on after each device has this machine as its trap target.</p></div>
+<label>Listen address</label><div><input type="text" name="trap_host" value="{{ s.trap_host }}" placeholder="0.0.0.0">
+<p class="hint">Interface that receives traps. Example: <code>0.0.0.0</code> so every LAN device can send them.</p></div>
+<label>UDP port</label><div><input type="number" name="trap_port" value="{{ s.trap_port }}" min="1" max="65535">
+<p class="hint">Port devices send traps to. Example: <code>1162</code>, or <code>162</code> for the standard port. The device's trap target must use this same port. The service can bind port 162.</p></div>
+<label>Accepted communities</label><div><input type="text" name="trap_community" value="{{ s.trap_community }}" placeholder="empty = any; e.g. public,wirewave">
+<p class="hint">v1/v2c community strings to accept, separated by commas. Example: <code>wwmon</code>. Empty means any community. The sender must also be inside Allowed sender networks.</p></div>
+<label>Forward traps</label><div><select name="trap_forward_min">{% for k, v in [('info','Everything (incl. linkUp)'),('warning','Warnings + critical'),('critical','Critical only (linkDown, coldStart)'),('none','Nothing (dashboard only)')] %}<option value="{{ k }}" {{ 'selected' if s.trap_forward_min==k }}>{{ v }}</option>{% endfor %}</select>
+<p class="hint">Which traps are sent onward. Example: Critical only, so linkDown and coldStart are forwarded and linkUp stays on the dashboard.</p></div>
 <span></span><div><button>Save + restart trap receiver</button></div></div></form></div>
 
-<div class="card" id="webhook"><h2>Outgoing webhook (Grok Bot / automations)</h2><form method="post" action="{{ url_for('save_section', section='webhook') }}">""" + CSRF + """
-<p class="hint">POSTs JSON on host_down, host_recovered, forwarded device_alert, snmp_alert and snmp_trap events. See README for the payload.</p>
+<div class="card" id="webhook"><h2>Outgoing webhook (Grok Bot / automations)</h2>
+<p class="section-intro">On each alert the monitor POSTs a JSON body to a URL you choose. Use it for Grok Bot or any other automation. The README lists the fields.</p>
+<form method="post" action="{{ url_for('save_section', section='webhook') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>Enabled</label><input type="checkbox" name="webhook_enabled" value="1" {{ 'checked' if s.webhook_enabled }}>
-<label>URL</label><input type="url" name="webhook_url" value="{{ s.webhook_url }}" placeholder="https://...">
-<label>Secret header name</label><input type="text" name="webhook_header_name" value="{{ s.webhook_header_name }}" placeholder="Authorization or X-Webhook-Secret">
-<label>Secret header value</label>""" + _secret_input("webhook_header_value") + """
+<label>Enabled</label><div><input type="checkbox" name="webhook_enabled" value="1" {{ 'checked' if s.webhook_enabled }}>
+<p class="hint">Send the JSON. Turn it on after the URL answers a test.</p></div>
+<label>URL</label><div><input type="url" name="webhook_url" value="{{ s.webhook_url }}" placeholder="https://...">
+<p class="hint">Where the JSON is posted. Example: <code>https://bot.example.com/hook</code>. Use the address your automation gave you.</p></div>
+<label>Secret header name</label><div><input type="text" name="webhook_header_name" value="{{ s.webhook_header_name }}" placeholder="Authorization or X-Webhook-Secret">
+<p class="hint">HTTP header the receiver expects. Example: <code>Authorization</code> or <code>X-Webhook-Secret</code>. Match what the bot checks.</p></div>
+<label>Secret header value</label><div>""" + _secret_input("webhook_header_value") + """
+<p class="hint">The secret itself. Example: <code>Bearer</code> followed by a long random string. Leave it blank when saving to keep the stored value.</p></div>
 <span></span><div><button>Save</button> <button formaction="{{ url_for('test_channel', ch='webhook') }}" class="sec">Save + send test</button></div></div></form></div>
 
 <div class="card" id="api"><h2>JSON API token</h2>
-<p class="hint">Use as <code>Authorization: Bearer &lt;token&gt;</code> or <code>?token=&lt;token&gt;</code> on <code>/api/status</code> and <code>/api/events</code>.</p>
+<p class="section-intro">A password for scripts that read status. It is not the admin password, and it cannot change settings.</p>
+<p class="hint">Send it as <code>Authorization: Bearer &lt;token&gt;</code> (best) or <code>?token=&lt;token&gt;</code> on <code>/api/status</code> and <code>/api/events</code>. Example: a Grok Bot poller. Show and Copy do not change it. Regenerate if it leaks; the old value stops working immediately.</p>
 <input type="password" id="apitok" value="{{ s.api_token }}" readonly style="width:420px;font-family:monospace">
 <button type="button" class="sec" onclick="const t=document.getElementById('apitok');t.type=t.type=='password'?'text':'password'">Show</button>
 <button type="button" class="sec" onclick="navigator.clipboard.writeText(document.getElementById('apitok').value).then(()=>this.textContent='Copied')">Copy</button>
-<form method="post" action="{{ url_for('regen_token') }}" style="display:inline" onsubmit="return confirm('Old token stops working. Continue?')">""" + CSRF + """<button class="del">Regenerate</button></form></div>
+<form method="post" action="{{ url_for('regen_token') }}" style="display:inline" onsubmit="return confirm('Old token stops working. Continue?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del">Regenerate</button></form></div>
 
-<div class="card" id="password"><h2>Change admin password</h2><form method="post" action="{{ url_for('change_password') }}">""" + CSRF + """
-<div class="form-grid"><label>Current password</label><input type="password" name="current" required>
-<label>New password (min 8)</label><input type="password" name="new" required minlength="8">
-<label>Repeat new password</label><input type="password" name="new2" required minlength="8">
+<div class="card" id="password"><h2>Change admin password</h2>
+<p class="section-intro">Replaces the password that opens Settings and the dashboard. It does not change the viewer password (that is under General).</p>
+<form method="post" action="{{ url_for('change_password') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid"><label>Current password</label><div><input type="password" name="current" required>
+<p class="hint">The admin password you use to log in now. It is checked before the new one is saved.</p></div>
+<label>New password (min 8)</label><div><input type="password" name="new" required minlength="8">
+<p class="hint">The replacement password. Example: a long phrase you do not use for e-mail. At least 8 characters.</p></div>
+<label>Repeat new password</label><div><input type="password" name="new2" required minlength="8">
+<p class="hint">Type the new password again. If the two do not match, nothing is changed.</p></div>
 <span></span><div><button>Change password</button></div></div></form></div>
 """
-
 BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_enabled", "rx_enabled", "rx_require_auth",
                "snmp_enabled", "snmp_alert_ifdown", "snmp_alert_reboot", "trap_enabled"}
 SECTIONS = {
@@ -2082,30 +2198,41 @@ def host_delete(hid):
 
 SNMP_HOST_BODY = """<p><a href="{{ url_for('settings') }}#hosts">← Settings / hosts</a></p>
 <div class="card"><h2>SNMP for {{ h.name }} <span class="muted">{{ h.host }} · {{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[0] }}</span></h2>
-<form method="post" action="{{ url_for('host_snmp', hid=h.id) }}">""" + CSRF + """<input type="hidden" name="has_ifaces" value="{{ 1 if ifaces else 0 }}">
+<p class="section-intro">How this one device is polled. Save + test now checks the community or v3 password and fills in the interface list. Use a read-only community, or SNMPv3, and allow only this monitor's IP on the device.</p>
+<form method="post" action="{{ url_for('host_snmp', hid=h.id) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="has_ifaces" value="{{ 1 if ifaces else 0 }}">
 <div class="form-grid">
-<label>SNMP enabled</label><input type="checkbox" name="enabled" value="1" {{ 'checked' if c.enabled }}>
-<label>Version</label><select name="version" onchange="document.querySelectorAll('.v3').forEach(e=>e.style.display=this.value=='3'?'':'none');document.querySelectorAll('.v2').forEach(e=>e.style.display=this.value=='3'?'none':'')">
+<label>SNMP enabled</label><div><input type="checkbox" name="enabled" value="1" {{ 'checked' if c.enabled }}>
+<p class="hint">Poll this host for uptime, CPU, memory and interfaces. Turn it on after the community or v3 user below is filled in.</p></div>
+<label>Version</label><div><select name="version" onchange="document.querySelectorAll('.v3').forEach(e=>e.style.display=this.value=='3'?'':'none');document.querySelectorAll('.v2').forEach(e=>e.style.display=this.value=='3'?'none':'')">
 {% for v in ['2c','1','3'] %}<option value="{{ v }}" {{ 'selected' if c.version==v }}>v{{ v }}</option>{% endfor %}</select>
-<label>UDP port</label><input type="number" name="port" value="{{ c.port }}" min="1" max="65535">
-<label class="v2">Community</label><input class="v2" type="password" name="community" autocomplete="new-password" placeholder="{{ ('saved ' + mask(c.community) + ' - leave empty to keep') if c.community else 'e.g. public (read-only)' }}">
-<label class="v3">v3 user</label><input class="v3" type="text" name="user" value="{{ c.user }}" autocomplete="off">
-<label class="v3">Auth protocol</label><select class="v3" name="auth_proto">{% for v in ['SHA','MD5','SHA256','none'] %}<option {{ 'selected' if c.auth_proto==v }}>{{ v }}</option>{% endfor %}</select>
-<label class="v3">Auth password</label><input class="v3" type="password" name="auth_key" autocomplete="new-password" placeholder="{{ ('saved ' + mask(c.auth_key) + ' - leave empty to keep') if c.auth_key else 'min 8 characters' }}">
-<label class="v3">Privacy protocol</label><select class="v3" name="priv_proto">{% for v in ['AES','DES','AES256','none'] %}<option {{ 'selected' if c.priv_proto==v }}>{{ v }}</option>{% endfor %}</select>
-<label class="v3">Privacy password</label><input class="v3" type="password" name="priv_key" autocomplete="new-password" placeholder="{{ ('saved ' + mask(c.priv_key) + ' - leave empty to keep') if c.priv_key else 'min 8 characters' }}">
+<p class="hint"><b>v2c</b> is the usual choice and uses the community string. <b>v3</b> uses a user and passwords. <b>v1</b> is only for very old gear.</p></div>
+<label>UDP port</label><div><input type="number" name="port" value="{{ c.port }}" min="1" max="65535">
+<p class="hint">Device SNMP port. Example: <code>161</code>. Change it only when the device is not on the standard port.</p></div>
+<label class="v2">Community</label><div class="v2"><input class="v2" type="password" name="community" autocomplete="new-password" placeholder="{{ ('saved ' + mask(c.community) + ' - leave empty to keep') if c.community else 'e.g. public (read-only)' }}">
+<p class="hint">Read-only v1/v2c string configured on the device. Example: <code>wwmon</code>. Avoid <code>public</code> on a network you share. Leave it blank when saving to keep the stored value.</p></div>
+<label class="v3">v3 user</label><div class="v3"><input class="v3" type="text" name="user" value="{{ c.user }}" autocomplete="off">
+<p class="hint">SNMPv3 username on the device. Example: <code>monitor</code>. It must match exactly, including capitals.</p></div>
+<label class="v3">Auth protocol</label><div class="v3"><select class="v3" name="auth_proto">{% for v in ['SHA','MD5','SHA256','none'] %}<option {{ 'selected' if c.auth_proto==v }}>{{ v }}</option>{% endfor %}</select>
+<p class="hint">How the user is authenticated. Example: <code>SHA</code>. It must match the device. <code>none</code> means no authentication.</p></div>
+<label class="v3">Auth password</label><div class="v3"><input class="v3" type="password" name="auth_key" autocomplete="new-password" placeholder="{{ ('saved ' + mask(c.auth_key) + ' - leave empty to keep') if c.auth_key else 'min 8 characters' }}">
+<p class="hint">SNMPv3 authentication password. At least 8 characters, the same as on the device. Leave it blank when saving to keep the stored password.</p></div>
+<label class="v3">Privacy protocol</label><div class="v3"><select class="v3" name="priv_proto">{% for v in ['AES','DES','AES256','none'] %}<option {{ 'selected' if c.priv_proto==v }}>{{ v }}</option>{% endfor %}</select>
+<p class="hint">How the SNMP traffic is encrypted. Example: <code>AES</code>. <code>none</code> means the replies are not encrypted. Match the device.</p></div>
+<label class="v3">Privacy password</label><div class="v3"><input class="v3" type="password" name="priv_key" autocomplete="new-password" placeholder="{{ ('saved ' + mask(c.priv_key) + ' - leave empty to keep') if c.priv_key else 'min 8 characters' }}">
+<p class="hint">SNMPv3 encryption password, used when privacy is not <code>none</code>. At least 8 characters. Leave it blank when saving to keep the stored password.</p></div>
 </div>
-{% if ifaces %}<h2 style="margin-top:16px">Interfaces</h2><p class="hint">Graph = traffic chart on the host page. Alert = message when it goes from up to down (and back).</p>
+{% if ifaces %}<h2 style="margin-top:16px">Interfaces</h2><p class="hint">Graph draws a traffic chart on the host page. Alert sends a message when that interface goes from up to down, and again when it recovers. Tick the WAN and uplinks. Leave unused ports unticked.</p>
 <table><tr><th>Interface</th><th>Status</th><th>Speed</th><th>Graph</th><th>Alert</th></tr>
 {% for i in ifaces %}<tr><td><b>{{ i.name }}</b> <span class="muted">{{ i.alias }} {{ i.descr if i.descr != i.name else '' }}</span></td>
 <td><span class="lnk {{ 'g' if i.oper=='up' else 'r' }}">{{ i.oper }}</span></td><td>{{ fmt_bps(i.speed) if i.speed else '—' }}</td>
 <td><input type="checkbox" name="g_{{ i.name }}" value="1" {{ 'checked' if i.name in (c.ifaces or []) }}></td>
 <td><input type="checkbox" name="a_{{ i.name }}" value="1" {{ 'checked' if i.name in (c.alert_ifaces or []) }}></td></tr>{% endfor %}</table>
-{% else %}<p class="hint">Interfaces appear here after the first successful poll or a test (physical interfaces that are up get selected automatically).</p>{% endif %}
+{% else %}<p class="hint">Interfaces appear here after the first successful poll or a test. Physical interfaces that are up are selected automatically. Run Save + test now once SNMP answers.</p>{% endif %}
 <p><button>Save</button> <button name="test" value="1" class="sec">Save + test now</button></p></form>
 {% if test %}<div class="card" style="border:1px solid #e2e8f0;box-shadow:none">{% if test.error %}❌ <b>SNMP test failed:</b> {{ test.error }}{% else %}
 ✅ <b>{{ test.sysName }}</b> answered in {{ test.took }} s - {{ test.sysDescr[:150] if test.sysDescr }}<br>uptime {{ test.uptime_txt }} · CPU {{ test.cpu if test.cpu is not none else 'n/a' }} · RAM {{ test.mem_pct if test.mem_pct is not none else 'n/a' }}% · {{ test.ifaces|length }} interfaces{% for k, v in test.extra.items() %} · {{ k }} {{ v }}{% endfor %}{% endif %}</div>{% endif %}
-</div><script>document.querySelector('select[name=version]').dispatchEvent(new Event('change'))</script>"""
+</div><script>document.querySelector('select[name=version]').dispatchEvent(new Event('change'))</script>
+"""
 
 
 @app.route("/settings/hosts/<int:hid>/snmp", methods=["GET", "POST"])

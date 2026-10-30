@@ -10,9 +10,19 @@ systemctl status pingmonitor
 sudo timedatectl set-timezone Europe/Athens
 ```
 
-`sudo ./install.sh` must be run from this clone (it copies `pingmonitor.py`, `requirements.txt` and `pingmonitor.service` from the script's directory). It installs `python3`, `python3-venv`, `iputils-ping`, `openssl` and `ca-certificates`, creates the `pingmon` user, and installs a venv under `/opt/pingmonitor`. On a terminal, when no admin password is stored yet, it **prompts for the admin password** (minimum 8 characters, typed twice), then enables and starts `pingmonitor.service`.
+`sudo ./install.sh` must be run from this clone (it copies `pingmonitor.py`, `requirements.txt`, `pingmonitor.service` and `assets/wirewave_logo.jpg`). It installs `python3`, `python3-venv`, `iputils-ping`, `openssl` and `ca-certificates`, creates the `pingmon` user, and installs a venv under `/opt/pingmonitor`. On a terminal, when no admin password is stored yet, it **prompts for the admin password** (minimum 8 characters, typed twice).
 
-The service listens on `127.0.0.1:8080`. Open http://localhost:8080 on that machine, or publish it with a Cloudflare Tunnel (section 7). `sudo timedatectl set-timezone Europe/Athens` sets the OS clock; the app's timezone setting already defaults to `Europe/Athens`.
+The web page listens on **all interfaces** (`0.0.0.0:8080`) and **starts on boot**. There is no question to answer. At the end the installer prints both addresses, and it checks that `systemctl is-enabled pingmonitor` prints `enabled`:
+
+* LAN: `http://<LAN-IP>:8080` (another PC on the same network)
+* this machine: `http://127.0.0.1:8080`
+* Cloudflare Tunnel: point the public hostname at `http://localhost:8080`
+
+Both work at the same time. `cloudflared` on this machine connects to localhost. A PC on the LAN opens the LAN address. Login lockout uses the real visitor: through the tunnel that is Cloudflare's `CF-Connecting-IP` header (trusted only from localhost), and from the LAN it is that PC's own address. A fake `CF-Connecting-IP` header sent from the LAN is ignored.
+
+To listen on this machine only, run `PINGMON_HOST=127.0.0.1 sudo ./install.sh`. The choice is saved in `/opt/pingmonitor/data/web-bind` and kept on the next update. Switch back to LAN + tunnel with `PINGMON_HOST=0.0.0.0 sudo ./install.sh`.
+
+`sudo timedatectl set-timezone Europe/Athens` sets the OS clock. The app's timezone setting already defaults to `Europe/Athens`.
 
 ## Update
 
@@ -20,11 +30,13 @@ The service listens on `127.0.0.1:8080`. Open http://localhost:8080 on that mach
 cd pingmonitor && git pull && sudo ./install.sh
 ```
 
-Run that from the parent of the clone. The installer copies the new files over `/opt/pingmonitor`, refreshes the venv and restarts the service. Settings, hosts and history in `/opt/pingmonitor/data` are kept, and the password prompt is skipped when one is already set.
+Run that from the parent of the clone (for example `cd ~/pingmonitor` when the clone is in the root home directory). The installer copies the new files over `/opt/pingmonitor`, refreshes the venv, reloads systemd and restarts the service. Settings, hosts and history are kept, and the password prompt is skipped when one is already set.
+
+The first update from an older install, which always listened on `127.0.0.1`, switches the page to `0.0.0.0` so other PCs can open it. After that, a later update keeps the saved address. An update also enables the service for boot if it was not enabled yet.
 
 ---
 
-A small, single-file network monitor for hotel and client sites. It runs on a Debian thin client and you reach it through Cloudflare Tunnel.
+A small, single-file network monitor for hotel and client sites. It runs on a Debian machine. People on the LAN open it directly, and you can also publish it with Cloudflare Tunnel.
 
 * **Ping** every host on a fixed interval, with a latency graph and green/red state. It alerts after N failed pings and again on recovery.
 * **Settings page** (admin only) covers: hosts, general, Telegram, outgoing e-mail (SMTP), the incoming device-mail receiver, SNMP and traps, the webhook, the API token and the password.
@@ -35,11 +47,12 @@ A small, single-file network monitor for hotel and client sites. It runs on a De
 * Everything is in **one script**, `pingmonitor.py`, with SQLite storage. History is pruned after 30 days. Times use Europe/Athens.
 
 ```
-wirewave_ping_monitor_v2/
-├── pingmonitor.py        the whole app (web UI, monitor, mail receiver, SNMP, API)
+├── pingmonitor.py          the whole app (web UI, monitor, mail receiver, SNMP, API)
 ├── requirements.txt
-├── install.sh            Debian installer (venv + systemd)
-├── pingmonitor.service   systemd unit
+├── install.sh              Debian installer (venv + systemd, listens on the LAN)
+├── pingmonitor.service     systemd unit (starts on boot)
+├── assets/wirewave_logo.jpg
+├── screenshots/
 └── README.md
 ```
 
@@ -60,9 +73,9 @@ The installer does the following:
 2. Creates the system user `pingmon`.
 3. Copies the files to `/opt/pingmonitor` and builds a virtualenv.
 4. **Asks for the admin password**: it runs the script's own first-run prompt (min. 8 characters, typed twice).
-5. Installs and starts the `pingmonitor` systemd service on **127.0.0.1:8080**.
+5. Installs and starts the `pingmonitor` systemd service on **0.0.0.0:8080** (every interface) and enables it for the next boot (`systemctl enable --now`). `Restart=always` brings it back if it exits.
 
-Run `install.sh` again to upgrade. Settings, hosts and history are kept.
+Run `install.sh` again to upgrade. Settings, hosts and history are kept. The listen address saved in `/opt/pingmonitor/data/web-bind` is kept too. The first upgrade from a build that was hard-coded to `127.0.0.1` moves the page onto the LAN.
 
 | Task | Command |
 |---|---|
@@ -70,13 +83,17 @@ Run `install.sh` again to upgrade. Settings, hosts and history are kept.
 | Reset admin password | `sudo -u pingmon /opt/pingmonitor/venv/bin/python /opt/pingmonitor/pingmonitor.py --db /opt/pingmonitor/data/pingmonitor.db --set-password && sudo systemctl restart pingmonitor` |
 | Show the API token | `... pingmonitor.py --db /opt/pingmonitor/data/pingmonitor.db --show-token` |
 | Health check | `curl http://127.0.0.1:8080/healthz` -> `ok` |
-| Open from your laptop on the LAN | `ssh -L 8080:127.0.0.1:8080 user@thinclient`, then open http://127.0.0.1:8080 |
+| Open from another PC on the LAN | `http://<LAN-IP>:8080` (printed at the end of `install.sh`) |
+| This machine only (no LAN) | `PINGMON_HOST=127.0.0.1 sudo ./install.sh` |
+| LAN and Cloudflare Tunnel together | `PINGMON_HOST=0.0.0.0 sudo ./install.sh` (also the default) |
+| Confirm it starts on boot | `systemctl is-enabled pingmonitor` -> `enabled` |
 
 **Running it by hand** (any OS) goes through the same password flow:
 
 ```bash
 python3 -m venv venv && . venv/bin/activate && pip install -r requirements.txt
-python pingmonitor.py            # first run: "Create admin password:" -> then http://127.0.0.1:8080
+python pingmonitor.py            # first run asks for the admin password, then http://127.0.0.1:8080
+python pingmonitor.py --host 0.0.0.0   # same listen address as the Debian service: LAN and localhost
 python pingmonitor.py --help     # --db, --host, --port, --set-password, --show-token ...
 ```
 
@@ -317,7 +334,7 @@ The webhook is fire-and-forget: one try with a 15 s timeout, logged on failure. 
 
 ## 7. Remote access with Cloudflare Tunnel
 
-The app listens only on `127.0.0.1:8080`; `cloudflared` publishes it. This needs no port forwarding and works behind CGNAT or Starlink.
+The app listens on every interface, so a PC on the LAN can open `http://<LAN-IP>:8080` directly. `cloudflared` on the same machine still publishes it: point the tunnel's public hostname at `http://localhost:8080`. That needs no port forwarding and works behind CGNAT or Starlink. Login lockout treats the two paths separately. A tunnel visitor is the address in `CF-Connecting-IP`, and that header is trusted only when the connection comes from localhost (where `cloudflared` runs). A PC on the LAN is limited by its own address, even if it sends a fake `CF-Connecting-IP` header.
 
 ```bash
 # install (Cloudflare apt repo)
@@ -385,6 +402,7 @@ For Grok Bot, use one webhook URL with the `site` field telling the clients apar
 | SNMP "privacy/decryption" error | v3 priv password or AES/DES mismatch; check `pip show cryptography` is installed |
 | No traps | Trap target IP/port on the device; receiver enabled; community in the accepted list; source in allowed networks; firewall udp 1162/162 |
 | CPU/RAM shows "-" | The device doesn't expose HOST-RESOURCES/UCD (common on cheap switches) |
-| Cloudflare 502 | `curl http://127.0.0.1:8080/healthz`; is the service running? |
+| Page opens on the VM but not from another PC | `systemctl cat pingmonitor` should show `--host 0.0.0.0`. If it shows `127.0.0.1`, run `PINGMON_HOST=0.0.0.0 sudo ./install.sh`. If `ufw` is active: `sudo ufw allow 8080/tcp`. |
+| Cloudflare 502 | `curl http://127.0.0.1:8080/healthz`; is the service running? The tunnel target must be `http://localhost:8080`. |
 | API 401 behind Cloudflare | Add the Access service-token headers (§6.1) as well as the Bearer token |
 | Wrong times | `sudo timedatectl set-timezone Europe/Athens` and check Settings -> General -> Timezone |

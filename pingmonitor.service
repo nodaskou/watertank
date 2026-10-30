@@ -8,8 +8,10 @@ Type=simple
 User=pingmon
 Group=pingmon
 WorkingDirectory=/opt/pingmonitor
-ExecStart=/opt/pingmonitor/venv/bin/python /opt/pingmonitor/pingmonitor.py --db /opt/pingmonitor/data/pingmonitor.db --host 127.0.0.1 --port 8080
-Restart=on-failure
+# __BIND_HOST__ is replaced by install.sh. Default 0.0.0.0: LAN users open
+# http://<LAN-IP>:8080 and cloudflared on this machine uses http://localhost:8080.
+ExecStart=/opt/pingmonitor/venv/bin/python /opt/pingmonitor/pingmonitor.py --db /opt/pingmonitor/data/pingmonitor.db --host __BIND_HOST__ --port 8080
+Restart=always
 RestartSec=10
 # exit code 2 = no admin password yet -> run: sudo -u pingmon /opt/pingmonitor/venv/bin/python /opt/pingmonitor/pingmonitor.py --db /opt/pingmonitor/data/pingmonitor.db --set-password
 RestartPreventExitStatus=2
