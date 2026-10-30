@@ -878,6 +878,7 @@ def monitor_loop(stop):
                         interval = min(interval, int(n))
                 if start - int(s.get("public_ip_at") or 0) >= 600:
                     refresh_public_ip()
+                sia_supervise()
             except Exception:
                 log.exception("schedule lookup failed")
             stop.wait(max(1, interval - (time.time() - start)))
@@ -2379,7 +2380,7 @@ def _secret_input(name):
 SETTINGS_BODY = """
 <div class="nav"><a href="#general">General</a><a href="#hosts">Hosts</a><a href="#alerts">Alerts</a><a href="#internet">Internet</a>
 <a href="#graphs">Dashboard graphs</a><a href="#backups">Backups</a><a href="#telegram">Telegram</a><a href="#email">Outgoing e-mail</a>
-<a href="#receiver">Incoming e-mail (devices)</a><a href="#snmp">SNMP + traps</a><a href="#webhook">Webhook</a><a href="#api">API</a><a href="#password">Passwords</a></div>
+<a href="#receiver">Incoming e-mail (devices)</a><a href="#snmp">SNMP + traps</a><a href="#webhook">Webhook</a><a href="#api">API</a><a href="{{ url_for('alarm_settings') }}">Alarms</a><a href="#password">Passwords</a></div>
 
 <div class="card" id="hosts"><h2>Hosts</h2>
 <p class="section-intro">Each row is one device this monitor pings. Add a camera, router, access point or server you want to watch. Save a row after you change it.</p>
@@ -3202,6 +3203,166 @@ def save_dash_graphs():
     return redirect(url_for("settings") + "#graphs")
 
 
+SIA = siarecv.SIAServer()
+
+
+def _sia_map():
+    """Account id -> pysiaalarm account. Keys are decrypted only in memory."""
+    from pysiaalarm.account import SIAAccount
+    out = {}
+    with db() as c:
+        rows = c.execute("SELECT * FROM sia_accounts").fetchall()
+    for row in rows:
+        key = decrypt_secret(row["key_enc"]) if row["key_enc"] else None
+        try:
+            out[row["account"].upper()] = SIAAccount(row["account"], key=key or None, allowed_timeband=(1200, 1200))
+        except Exception as e:
+            log.warning("SIA account %s skipped: %s", row["account"], e)
+    return out
+
+
+def on_sia_frame(line, peer):
+    s = get_settings()
+    if not ip_allowed(peer, s.get("rx_allowed_nets")):
+        log.warning("SIA from %s ignored (not in allowed networks)", peer)
+        return siarecv._response("NAK", "0000", "R0", "L0", "000")
+    info = siarecv.parse_line(line, _sia_map())
+    if not info.get("ok"):
+        log.info("SIA reject from %s: %s", peer, info.get("error"))
+        return info
+    account = info.get("account") or ""
+    now = time.time()
+    with db() as c:
+        row = c.execute("SELECT * FROM sia_accounts WHERE account=?", (account,)).fetchone()
+    if not row:
+        return info
+    state = info.get("state") or (row["rest_state"] if info.get("heartbeat") and row["state"] == "offline" else row["state"])
+    if info.get("heartbeat") and row["state"] == "offline":
+        state = row["rest_state"] or "unknown"
+    rest = state if state and state != "offline" else row["rest_state"]
+    text = "" if info.get("heartbeat") else info.get("text") or ""
+    with _db_lock, db() as c:
+        c.execute("UPDATE sia_accounts SET last_ts=?, last_text=CASE WHEN ?='' THEN last_text ELSE ? END, state=?, rest_state=?, offline_alerted=0 WHERE account=?",
+                  (now, text, text, state or row["state"], rest or "unknown", account))
+    if not info.get("heartbeat"):
+        host = {"id": None, "name": row["name"], "host": account, "device_type": row["panel"]}
+        add_event("sia", "sia_" + (info.get("code") or "event"), info["severity"], None,
+                  info["text"][:80], f"{row['name']} ({account}): {info['text']}",
+                  {"account": account, "panel": row["panel"], "zone": info.get("zone"), "peer": peer})
+        consider_notify(s, None, info["severity"], f"[{s['site_name']}] {row['name']}: {info['text'][:80]}",
+                        f"{row['name']} account {account}\n{info['text']}\nfrom {peer}",
+                        build_payload(s, "device_alert", None, host, severity=info["severity"], message=info["text"]))
+    elif row["state"] == "offline":
+        add_event("sia", "sia_online", "info", None, "Panel online", f"{row['name']} sent a heartbeat again.",
+                  {"account": account})
+    return info
+
+
+def sia_supervise():
+    s = get_settings()
+    now = time.time()
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM sia_accounts")]
+    for row in rows:
+        limit = max(1, int(row["supervise_min"] or 10)) * 60
+        if not row["last_ts"] or now - row["last_ts"] < limit or row["offline_alerted"]:
+            continue
+        with _db_lock, db() as c:
+            c.execute("UPDATE sia_accounts SET state='offline', offline_alerted=1 WHERE account=?", (row["account"],))
+        msg = f"{row['name']} ({row['account']}) sent no heartbeat for {row['supervise_min']} minutes."
+        add_event("sia", "sia_offline", "critical", None, "Panel offline", msg, {"account": row["account"]})
+        consider_notify(s, None, "critical", f"[{s['site_name']}] Panel offline: {row['name']}", msg,
+                        build_payload(s, "device_alert", None, None, severity="critical", message=msg))
+
+
+def restart_sia():
+    s = get_settings()
+    if not s.get("sia_enabled"):
+        SIA.stop_server()
+        return
+    try:
+        SIA.start(s.get("sia_host") or "0.0.0.0", int(s.get("sia_port") or 12128),
+                  bool(s.get("sia_tcp")), bool(s.get("sia_udp")), on_sia_frame)
+    except Exception as e:
+        log.error("SIA receiver failed: %s", e)
+
+
+@app.route("/settings/alarms", methods=["GET", "POST"])
+@admin_required
+def alarm_settings():
+    if request.method == "POST":
+        if request.form.get("delete"):
+            with _db_lock, db() as c:
+                c.execute("DELETE FROM sia_accounts WHERE account=?", (request.form.get("delete").upper(),))
+            flash("Account removed.")
+            return redirect(url_for("alarm_settings"))
+        account = (request.form.get("account") or "").strip().upper()
+        name = (request.form.get("name") or "").strip()[:60]
+        panel = request.form.get("panel") if request.form.get("panel") in siarecv.PANELS else "other"
+        try:
+            supervise = int(request.form.get("supervise_min") or 10)
+        except ValueError:
+            supervise = 10
+        key = (request.form.get("key") or "").strip()
+        if not re.fullmatch(r"[A-F0-9]{3,16}", account):
+            flash("Account must be 3-16 hex characters (an Ajax object number is fine).")
+            return redirect(url_for("alarm_settings"))
+        if key and (len(key) not in (16, 24, 32) or not re.fullmatch(r"[0-9A-Fa-f]+", key)):
+            flash("Encryption key must be 16, 24 or 32 hex characters, or empty for no encryption.")
+            return redirect(url_for("alarm_settings"))
+        if not name:
+            flash("Give the panel a name, for example Ajax office.")
+            return redirect(url_for("alarm_settings"))
+        with db() as c:
+            old = c.execute("SELECT key_enc FROM sia_accounts WHERE account=?", (account,)).fetchone()
+        key_enc = encrypt_secret(key) if key else (old["key_enc"] if old else "")
+        with _db_lock, db() as c:
+            c.execute("""INSERT INTO sia_accounts(account, name, panel, key_enc, supervise_min)
+                         VALUES(?,?,?,?,?) ON CONFLICT(account) DO UPDATE SET
+                         name=excluded.name, panel=excluded.panel, key_enc=excluded.key_enc,
+                         supervise_min=excluded.supervise_min""",
+                      (account, name, panel, key_enc, max(1, min(supervise, 1440))))
+        set_settings(sia_enabled=1 if request.form.get("sia_enabled") else 0,
+                     sia_port=int(request.form.get("sia_port") or 12128))
+        restart_sia()
+        flash("Alarm account saved. This monitor is not a certified receiving centre.")
+        return redirect(url_for("alarm_settings"))
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM sia_accounts ORDER BY name")]
+    body = """<div class="card"><h2>Alarm panels (SIA DC-09)</h2>
+<p class="section-intro"><b>Information only.</b> This is not a certified alarm receiving centre (ARC/CMS). Keep Ajax, TrikdisConfig/Protegus, Hik-Connect and the Dahua app as the primary monitoring. TRK, the proprietary Trikdis protocol, is not supported — use SIA DC-09.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Receiver enabled</label><div><input type="checkbox" name="sia_enabled" value="1" {{ 'checked' if s.sia_enabled }}>
+<p class="hint">Listens on TCP and UDP port {{ s.sia_port }} on all interfaces. Only senders in the e-mail receiver's allowed networks are accepted. Example port: <code>12128</code>.</p></div>
+<label>Port</label><div><input type="number" name="sia_port" min="1" max="65535" value="{{ s.sia_port }}"></div>
+<label>Account</label><div><input type="text" name="account" placeholder="1234" maxlength="16">
+<p class="hint">The object / account number in the panel, 3-16 hex digits. Example: <code>1234</code>.</p></div>
+<label>Name</label><div><input type="text" name="name" placeholder="Office Ajax"></div>
+<label>Panel</label><div><select name="panel">
+<option value="ajax">Ajax hub</option><option value="trikdis">Trikdis communicator</option>
+<option value="hik_ax">Hikvision AX PRO / AX Hybrid</option><option value="dahua_arc">Dahua AirShield / ARC</option>
+<option value="other">Other SIA DC-09 panel</option></select></div>
+<label>AES key</label><div><input type="password" name="key" autocomplete="new-password" placeholder="empty = no encryption">
+<p class="hint">Optional. 16, 24 or 32 hex characters (AES-128/192/256). Stored encrypted. Leave empty when saving to keep the current key.</p></div>
+<label>Heartbeat timeout (min)</label><div><input type="number" name="supervise_min" value="10" min="1" max="1440">
+<p class="hint">Alarm “panel offline” if no NULL heartbeat arrives in this many minutes. Example: <code>10</code>. Match the panel's ping interval and add a couple of minutes.</p></div>
+<span></span><div><button>Save account</button></div></div></form>
+<h2>How to point the panel here</h2>
+<ul class="help-list">
+<li><b>Ajax</b> — PRO Desktop → Hub → Settings → Monitoring station. Protocol SIA DC-09 (SIA-DCS or ADM-CID). IP = this machine, port = the number above, account = object number. Encryption only if you set a key here.</li>
+<li><b>Trikdis</b> (GT+, G16, E16, SP3 and similar, via TrikdisConfig) — monitoring channel SIA DC-09, DCS or ADM-CID. Fill account, receiver/line if asked (R0 L0 is fine), and the same hex key length. Heartbeats are NULL messages. The TRK protocol used toward Protegus is not accepted.</li>
+<li><b>Hikvision AX PRO / AX Hybrid</b> — Hik-Connect or the panel web page → Communication → Alarm receiving centre. Protocol SIA-DCS or ADM-CID, this IP and port, account, optional encryption, and a heartbeat interval.</li>
+<li><b>Dahua AirShield / ARC</b> — ARC settings → SIA DC-09 or Contact ID over IP. Account, this IP and port, heartbeat. Camera and NVR events stay on the camera API and the e-mail receiver, not here.</li>
+</ul>
+<table><tr><th>Name</th><th>Account</th><th>Panel</th><th>State</th><th></th></tr>
+{% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.state }}</td>
+<td><button form="del{{ a.account }}" class="del">Remove</button></td></tr>{% else %}<tr><td colspan="5" class="muted">No accounts yet.</td></tr>{% endfor %}</table>
+{% for a in rows %}<form id="del{{ a.account }}" method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="delete" value="{{ a.account }}"></form>{% endfor %}
+</div>"""
+    return page(body, rows=rows)
+
+
 def main():
     global DB_PATH, DATA_DIR, SNAP_DIR
     ap = argparse.ArgumentParser(description=APP_NAME + " v" + VERSION)
@@ -3247,6 +3408,7 @@ def main():
     threading.Thread(target=monitor_loop, args=(stop,), daemon=True, name="monitor").start()
     RECEIVER.restart()
     SNMP.start()
+    restart_sia()
     log.info("%s %s - site '%s' - web UI http://%s:%d", APP_NAME, VERSION, s["site_name"], a.host, a.port)
     try:
         from waitress import serve

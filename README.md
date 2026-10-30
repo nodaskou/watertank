@@ -28,6 +28,8 @@ The dashboard opens with a status bar: internet latency and packet loss, the sit
 
 Alarms use a failed-ping count (global default 3, overridable per host) and a repeat interval (global default 30 minutes, `0` = do not repeat, also overridable per host). Each host can also use its own ping interval; empty means the global one.
 
+Alarm panels (Ajax, Trikdis, Hikvision AX PRO / AX Hybrid, Dahua AirShield / ARC) can send SIA DC-09 to TCP/UDP port 12128. Open **Settings → Alarms** for the account, the optional AES key, and the click-path on each brand. Trikdis TRK toward Protegus is not accepted. This is technical monitoring, not a certified alarm receiving centre; keep the vendor app as the primary path. NVR and camera events stay on the camera API and the e-mail receiver.
+
 ## Update
 
 ```bash
