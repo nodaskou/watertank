@@ -1,5 +1,5 @@
 [Unit]
-Description=Wirewave Ping Monitor v2
+Description=Wirewave Network Infrastructure Monitor
 Wants=network-online.target
 After=network-online.target
 

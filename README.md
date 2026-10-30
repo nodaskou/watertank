@@ -1,4 +1,4 @@
-# Wirewave Ping Monitor v2
+# Wirewave Network Infrastructure Monitor
 
 ## Quick install (Debian)
 
@@ -22,7 +22,11 @@ Both work at the same time. `cloudflared` on this machine connects to localhost.
 
 To listen on this machine only, run `PINGMON_HOST=127.0.0.1 sudo ./install.sh`. The choice is saved in `/opt/pingmonitor/data/web-bind` and kept on the next update. Switch back to LAN + tunnel with `PINGMON_HOST=0.0.0.0 sudo ./install.sh`.
 
-`sudo timedatectl set-timezone Europe/Athens` sets the OS clock. The app's timezone setting already defaults to `Europe/Athens`.
+The installer sets the OS timezone to `Europe/Athens` (`timedatectl`, or a symlink to `/usr/share/zoneinfo` if that is not available). Override it with `PINGMON_TZ=Europe/Athens sudo ./install.sh`. The app's own timezone setting already defaults to `Europe/Athens`.
+
+The dashboard opens with a status bar: internet latency and packet loss, the site's public IP (and the provider name when a lookup works), and the time of the last check. The bar is green when the internet, every host, the UPS and the alarm panels are quiet. It is red for a down internet, down devices, a UPS on battery or an alarm, and amber for high latency, high loss or maintenance. A change of public IP is logged and sent as an info alert.
+
+Alarms use a failed-ping count (global default 3, overridable per host) and a repeat interval (global default 30 minutes, `0` = do not repeat, also overridable per host). Each host can also use its own ping interval; empty means the global one.
 
 ## Update
 

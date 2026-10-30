@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Wirewave Ping Monitor v2 - all-in-one network monitor for client sites.
+Wirewave Network Infrastructure Monitor - network, camera and alarm monitor for client sites.
 
  * Pings hosts (MikroTik, UniFi, Hikvision, Dahua, TP-Link/Omada, ...) every N seconds
  * Read-only dashboard (green / amber / red, latency, uptime, 24h graphs, events)
@@ -17,6 +17,11 @@ import argparse
 import asyncio
 import base64
 import getpass
+import jobs
+import mtbackup
+import reportpdf
+import siarecv
+import wirelogic
 import hashlib
 import hmac
 import ipaddress
@@ -53,9 +58,10 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None
 
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
-                   request, send_from_directory, session, url_for)
+                   request, send_file, send_from_directory, session, url_for)
 
-VERSION = "2.1"
+VERSION = "2.2"
+APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
 
@@ -78,6 +84,7 @@ DEVICE_TYPES = {
     "pbx":       ("Phone system / PBX", "PBX", "#7c3aed"),
     "server":    ("PC / server / NVR software", "PC", "#475569"),
     "printer":   ("Printer", "PRN", "#a16207"),
+    "ups":       ("UPS", "UPS", "#b45309"),
 }
 
 # ----------------------------------------------------------------------------- settings
@@ -88,6 +95,7 @@ DEFAULTS = {
     "ping_interval": 60,
     "ping_timeout": 2,
     "fail_threshold": 3,
+    "repeat_min": 30,
     "retention_days": 30,
     "ping_method": "auto",
     "dashboard_access": "login",          # login | public
@@ -109,6 +117,16 @@ DEFAULTS = {
     "snmp_enabled": 1, "snmp_interval": 300, "snmp_timeout": 2, "snmp_cpu_threshold": 90,
     "snmp_alert_ifdown": 1, "snmp_alert_reboot": 1, "snmp_forward_min": "warning",
     "trap_enabled": 0, "trap_host": "0.0.0.0", "trap_port": 1162, "trap_community": "", "trap_forward_min": "warning",
+    "quiet_start": "", "quiet_end": "", "quiet_critical": 1,
+    "maintenance_until": 0,
+    "cam_interval": 900,
+    "snmp_temp_threshold": 75, "snmp_util_threshold": 80,
+    "wan_enabled": 1, "wan_targets": "1.1.1.1, 8.8.8.8", "wan_loss_pct": 20, "wan_latency_ms": 200, "wan_count": 5,
+    "mt_backup_day": 0, "mt_backup_time": "03:00", "mt_backup_keep": 52,
+    "ups_runtime_min": 10, "ups_load_pct": 80,
+    "event_keep": 100,
+    "public_ip": "", "public_ip_isp": "", "public_ip_at": 0,
+    "sia_enabled": 0, "sia_host": "0.0.0.0", "sia_port": 12128, "sia_tcp": 1, "sia_udp": 1,
 }
 INT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, int)}
 SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password"}
@@ -130,6 +148,63 @@ def db():
     conn = sqlite3.connect(DB_PATH, timeout=30, factory=_Conn)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _cols(c, table):
+    return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_col(c, table, name, decl):
+    if name not in _cols(c, table):
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _migrate(c):
+    """Add columns and tables used by later versions. Existing rows keep working."""
+    _add_col(c, "hosts", "fail_n", "INTEGER NOT NULL DEFAULT 0")
+    _add_col(c, "hosts", "repeat_min", "INTEGER NOT NULL DEFAULT -1")
+    _add_col(c, "hosts", "ping_every", "INTEGER NOT NULL DEFAULT 0")
+    _add_col(c, "hosts", "last_alert", "REAL NOT NULL DEFAULT 0")
+    _add_col(c, "hosts", "maint_until", "REAL NOT NULL DEFAULT 0")
+    had_alert = "alerted_down" in _cols(c, "hosts")
+    _add_col(c, "hosts", "alerted_down", "INTEGER NOT NULL DEFAULT 0")
+    if not had_alert:
+        c.execute("UPDATE hosts SET alerted_down=1 WHERE state='down'")
+    _add_col(c, "hosts", "cam", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "hosts", "mtbak", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "results", "n", "INTEGER NOT NULL DEFAULT 1")
+    if "nok" not in _cols(c, "results"):
+        c.execute("ALTER TABLE results ADD COLUMN nok INTEGER")
+        c.execute("UPDATE results SET nok=ok WHERE nok IS NULL")
+    _add_col(c, "results", "g", "INTEGER NOT NULL DEFAULT 0")
+    _add_col(c, "snmp_samples", "temp", "REAL")
+    _add_col(c, "snmp_samples", "extra", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "snmp_samples", "g", "INTEGER NOT NULL DEFAULT 0")
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS cam_state(host_id INTEGER PRIMARY KEY, ts REAL, data TEXT);
+        CREATE TABLE IF NOT EXISTS wan_samples(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, target TEXT NOT NULL,
+            loss REAL, avg_ms REAL, jitter REAL, g INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS idx_wan_ts ON wan_samples(ts);
+        CREATE TABLE IF NOT EXISTS wan_status(
+            id INTEGER PRIMARY KEY CHECK(id=1), state TEXT, since_ts REAL,
+            alerted INTEGER NOT NULL DEFAULT 0, detail TEXT);
+        CREATE TABLE IF NOT EXISTS alert_queue(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, severity TEXT, subject TEXT, body TEXT, payload TEXT);
+        CREATE TABLE IF NOT EXISTS backups(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, host_id INTEGER NOT NULL, ts REAL NOT NULL,
+            ok INTEGER NOT NULL, error TEXT, path TEXT, bin_path TEXT, sha TEXT,
+            changed INTEGER NOT NULL DEFAULT 0, diff TEXT, bytes INTEGER);
+        CREATE TABLE IF NOT EXISTS dash_ifaces(
+            host_id INTEGER NOT NULL, iface TEXT NOT NULL,
+            color_in TEXT NOT NULL DEFAULT '#16a34a', color_out TEXT NOT NULL DEFAULT '#1d5fbf',
+            PRIMARY KEY(host_id, iface));
+        CREATE TABLE IF NOT EXISTS sia_accounts(
+            account TEXT PRIMARY KEY, name TEXT NOT NULL, panel TEXT NOT NULL DEFAULT 'ajax',
+            key_enc TEXT NOT NULL DEFAULT '', supervise_min INTEGER NOT NULL DEFAULT 10,
+            last_ts REAL, last_text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'unknown',
+            rest_state TEXT NOT NULL DEFAULT 'unknown', offline_alerted INTEGER NOT NULL DEFAULT 0);
+    """)
 
 
 def init_db():
@@ -158,6 +233,7 @@ def init_db():
         cols = {r[1] for r in c.execute("PRAGMA table_info(hosts)")}
         if "snmp" not in cols:   # upgrade from 2.0
             c.execute("ALTER TABLE hosts ADD COLUMN snmp TEXT NOT NULL DEFAULT ''")
+        _migrate(c)
         for k, v in DEFAULTS.items():
             c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, str(v)))
         for k in ("secret_key", "api_token"):
@@ -188,6 +264,109 @@ def set_settings(**kv):
             c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (k, str(v)))
 
 
+def _fernet():
+    from cryptography.fernet import Fernet
+    key = base64.urlsafe_b64encode(hashlib.sha256(get_settings()["secret_key"].encode()).digest())
+    return Fernet(key)
+
+
+def encrypt_secret(plain):
+    if not plain:
+        return ""
+    return "enc:" + _fernet().encrypt(plain.encode()).decode()
+
+
+def decrypt_secret(stored):
+    if not stored:
+        return ""
+    if not str(stored).startswith("enc:"):
+        return stored
+    try:
+        return _fernet().decrypt(str(stored)[4:].encode()).decode()
+    except Exception:
+        return ""
+
+
+def minute_now(now=None):
+    local = datetime.fromtimestamp(now or time.time(), tzinfo())
+    return local.hour * 60 + local.minute
+
+
+def global_maint(s, now=None):
+    return int(s.get("maintenance_until") or 0) > (now or time.time())
+
+
+def host_maint(h, s, now=None):
+    now = now or time.time()
+    if global_maint(s, now):
+        return True
+    return bool(h) and float(h.get("maint_until") or 0) > now
+
+
+def is_quiet(s, now=None):
+    return wirelogic.in_quiet(s.get("quiet_start"), s.get("quiet_end"), minute_now(now))
+
+
+def fail_limit(h, s):
+    n = int(h.get("fail_n") or 0)
+    return n if n > 0 else max(1, int(s["fail_threshold"]))
+
+
+def repeat_minutes(h, s):
+    """Minutes between repeat DOWN alerts. Host -1 uses the global value. 0 means never."""
+    raw = h.get("repeat_min")
+    n = int(s.get("repeat_min") or 0) if raw is None or int(raw) < 0 else int(raw)
+    return max(0, n)
+
+
+def ping_seconds(h, s):
+    """Seconds between pings. 0 on the host uses the global interval."""
+    n = int(h.get("ping_every") or 0)
+    return n if n >= 10 else max(10, int(s["ping_interval"]))
+
+
+def consider_notify(s, host, severity, subject, text, payload):
+    """Send, queue for quiet hours, or drop while maintenance is on."""
+    now = time.time()
+    if host_maint(host, s, now) or (host is None and global_maint(s, now)):
+        return "suppressed"
+    if is_quiet(s, now) and not (severity == "critical" and s.get("quiet_critical")):
+        with _db_lock, db() as c:
+            c.execute("INSERT INTO alert_queue(ts, severity, subject, body, payload) VALUES(?,?,?,?,?)",
+                      (now, severity, subject, text, json.dumps(payload)))
+        return "queued"
+    notify(subject, text, payload)
+    return "sent"
+
+
+SPANS = {"12h": 12 * 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+SPAN_LABEL = {"12h": "12 hours", "24h": "24 hours", "7d": "7 days", "30d": "30 days"}
+
+
+def current_span():
+    span = request.args.get("span", "24h")
+    if span not in SPANS:
+        span = "24h"
+    return span, SPANS[span]
+
+
+def local_input_to_ts(text):
+    text = (text or "").strip()
+    if not text:
+        return 0
+    try:
+        dt = datetime.strptime(text[:16], "%Y-%m-%dT%H:%M")
+    except ValueError:
+        raise ValueError("use the date and time picker")
+    return dt.replace(tzinfo=tzinfo()).timestamp()
+
+
+def ts_to_local_input(ts):
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(float(ts), tzinfo()).strftime("%Y-%m-%dT%H:%M")
+
+
 # ----------------------------------------------------------------------------- passwords
 def hash_password(pw):
     salt = os.urandom(16)
@@ -214,7 +393,7 @@ def prompt_new_password(from_stdin=False):
         if len(pw) < 8:
             sys.exit("Password must be at least 8 characters")
         return pw
-    print("=== Wirewave Ping Monitor - set admin password ===")
+    print(f"=== {APP_NAME} - set admin password ===")
     for _ in range(3):
         pw = getpass.getpass("New admin password (min 8 chars): ")
         if len(pw) < 8:
@@ -388,7 +567,8 @@ def send_email(s, subject, text):
         raise RuntimeError("SMTP server / recipients not set")
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = s["smtp_from"] or s["smtp_user"] or "pingmonitor@localhost"
+    addr = s["smtp_from"] or s["smtp_user"] or "monitor@localhost"
+    msg["From"] = addr if "<" in addr else f"{APP_NAME} <{addr}>"
     msg["To"] = ", ".join(to)
     msg.set_content(text)
     ctx = ssl.create_default_context()
@@ -410,7 +590,7 @@ def send_email(s, subject, text):
 def send_webhook(s, payload):
     if not s["webhook_url"].startswith(("http://", "https://")):
         raise RuntimeError("Webhook URL must start with http:// or https://")
-    headers = {"Content-Type": "application/json", "User-Agent": f"WirewavePingMonitor/{VERSION}",
+    headers = {"Content-Type": "application/json", "User-Agent": f"WirewaveNetworkInfrastructureMonitor/{VERSION}",
                "X-PingMonitor-Event": payload["event"]}
     if s["webhook_header_name"] and s["webhook_header_value"]:
         headers[s["webhook_header_name"]] = s["webhook_header_value"]
@@ -448,6 +628,10 @@ def build_payload(s, event, ev_id=None, host=None, state=None, down_since=None, 
 
 def notify(subject, text, payload, photo=None, sync=False):
     """Send to all enabled channels. Async with retries unless sync=True."""
+    if APP_NAME not in subject:
+        subject = f"{APP_NAME}: {subject}"
+    if APP_NAME not in text[:120]:
+        text = APP_NAME + "\n" + text
     s = get_settings()
     jobs = []
     if s["telegram_enabled"]:
@@ -483,6 +667,10 @@ def add_event(source, kind, severity, host=None, title="", message="", details=N
         (ts or time.time(), source, kind, severity, host["id"] if host else None,
          host["name"] if host else None, host["host"] if host else None, title, message,
          json.dumps(details or {}, ensure_ascii=False), json.dumps(attachments or [])))
+    try:
+        jobs.trim_events(sys.modules[__name__], conn)
+    except Exception:
+        log.debug("event trim skipped", exc_info=True)
     return cur.lastrowid
 
 
@@ -496,74 +684,202 @@ def monitor_cycle(pool):
         return
     timeout = float(s["ping_timeout"])
     now = time.time()
-    results = list(pool.map(lambda h: (h, *pinger["fn"](h["host"], timeout)), hosts))
-    threshold = max(1, s["fail_threshold"])
+    due = []
+    for h in hosts:
+        last = h.get("last_check") or 0
+        if not last or now - last >= ping_seconds(h, s) - 1:
+            due.append(h)
+    if not due:
+        return
+    results = list(pool.map(lambda h: (h, *pinger["fn"](h["host"], timeout)), due))
     site = s["site_name"]
     with _db_lock, db() as c:
         for h, ok, ms in results:
-            if not c.execute("SELECT 1 FROM hosts WHERE id=? AND enabled=1", (h["id"],)).fetchone():
+            fresh = c.execute("SELECT * FROM hosts WHERE id=? AND enabled=1", (h["id"],)).fetchone()
+            if not fresh:
                 continue
-            c.execute("INSERT INTO results(host_id, ts, ok, ms) VALUES(?,?,?,?)", (h["id"], now, int(ok), ms))
+            h = dict(fresh)
+            threshold = fail_limit(h, s)
+            c.execute("INSERT INTO results(host_id, ts, ok, ms, n, nok, g) VALUES(?,?,?,?,1,?,0)",
+                      (h["id"], now, int(ok), ms, 1 if ok else 0))
             label = f"{h['name']} ({h['host']})"
             if ok:
-                if h["state"] == "down":
+                if h["state"] == "down" and h.get("alerted_down"):
                     downtime = now - (h["down_since"] or now)
                     msg = f"{label} is back UP ({ms} ms) after {fmt_dur(downtime)} down."
                     eid = add_event("ping", "host_recovered", "info", h, "Recovered", msg, {"downtime_seconds": int(downtime)}, ts=now, conn=c)
                     text = f"✅ RECOVERED [{site}]\n{label} is back UP ({ms} ms)\nDowntime: {fmt_dur(downtime)}\n{fmt_ts(now)}"
-                    notify(f"[{site}] RECOVERED: {h['name']}", text,
-                           build_payload(s, "host_recovered", eid, h, "up", h["down_since"], downtime, 0, ms, "info", msg, ts=now))
-                c.execute("UPDATE hosts SET state='up', consec_fail=0, last_ms=?, last_check=?, last_seen=?, down_since=NULL WHERE id=?",
+                    consider_notify(s, h, "info", f"[{site}] RECOVERED: {h['name']}", text,
+                                    build_payload(s, "host_recovered", eid, h, "up", h["down_since"], downtime, 0, ms, "info", msg, ts=now))
+                c.execute("UPDATE hosts SET state='up', consec_fail=0, last_ms=?, last_check=?, last_seen=?, down_since=NULL, alerted_down=0, last_alert=0 WHERE id=?",
                           (ms, now, now, h["id"]))
             else:
                 fails = h["consec_fail"] + 1
                 state, down_since = h["state"], h["down_since"]
+                alerted = h.get("alerted_down") or 0
+                last_alert = h.get("last_alert") or 0
                 if fails >= threshold and state != "down":
                     state, down_since = "down", now
                     msg = f"{label} is not responding ({fails} failed pings in a row). Last seen: {fmt_ts(h['last_seen'])}."
                     eid = add_event("ping", "host_down", "critical", h, "Down", msg, {"consecutive_failures": fails}, ts=now, conn=c)
                     text = (f"🔴 DOWN [{site}]\n{label} is not responding ({fails} failed pings in a row)\n"
                             f"Last seen: {fmt_ts(h['last_seen'])}\n{fmt_ts(now)}")
-                    notify(f"[{site}] DOWN: {h['name']}", text,
-                           build_payload(s, "host_down", eid, h, "down", now, 0, fails, None, "critical", msg, ts=now))
+                    how = consider_notify(s, h, "critical", f"[{site}] DOWN: {h['name']}", text,
+                                          build_payload(s, "host_down", eid, h, "down", now, 0, fails, None, "critical", msg, ts=now))
+                    alerted = 1 if how in ("sent", "queued") else 0
+                    last_alert = now if alerted else 0
+                elif state == "down":
+                    every = repeat_minutes(h, s)
+                    if alerted and every > 0 and last_alert and now - last_alert >= every * 60:
+                        msg = f"{label} is still DOWN ({fmt_dur(now - (down_since or now))})."
+                        eid = add_event("ping", "host_down_repeat", "critical", h, "Still down", msg,
+                                        {"consecutive_failures": fails}, ts=now, conn=c)
+                        text = f"🔴 STILL DOWN [{site}]\n{msg}\n{fmt_ts(now)}"
+                        consider_notify(s, h, "critical", f"[{site}] STILL DOWN: {h['name']}", text,
+                                        build_payload(s, "host_down", eid, h, "down", down_since, now - (down_since or now),
+                                                      fails, None, "critical", msg, ts=now))
+                        last_alert = now
                 elif state != "down":
                     state = "warn"
-                c.execute("UPDATE hosts SET state=?, consec_fail=?, last_check=?, last_ms=NULL, down_since=? WHERE id=?",
-                          (state, fails, now, down_since, h["id"]))
+                c.execute("UPDATE hosts SET state=?, consec_fail=?, last_check=?, last_ms=NULL, down_since=?, alerted_down=?, last_alert=? WHERE id=?",
+                          (state, fails, now, down_since, alerted, last_alert, h["id"]))
+
+
+def refresh_public_ip():
+    """Learn the WAN address every 10 minutes and note when the provider changes it."""
+    s = get_settings()
+    ip = ""
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            ip = urllib.request.urlopen(req, timeout=6).read().decode("utf-8", "replace").strip().split()[0]
+            if ip and len(ip) <= 64:
+                break
+            ip = ""
+        except Exception:
+            ip = ""
+    isp = ""
+    if ip:
+        try:
+            req = urllib.request.Request("https://ipinfo.io/" + ip + "/json",
+                                         headers={"User-Agent": "curl/8.0", "Accept": "application/json"})
+            info = json.loads(urllib.request.urlopen(req, timeout=6).read().decode("utf-8", "replace"))
+            isp = str(info.get("org") or "")[:80]
+        except Exception:
+            isp = s.get("public_ip_isp") or ""
+    prev = s.get("public_ip") or ""
+    set_settings(public_ip=ip or prev, public_ip_isp=isp, public_ip_at=int(time.time()))
+    if prev and ip and prev != ip:
+        msg = f"Public IP changed from {prev} to {ip}" + (f" ({isp})" if isp else "") + "."
+        add_event("wan", "public_ip_change", "info", None, "Public IP changed", msg, {"old": prev, "new": ip, "isp": isp})
+        consider_notify(s, None, "info", f"[{s['site_name']}] Public IP changed", msg,
+                        build_payload(s, "public_ip_change", None, None, severity="info", message=msg))
+
+
+def _alarm_rows(tz):
+    try:
+        with db() as c:
+            rows = c.execute("SELECT * FROM sia_accounts ORDER BY name").fetchall()
+    except Exception:
+        return []
+    return [{"name": r["name"], "panel": r["panel"], "account": r["account"], "state": r["state"] or "unknown",
+             "last_text": r["last_text"] or ""} for r in rows]
+
+
+def _status_bar(hosts, wan, alarms):
+    s = get_settings()
+    latencies, losses = [], []
+    if wan and wan.get("targets"):
+        for target in wan["targets"]:
+            if isinstance(target, dict) and target.get("avg_ms") is not None:
+                latencies.append(target["avg_ms"])
+            if isinstance(target, dict) and target.get("loss") is not None:
+                losses.append(target["loss"])
+    reasons, level = [], "ok"
+
+    def worse(new):
+        nonlocal level
+        if {"ok": 0, "warn": 1, "bad": 2}[new] > {"ok": 0, "warn": 1, "bad": 2}[level]:
+            level = new
+
+    if wan and wan.get("state") == "down":
+        reasons.append("Internet down")
+        worse("bad")
+    elif wan and wan.get("state") == "degraded":
+        reasons.append("High latency or packet loss")
+        worse("warn")
+    down = [h for h in hosts if h["state"] == "down" and not h.get("maint")]
+    if down:
+        reasons.append(f"{len(down)} device" + ("s" if len(down) != 1 else "") + " down")
+        worse("bad")
+    if global_maint(s) or any(h.get("maint") for h in hosts):
+        reasons.append("Maintenance")
+        worse("warn")
+    for h in hosts:
+        ups = ((h.get("sn") or {}).get("ups") or {})
+        if ups.get("on_battery"):
+            reasons.append("UPS on battery")
+            worse("bad")
+            break
+    for alarm in alarms or []:
+        if alarm.get("state") == "alarm":
+            reasons.append("Alarm: " + (alarm.get("last_text") or alarm.get("name") or "panel")[:48])
+            worse("bad")
+        elif alarm.get("state") == "offline":
+            reasons.append("Panel offline: " + alarm.get("name", ""))
+            worse("bad")
+    return {
+        "level": level,
+        "reason": " · ".join(reasons) if reasons else "All clear",
+        "latency": round(sum(latencies) / len(latencies), 1) if latencies else None,
+        "loss": round(sum(losses) / len(losses), 1) if losses else None,
+        "ip": s.get("public_ip") or "",
+        "isp": s.get("public_ip_isp") or "",
+        "checked": fmt_ts(s.get("public_ip_at"), tzinfo()) if s.get("public_ip_at") else "—",
+    }
 
 
 def prune():
-    s = get_settings()
-    cutoff = time.time() - max(1, s["retention_days"]) * 86400
-    with _db_lock, db() as c:
-        old = c.execute("SELECT attachments FROM events WHERE ts < ?", (cutoff,)).fetchall()
-        c.execute("DELETE FROM results WHERE ts < ?", (cutoff,))
-        c.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
-        c.execute("DELETE FROM snmp_samples WHERE ts < ?", (cutoff,))
-    for row in old:
-        for f in json.loads(row["attachments"] or "[]"):
-            try:
-                os.remove(os.path.join(SNAP_DIR, f))
-            except OSError:
-                pass
+    """Roll recent samples into 5-minute and hourly buckets, then cap the event log."""
+    try:
+        jobs.rollup(sys.modules[__name__])
+    except Exception:
+        log.exception("history rollup failed")
     with db() as c:
         c.execute("PRAGMA optimize")
-    log.info("Pruned data older than %s days", s["retention_days"])
+    log.info("History rollup finished (raw 2 days, 5 min to 7 days, hourly after that)")
 
 
 def monitor_loop(stop):
     last_prune = 0
+    me = sys.modules[__name__]
     with ThreadPoolExecutor(max_workers=16) as pool:
         while not stop.is_set():
             start = time.time()
             try:
                 monitor_cycle(pool)
-                if start - last_prune > 6 * 3600:
+                try:
+                    jobs.wan_probe(me)
+                    jobs.flush_quiet(me)
+                    jobs.camera_poll(me)
+                    jobs.backup_scheduled(me)
+                except Exception:
+                    log.exception("extra monitor jobs failed")
+                if start - last_prune > 900:
                     prune()
                     last_prune = start
             except Exception:
                 log.exception("monitor cycle failed")
-            interval = max(5, get_settings()["ping_interval"])
+            s = get_settings()
+            interval = max(5, int(s["ping_interval"]))
+            try:
+                with db() as c:
+                    for (n,) in c.execute("SELECT ping_every FROM hosts WHERE enabled=1 AND ping_every>=10"):
+                        interval = min(interval, int(n))
+                if start - int(s.get("public_ip_at") or 0) >= 600:
+                    refresh_public_ip()
+            except Exception:
+                log.exception("schedule lookup failed")
             stop.wait(max(1, interval - (time.time() - start)))
 
 
@@ -875,7 +1191,7 @@ class SmtpReceiver:
 
                 kw = dict(hostname=s["rx_host"], port=int(s["rx_port"]), authenticator=authenticator,
                           auth_required=False, auth_require_tls=False, data_size_limit=15 * 1024 * 1024,
-                          decode_data=False, server_hostname="pingmonitor", ident=f"Wirewave PingMonitor {VERSION}")
+                          decode_data=False, server_hostname="pingmonitor", ident=f"{APP_NAME} {VERSION}")
                 if s["rx_security"] == "starttls":
                     kw.update(tls_context=_tls_context(), require_starttls=False)
                 elif s["rx_security"] == "ssl":
@@ -928,11 +1244,20 @@ O_HIK_DISK = "1.3.6.1.4.1.39165.1.20"   # HIK-DEVICE-MIB area seen on some NVRs 
 IFTYPE_PHYS = {6, 62, 69, 117, 71}       # ethernet, fastEther, gigabit..., ieee80211
 TRAP_NAMES = {"1.3.6.1.6.3.1.1.5.1": "coldStart", "1.3.6.1.6.3.1.1.5.2": "warmStart", "1.3.6.1.6.3.1.1.5.3": "linkDown",
               "1.3.6.1.6.3.1.1.5.4": "linkUp", "1.3.6.1.6.3.1.1.5.5": "authenticationFailure",
-              "1.3.6.1.6.3.1.1.5.6": "egpNeighborLoss"}
+              "1.3.6.1.6.3.1.1.5.6": "egpNeighborLoss",
+              "1.3.6.1.2.1.33.2.1": "upsOnBattery", "1.3.6.1.2.1.33.2.3": "upsAlarm",
+              "1.3.6.1.2.1.33.2.4": "upsAlarmCleared",
+              "1.3.6.1.4.1.318.0.5": "upsOnBattery", "1.3.6.1.4.1.318.0.9": "powerRestored",
+              "1.3.6.1.4.1.318.0.7": "lowBattery", "1.3.6.1.4.1.318.0.11": "returnFromLowBattery",
+              "1.3.6.1.4.1.318.0.17": "batteryNeedsReplacement"}
 V1_GENERIC = ["coldStart", "warmStart", "linkDown", "linkUp", "authenticationFailure", "egpNeighborLoss", "enterpriseSpecific"]
 TRAP_INFO = {"coldStart": ("critical", "Device rebooted (coldStart trap)"), "warmStart": ("warning", "Device restarted (warmStart trap)"),
              "linkDown": ("critical", "Interface down (linkDown trap)"), "linkUp": ("info", "Interface up (linkUp trap)"),
-             "authenticationFailure": ("warning", "SNMP authentication failure"), "egpNeighborLoss": ("warning", "EGP neighbor loss")}
+             "authenticationFailure": ("warning", "SNMP authentication failure"), "egpNeighborLoss": ("warning", "EGP neighbor loss"),
+             "upsOnBattery": ("critical", "UPS on battery (power cut)"), "powerRestored": ("info", "UPS mains restored"),
+             "lowBattery": ("critical", "UPS battery low"), "returnFromLowBattery": ("info", "UPS battery recovered"),
+             "batteryNeedsReplacement": ("warning", "UPS battery needs replacement"),
+             "upsAlarm": ("warning", "UPS alarm"), "upsAlarmCleared": ("info", "UPS alarm cleared")}
 O_SNMPTRAPOID, O_IFINDEX, O_IFDESCR_PFX, O_IFNAME_PFX = "1.3.6.1.6.3.1.1.4.1.0", "1.3.6.1.2.1.2.2.1.1.", "1.3.6.1.2.1.2.2.1.2.", "1.3.6.1.2.1.31.1.1.1.1."
 SNMP_DEFAULT_CFG = {"enabled": 0, "version": "2c", "community": "", "port": 161, "user": "", "auth_proto": "SHA",
                     "auth_key": "", "priv_proto": "AES", "priv_key": "", "ifaces": None, "alert_ifaces": None}
@@ -1201,7 +1526,35 @@ class SnmpService:
                     d["extra"]["hik_vendor_values"] = len(w)   # vendor MIB answers; details vary by firmware
         except Exception as e:
             log.debug("SNMP extras for %s: %s", h["host"], e)
+        temps = [v for v in (d["extra"].get("temp"), d["extra"].get("cpu_temp")) if isinstance(v, (int, float))]
+        d["temp"] = max(temps) if temps else None
+        if brand == "ups":
+            try:
+                d["ups"] = await self._read_ups(auth, target)
+                if d["ups"].get("temperature") is not None:
+                    d["temp"] = d["ups"]["temperature"]
+            except Exception as e:
+                log.debug("UPS %s: %s", h["host"], e)
+                d["ups"] = {"error": str(e)[:160]}
         return d
+
+    async def _read_ups(self, auth, target):
+        std_raw = {}
+        apc_raw = {}
+        try:
+            got = await self._get(auth, target, list(wirelogic.UPS_STD_OIDS.values()))
+            std_raw = {name: got.get(oid) for name, oid in wirelogic.UPS_STD_OIDS.items()}
+        except Exception:
+            std_raw = {}
+        try:
+            got = await self._get(auth, target, list(wirelogic.UPS_APC_OIDS.values()))
+            apc_raw = {name: got.get(oid) for name, oid in wirelogic.UPS_APC_OIDS.items()}
+        except Exception:
+            apc_raw = {}
+        view = wirelogic.ups_view(std_raw, apc_raw)
+        if not any(view.get(k) is not None for k in ("charge_pct", "load_pct", "input_voltage", "minutes_remaining")) and view.get("source") in (None, "unknown"):
+            view["error"] = "no UPS-MIB answer"
+        return view
 
     async def poll_host(self, h, s):
         cfg = host_snmp_cfg(h)
@@ -1224,11 +1577,9 @@ class SnmpService:
             p = cnt.get(i["name"])
             i["in_bps"] = i["out_bps"] = None
             if p and isinstance(i["in"], int) and isinstance(i["out"], int) and now > p[0]:
-                dt = now - p[0]
-                wrap = 2 ** 64 if i["hc"] else 2 ** 32
-                din, dout = (i["in"] - p[1]) % wrap, (i["out"] - p[2]) % wrap
-                if din < wrap / 4 and dout < wrap / 4:
-                    i["in_bps"], i["out_bps"] = round(din * 8 / dt), round(dout * 8 / dt)
+                bits = 64 if i["hc"] else 32
+                i["in_bps"] = wirelogic.octet_rate(p[1], i["in"], now - p[0], bits)
+                i["out_bps"] = wirelogic.octet_rate(p[2], i["out"], now - p[0], bits)
                 i["err_delta"] = max(0, i["inerr"] - p[3]) + max(0, i["outerr"] - p[4])
             cnt[i["name"]] = (now, i["in"], i["out"], i["inerr"], i["outerr"])
         # default selection: physical interfaces that are up (max 8)
@@ -1239,11 +1590,14 @@ class SnmpService:
                 c.execute("UPDATE hosts SET snmp=? WHERE id=?", (json.dumps(cfg), h["id"]))
         d.pop("error", None)
         self._alerts(h, s, cfg, prev, d)
+        ups = d.get("ups") or {}
+        extra = {"temp": d.get("temp"), "ups_charge": ups.get("charge_pct"), "ups_load": ups.get("load_pct"),
+                 "ups_vin": ups.get("input_voltage")}
         with _db_lock, db() as c:
             c.execute("INSERT OR REPLACE INTO snmp_state(host_id, ts, data) VALUES(?,?,?)", (h["id"], now, json.dumps(d)))
             graphed = {i["name"]: [i["in_bps"], i["out_bps"]] for i in d["ifaces"] if i["name"] in (cfg["ifaces"] or [])}
-            c.execute("INSERT INTO snmp_samples(host_id, ts, cpu, mem, ifs) VALUES(?,?,?,?,?)",
-                      (h["id"], now, d["cpu"], d["mem_pct"], json.dumps(graphed)))
+            c.execute("INSERT INTO snmp_samples(host_id, ts, cpu, mem, ifs, temp, extra, g) VALUES(?,?,?,?,?,?,?,0)",
+                      (h["id"], now, d["cpu"], d["mem_pct"], json.dumps(graphed), d.get("temp"), json.dumps(extra)))
 
     def _alerts(self, h, s, cfg, prev, d):
         if not prev.get("ts"):
@@ -1255,10 +1609,16 @@ class SnmpService:
             found.append(("snmp_reboot", "warning", "Device rebooted",
                           f"uptime is now {fmt_dur(nu / 100)} (was {fmt_dur(pu / 100)})", {}))
         # interface oper status changes on watched interfaces
+        watched = set(cfg.get("alert_ifaces") or [])
+        try:
+            with db() as c:
+                watched |= {r["iface"] for r in c.execute("SELECT iface FROM dash_ifaces WHERE host_id=?", (h["id"],))}
+        except Exception:
+            pass
         if s["snmp_alert_ifdown"]:
             old = {i["name"]: i.get("oper") for i in prev.get("ifaces", [])}
             for i in d["ifaces"]:
-                if i["name"] not in (cfg.get("alert_ifaces") or []) or i["name"] not in old:
+                if i["name"] not in watched or i["name"] not in old:
                     continue
                 label = i["name"] + (f" ({i['alias']})" if i["alias"] else "")
                 if old[i["name"]] == "up" and i["oper"] != "up":
@@ -1281,6 +1641,32 @@ class SnmpService:
                     found.append(("snmp_cpu_ok", "info", f"CPU back to {d['cpu']:.0f}%", "CPU load normal again", {"cpu": d["cpu"]}))
                 n = 0
             self.cpu_high[h["id"]] = n
+        thr_t = s.get("snmp_temp_threshold") or 0
+        if thr_t and isinstance(d.get("temp"), (int, float)):
+            hot = d["temp"] >= thr_t
+            was = isinstance(prev.get("temp"), (int, float)) and prev["temp"] >= thr_t
+            if hot and not was:
+                found.append(("snmp_temp_high", "warning", f"Temperature {d['temp']:.0f}°C",
+                              f"Temperature {d['temp']:.0f}°C (threshold {thr_t}°C)", {"temp": d["temp"]}))
+        thr_u = s.get("snmp_util_threshold") or 0
+        if thr_u:
+            old_util = {}
+            for i in prev.get("ifaces") or []:
+                if i.get("speed") and i.get("in_bps") is not None:
+                    old_util[i["name"]] = 100.0 * max(i["in_bps"], i.get("out_bps") or 0) / i["speed"]
+            for i in d["ifaces"]:
+                if i["name"] not in watched or not i.get("speed") or i.get("in_bps") is None:
+                    continue
+                util = 100.0 * max(i["in_bps"], i.get("out_bps") or 0) / i["speed"]
+                if util >= thr_u and old_util.get(i["name"], 0) < thr_u:
+                    found.append(("snmp_util_high", "warning", f"{i['name']} at {util:.0f}%",
+                                  f"{i['name']} is using {util:.0f}% of {i['speed']} bps",
+                                  {"interface": i["name"], "util": round(util, 1)}))
+        if d.get("ups") and not d["ups"].get("error"):
+            for kind, sev, title, msg in wirelogic.ups_alerts(prev.get("ups"), d["ups"], s.get("ups_runtime_min") or 0, s.get("ups_load_pct") or 0):
+                eid = add_event("ups", kind, sev, h, title, msg, {"kind": kind})
+                consider_notify(s, h, sev, f"[{s['site_name']}] {title}: {h['name']}", msg,
+                                build_payload(s, "snmp_alert", eid, h, severity=sev, message=msg))
         for kind, sev, title, msg, extra in found:
             snmp_event(h, s, kind, sev, title, msg, extra, source_ip=h["host"])
 
@@ -1367,16 +1753,19 @@ def process_trap(peer_ip, ver, community, trap, vbs, s=None):
     extra = {"trap": trap, "snmp_version": "1" if ver == 0 else "2c", "interface": iface,
              "varbinds": [{"oid": o, "value": v} for o, v in vbs[:30]]}
     log.info("SNMP trap %s from %s", trap, peer_ip)
-    snmp_event(host or {"id": None, "name": None, "host": peer_ip}, s, "snmp_trap", sev, title, msg[:500], extra,
-               source_ip=peer_ip, forward_min=s["trap_forward_min"])
+    ups_trap = trap in ("upsOnBattery", "powerRestored", "lowBattery", "returnFromLowBattery",
+                        "batteryNeedsReplacement", "upsAlarm", "upsAlarmCleared")
+    snmp_event(host or {"id": None, "name": None, "host": peer_ip}, s, "ups_trap" if ups_trap else "snmp_trap",
+               sev, title, msg[:500], extra, source_ip=peer_ip, forward_min=s["trap_forward_min"],
+               source="ups" if ups_trap else "snmp")
 
 
-def snmp_event(h, s, kind, sev, title, msg, extra, source_ip=None, forward_min=None):
-    """Store + forward an SNMP poll alert or trap (event type snmp_*)."""
+def snmp_event(h, s, kind, sev, title, msg, extra, source_ip=None, forward_min=None, source="snmp"):
+    """Store + forward an SNMP poll alert or trap (event type snmp_* or ups)."""
     host = h if h.get("id") else None
     now = time.time()
     details = dict(extra, type=kind, source_ip=source_ip)
-    eid = add_event("snmp", kind, sev, host, title, msg, details, ts=now)
+    eid = add_event(source, kind, sev, host, title, msg, details, ts=now)
     if host is None:
         with _db_lock, db() as c:
             c.execute("UPDATE events SET host_ip=? WHERE id=?", (source_ip, eid))
@@ -1397,7 +1786,7 @@ def snmp_event(h, s, kind, sev, title, msg, extra, source_ip=None, forward_min=N
         alert["varbinds"] = extra.get("varbinds")
     payload = build_payload(s, "snmp_trap" if kind == "snmp_trap" else "snmp_alert", eid, host, None,
                             severity=sev, message=text, alert=alert, ts=now)
-    notify(f"[{s['site_name']}] {title}" + (f": {h['name']}" if h.get("name") else ""), text, payload)
+    consider_notify(s, host, sev, f"[{s['site_name']}] {title}" + (f": {h['name']}" if h.get("name") else ""), text, payload)
     return eid
 
 
@@ -1527,6 +1916,13 @@ button{background:#1d5fbf;color:#fff;border:none;cursor:pointer}button.sec{backg
 .form-grid input[type=text],.form-grid input[type=password],.form-grid input[type=number],.form-grid input[type=url],.form-grid select{width:100%}
 .nav a{display:inline-block;margin:0 6px 8px 0;padding:6px 10px;background:#fff;border-radius:8px;text-decoration:none;color:#1d5fbf;font-size:13px;box-shadow:0 1px 2px rgba(0,0,0,.06)}
 .thumb{height:44px;border-radius:4px}a{color:#1d5fbf}.hint{font-size:12px;color:#64748b}
+.ranges a{display:inline-block;margin:0 6px 8px 0;padding:4px 8px;border-radius:8px;background:#fff;text-decoration:none}
+.ranges a.on{background:#0b2a55;color:#fff}
+.banner{padding:12px 16px;border-radius:10px;margin-bottom:14px;font-weight:700}
+.banner.bad{background:#fee2e2;color:#991b1b}.banner.warn{background:#fef3c7;color:#92400e}
+.statusbar{position:sticky;top:0;z-index:30;display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:10px 16px;border-radius:10px;margin:0 0 14px;color:#fff}
+.statusbar.ok{background:#15803d}.statusbar.warn{background:#b45309}.statusbar.bad{background:#b91c1c}
+.statusbar .why{font-weight:700}
 .snmpline{font-size:12.5px;color:#334155;margin:2px 0 8px}.lnk{display:inline-block;color:#fff;border-radius:6px;padding:1px 6px;margin:0 4px 3px 0;font-size:11.5px;font-weight:600}
 .lnk small{font-weight:400;opacity:.9}.kv td:first-child{color:#64748b;width:160px}
 code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
@@ -1535,11 +1931,12 @@ code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
 LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 {% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
 <link rel="icon" href="{{ url_for('brand_logo') }}" type="image/jpeg">
-<title>{{ s.site_name }} - Ping Monitor</title><style>""" + CSS + """</style>
+<title>{{ s.site_name }} - """ + APP_NAME + """</title><style>""" + CSS + """</style>
 {% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body>
-<header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>Wirewave Ping Monitor <small>· {{ s.site_name }}</small></span></h1><div>
+<header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>""" + APP_NAME + """ <small>· {{ s.site_name }}</small></span></h1><div>
 <a href="{{ url_for('index') }}">Dashboard</a>
-{% if role() == 'admin' %}<a href="{{ url_for('settings') }}">Settings</a>{% endif %}
+{% if role() %}<a href="{{ url_for('event_log') }}">Log</a>{% endif %}
+{% if role() == 'admin' %}<a href="{{ url_for('report_page') }}">Report</a><a href="{{ url_for('settings') }}">Settings</a>{% endif %}
 {% if role() %}<a href="{{ url_for('logout') }}">Logout ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">Login</a>{% endif %}
 </div></header><main>
 {% with m = get_flashed_messages() %}{% for x in m %}<div class="flash">{{ x }}</div>{% endfor %}{% endwith %}
@@ -1547,28 +1944,31 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 
 CHART_JS = """<script>
 const TZ = {{ s.timezone|tojson }};
-function hhmm(v){return new Date(v).toLocaleTimeString('en-GB',{timeZone:TZ,hour:'2-digit',minute:'2-digit'});}
+const WIN = {{ win_ms|tojson }};
+function hhmm(v){const opt=WIN>2*86400000?{timeZone:TZ,day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}:{timeZone:TZ,hour:'2-digit',minute:'2-digit'};
+ return new Date(v).toLocaleString('en-GB',opt);}
+function axisTicks(ax, from, now){const step=WIN>8*86400000?86400000:(WIN>2*86400000?6*3600e3:4*3600e3);const t=[],st=Math.ceil(from/step)*step;for(let v=st;v<=now;v+=step)t.push({value:v});ax.ticks=t;}
 function drawChart(id, pts, big){
   const up=pts.filter(p=>p[1]).map(p=>({x:p[0]*1000,y:p[2]})), down=pts.filter(p=>!p[1]).map(p=>({x:p[0]*1000,y:0}));
-  const now=Date.now(), from=now-24*3600e3;
+  const now=Date.now(), from=now-WIN;
   new Chart(document.getElementById(id),{data:{datasets:[
     {type:'line',label:'Latency (ms)',data:up,borderColor:'#1d5fbf',backgroundColor:'rgba(29,95,191,.12)',fill:true,pointRadius:0,borderWidth:1.4,tension:.2},
     {type:'scatter',label:'Failed ping',data:down,pointBackgroundColor:'#dc2626',pointBorderColor:'#dc2626',pointRadius:3}]},
    options:{animation:false,responsive:true,maintainAspectRatio:false,
     plugins:{legend:{display:!!big},tooltip:{callbacks:{title:(i)=>new Date(i[0].parsed.x).toLocaleString('en-GB',{timeZone:TZ})}}},
-    scales:{x:{type:'linear',min:from,max:now,afterBuildTicks:(ax)=>{const t=[],h=3600e3,st=Math.ceil(from/(4*h))*4*h;for(let v=st;v<=now;v+=4*h)t.push({value:v});ax.ticks=t;},
+    scales:{x:{type:'linear',min:from,max:now,afterBuildTicks:(ax)=>axisTicks(ax,from,now),
       ticks:{callback:(v)=>hhmm(v)}},y:{beginAtZero:true,title:{display:!!big,text:'ms'}}}}});
 }
 function fmtBps(v){if(v==null)return '';const u=[['G',1e9],['M',1e6],['k',1e3]];for(const [n,d] of u){if(v>=d)return (v/d).toFixed(1)+' '+n+'b/s';}return Math.round(v)+' b/s';}
 function drawSeries(id, series, opts){
-  const now=Date.now(), from=now-24*3600e3;
+  const now=Date.now(), from=now-WIN;
   new Chart(document.getElementById(id),{type:'line',data:{datasets:series.map(x=>({label:x.label,data:x.data.map(p=>({x:p[0]*1000,y:p[1]})),
     borderColor:x.color,backgroundColor:x.fill||'transparent',fill:!!x.fill,pointRadius:0,borderWidth:1.4,tension:.2,spanGaps:false}))},
    options:{animation:false,responsive:true,maintainAspectRatio:false,
     plugins:{legend:{display:true,labels:{boxWidth:10}},tooltip:{callbacks:{title:(i)=>new Date(i[0].parsed.x).toLocaleString('en-GB',{timeZone:TZ}),
       label:(i)=>i.dataset.label+': '+(opts.bps?fmtBps(i.parsed.y):i.parsed.y+'%')}}},
-    scales:{x:{type:'linear',min:from,max:now,afterBuildTicks:(ax)=>{const t=[],h=3600e3,st=Math.ceil(from/(4*h))*4*h;for(let v=st;v<=now;v+=4*h)t.push({value:v});ax.ticks=t;},
-      ticks:{callback:(v)=>hhmm(v)}},y:{beginAtZero:true,max:opts.bps?undefined:100,ticks:{callback:(v)=>opts.bps?fmtBps(v):v+'%'}}}}});
+    scales:{x:{type:'linear',min:from,max:now,afterBuildTicks:(ax)=>axisTicks(ax,from,now),
+      ticks:{callback:(v)=>hhmm(v)}},y:{beginAtZero:true,max:(opts.bps||opts.plain)?undefined:100,ticks:{callback:(v)=>opts.bps?fmtBps(v):(opts.plain?v:v+'%')}}}}});
 }</script>"""
 
 STATE_CLS = {"up": "g", "down": "r", "warn": "a"}
@@ -1590,6 +1990,25 @@ EVENTS_TABLE = """<table><tr><th>Time</th><th>Source</th><th>Event</th><th>Detai
 {% else %}<tr><td colspan="5" class="muted">No events yet.</td></tr>{% endfor %}</table>"""
 
 INDEX_BODY = CHART_JS + """
+<div class="statusbar {{ bar.level }}">
+ <span class="why">{{ bar.reason }}</span>
+ <span>Internet {% if bar.latency is not none %}{{ '%.0f'|format(bar.latency) }} ms{% else %}—{% endif %}
+  · loss {% if bar.loss is not none %}{{ '%.0f'|format(bar.loss) }}%{% else %}—{% endif %}</span>
+ <span>Public IP {{ bar.ip or '—' }}{% if bar.isp %} · {{ bar.isp }}{% endif %}</span>
+ <span class="muted" style="color:rgba(255,255,255,.85)">checked {{ bar.checked }}</span>
+</div>
+{% if banner %}<div class="banner {{ banner.cls }}">{{ banner.text }}</div>{% endif %}
+<p class="ranges">{% for key, label in spans %}<a href="?span={{ key }}" class="{{ 'on' if span==key else '' }}">{{ label }}</a>{% endfor %}</p>
+<p class="hint">12 hours and 24 hours use each ping. A week keeps 5-minute averages after the last two days. A month keeps 1-hour averages after the first week.</p>
+{% if wan and wan.state %}<div class="card"><h2>Internet {% if wan.state=='down' %}<span class="badge sev-critical">down</span>{% elif wan.state=='degraded' %}<span class="badge sev-warning">degraded</span>{% else %}<span class="badge sev-info">up</span>{% endif %}</h2>
+<p class="muted">{% for t in wan.targets %}{{ t.target }}: loss {{ t.loss }}%{% if t.avg_ms is not none %} · {{ '%.0f'|format(t.avg_ms) }} ms{% endif %}{% if t.jitter is not none %} · jitter {{ t.jitter }} ms{% endif %}<br>{% endfor %}</p>
+<div class="chartbox"><canvas id="wanlat"></canvas></div>
+<script>drawSeries('wanlat',[{label:'Latency',color:'#1d5fbf',data:{{ wan.latency|tojson }}},{label:'Loss %',color:'#dc2626',data:{{ wan.loss|tojson }}}],{});</script>
+</div>{% endif %}
+{% if traffic %}<h2>Interface graphs</h2><div class="grid">{% for g in traffic %}<div class="card"><b>{{ g.host }} · {{ g.iface }}</b>
+<div class="chartbox"><canvas id="dg{{ loop.index }}"></canvas></div>
+<script>drawSeries('dg{{ loop.index }}',[{label:'In',color:{{ g.color_in|tojson }},fill:'rgba(22,163,74,.12)',data:{{ g.inn|tojson }}},{label:'Out',color:{{ g.color_out|tojson }},data:{{ g.out|tojson }}}],{bps:true});</script>
+</div>{% endfor %}</div>{% endif %}
 <div class="summary">
  <div class="pill g">UP {{ c.up }}</div><div class="pill r">DOWN {{ c.down }}</div>
  {% if c.warn %}<div class="pill a">UNSTABLE {{ c.warn }}</div>{% endif %}
@@ -1600,7 +2019,8 @@ INDEX_BODY = CHART_JS + """
 {% for h in hs %}<div class="card"><div class="dev">
  <div class="dot {{ STATE_CLS.get(h.state,'p') }}">{{ STATE_TXT.get(h.state,'…') }}</div>
  <div style="flex:1"><a href="{{ url_for('host_page', hid=h.id) }}" style="color:inherit;text-decoration:none"><h3>{{ h.name }}</h3></a>
- <div class="muted"><span class="badge" style="background:{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[2] }}">{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[1] }}</span> {{ h.host }}</div></div></div>
+ <div class="muted"><span class="badge" style="background:{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[2] }}">{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[1] }}</span> {{ h.host }}
+ {% if h.maint %}<span class="badge" style="background:#7c3aed">MAINT</span>{% endif %}{% if h.lan_down %} · LAN device down{% endif %}</div></div></div>
  <div class="stats"><div>Last ping<b>{{ '%.1f ms'|format(h.last_ms) if h.last_ms is not none else '—' }}</b></div>
  <div>Uptime 24h<b>{{ '%.1f%%'|format(h.uptime) if h.uptime is not none else '—' }}</b></div>
  <div>{% if h.state=='down' %}Down for<b style="color:#dc2626">{{ h.down_for }}</b>{% else %}Last seen<b style="font-size:13px">{{ h.last_seen_txt }}</b>{% endif %}</div></div>
@@ -1610,9 +2030,16 @@ INDEX_BODY = CHART_JS + """
  <div style="margin-top:4px">{% for i in h.sn.watched %}<span class="lnk {{ 'g' if i.oper=='up' else 'r' }}" title="{{ i.alias }} {{ i.oper }}">{{ i.name }} {{ '▲' if i.oper=='up' else '▼' }}{% if i.in_bps is not none %} <small>{{ fmt_bps(i.in_bps) }}↓ {{ fmt_bps(i.out_bps) }}↑</small>{% endif %}</span>{% endfor %}</div>{% endif %}</div>{% endif %}
  <div class="chartbox"><canvas id="c{{ h.id }}"></canvas></div><script>drawChart('c{{ h.id }}', {{ h.points|tojson }});</script>
 </div>{% endfor %}</div>{% else %}<div class="card">No hosts yet. {% if role()=='admin' %}<a href="{{ url_for('settings') }}#hosts">Add hosts in Settings</a>.{% endif %}</div>{% endfor %}
+{% if alarms %}<div class="card"><h2>Alarms</h2>
+<p class="hint">For information and technical monitoring only. This is not a certified alarm receiving centre (ARC/CMS). Keep the panel maker's own app (Ajax, Trikdis, Hikvision or Dahua) as the primary monitoring.</p>
+<table><tr><th>Panel</th><th>Account</th><th>State</th><th>Last event</th></tr>
+{% for a in alarms %}<tr><td>{{ a.name }} <span class="muted">{{ a.panel }}</span></td><td>{{ a.account }}</td>
+<td><span class="badge {{ 'sev-critical' if a.state in ('alarm','offline') else ('sev-info' if a.state in ('armed','disarmed') else 'sev-warning') }}">{{ a.state }}</span></td>
+<td class="muted">{{ a.last_text }}</td></tr>{% endfor %}</table></div>{% endif %}
 <div class="card" style="margin-top:16px"><h2>Recent events (ping + device e-mails)</h2>""" + EVENTS_TABLE + """</div>"""
 
-HOST_BODY = CHART_JS + """<div class="card"><div class="dev">
+HOST_BODY = CHART_JS + """<p class="ranges">{% for key, label in spans %}<a href="?span={{ key }}" class="{{ 'on' if span==key else '' }}">{{ label }}</a>{% endfor %}</p>
+<div class="card"><div class="dev">
 <div class="dot {{ STATE_CLS.get(h.state,'p') }}">{{ STATE_TXT.get(h.state,'…') }}</div>
 <div><h3>{{ h.name }}</h3><div class="muted">{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[0] }} · {{ h.host }} · {{ h.grp }} ·
 last seen {{ h.last_seen_txt }} · uptime 24h {{ '%.1f%%'|format(h.uptime) if h.uptime is not none else '—' }}</div></div></div>
@@ -1637,19 +2064,43 @@ last seen {{ h.last_seen_txt }} · uptime 24h {{ '%.1f%%'|format(h.uptime) if h.
 <div style="height:170px"><canvas id="t{{ loop.index }}"></canvas></div>
 <script>drawSeries('t{{ loop.index }}',[{label:'In',color:'#16a34a',fill:'rgba(22,163,74,.12)',data:{{ pts[0]|tojson }}},{label:'Out',color:'#1d5fbf',data:{{ pts[1]|tojson }}}],{bps:true});</script></div>{% endfor %}</div>
 </div>{% endif %}
+{% if h.temp_pts %}<div class="card"><h2>Temperature</h2><div style="height:180px"><canvas id="temp"></canvas></div>
+<script>drawSeries('temp',[{label:'°C',color:'#ea580c',data:{{ h.temp_pts|tojson }}}],{});</script></div>{% endif %}
+{% if h.ups %}<div class="card"><h2>UPS {% if h.ups.on_battery %}<span class="badge sev-critical">on battery</span>{% elif h.ups.on_mains %}<span class="badge sev-info">on mains</span>{% endif %}</h2>
+<table class="kv"><tr><td>Battery</td><td>{{ h.ups.charge_pct if h.ups.charge_pct is not none else '—' }}% · {{ h.ups.battery_status }}{% if h.ups.minutes_remaining is not none %} · {{ h.ups.minutes_remaining }} min left{% endif %}{% if h.ups.replace %} · replace battery{% endif %}</td></tr>
+<tr><td>Load</td><td>{{ h.ups.load_pct if h.ups.load_pct is not none else '—' }}%</td></tr>
+<tr><td>Input / output</td><td>{{ h.ups.input_voltage or '—' }} V / {{ h.ups.output_voltage or '—' }} V</td></tr>
+<tr><td>Temperature</td><td>{{ h.ups.temperature if h.ups.temperature is not none else '—' }}°C</td></tr></table>
+<div class="grid">{% if h.ups_charge %}<div style="height:160px"><canvas id="upc"></canvas></div><script>drawSeries('upc',[{label:'Battery %',color:'#16a34a',data:{{ h.ups_charge|tojson }}}],{});</script>{% endif %}
+{% if h.ups_load %}<div style="height:160px"><canvas id="upl"></canvas></div><script>drawSeries('upl',[{label:'Load %',color:'#1d5fbf',data:{{ h.ups_load|tojson }}}],{});</script>{% endif %}
+{% if h.ups_vin %}<div style="height:160px"><canvas id="upv"></canvas></div><script>drawSeries('upv',[{label:'Input V',color:'#a855f7',data:{{ h.ups_vin|tojson }}}],{plain:true});</script>{% endif %}</div></div>{% endif %}
+{% if h.cam %}<div class="card"><h2>Recorder {% if not h.cam.ok %}<span class="badge sev-critical">{{ h.cam.error or 'no reply' }}</span>{% endif %}</h2>
+<p class="muted">{{ h.cam.device.model or '' }} {{ h.cam.device.firmware or '' }} {{ h.cam.device.name or '' }}</p>
+{% if h.cam.disks %}<table><tr><th>Disk</th><th>Status</th><th>Free</th></tr>{% for d in h.cam.disks %}<tr><td>{{ d.name }}</td><td>{{ d.status }}</td><td>{{ d.free_mb or '—' }} MB</td></tr>{% endfor %}</table>{% endif %}
+{% if h.cam.channels %}<p class="hint">{% for ch in h.cam.channels %}Channel {{ ch.id }} {{ 'offline' if ch.online is sameas false else 'online' }} {{ ch.name or '' }} · {% endfor %}</p>{% endif %}
+</div>{% endif %}
+{% if h.backups %}<div class="card"><h2>Config backups</h2>
+<table><tr><th>When</th><th>Result</th><th></th></tr>{% for b in h.backups %}<tr>
+<td>{{ b.when }}</td><td>{% if b.ok %}weekly{% if b.changed %} · changed{% else %} · same{% endif %}{% else %}<span class="badge sev-critical">failed</span> {{ b.error }}{% endif %}</td>
+<td>{% if b.ok %}<a href="{{ url_for('backup_download', bid=b.id) }}">export</a>{% if b.bin_path %} · <a href="{{ url_for('backup_download', bid=b.id, kind='bin') }}">binary</a>{% endif %}{% endif %}</td></tr>{% endfor %}</table>
+{% if h.backup_diff %}<pre class="hint" style="white-space:pre-wrap">{{ h.backup_diff }}</pre>{% endif %}
+</div>{% endif %}
 <div class="card"><h2>Events</h2>""" + EVENTS_TABLE + """</div>"""
 
 
-def snmp_view(h, tz, full=False):
+def snmp_view(h, tz, full=False, since=None):
     cfg = host_snmp_cfg(h)
     if not cfg["enabled"]:
         return None
+    now = time.time()
+    since = now - 86400 if since is None else since
     with db() as c:
         row = c.execute("SELECT data FROM snmp_state WHERE host_id=?", (h["id"],)).fetchone()
         d = json.loads(row["data"]) if row else {}
         if full:
-            samples = c.execute("SELECT ts, cpu, mem, ifs FROM snmp_samples WHERE host_id=? AND ts>=? ORDER BY ts",
-                                (h["id"], time.time() - 86400)).fetchall()
+            samples = c.execute(
+                f"SELECT ts, cpu, mem, ifs, temp, extra FROM snmp_samples WHERE host_id=? AND {jobs.TIER} ORDER BY ts",
+                (h["id"], *jobs.tier_args(since, now))).fetchall()
     s = get_settings()
     d.setdefault("ifaces", [])
     d.setdefault("extra", {})
@@ -1665,6 +2116,20 @@ def snmp_view(h, tz, full=False):
     if full:
         d["cpu_pts"] = [[r["ts"], r["cpu"]] for r in samples if r["cpu"] is not None]
         d["mem_pts"] = [[r["ts"], r["mem"]] for r in samples if r["mem"] is not None]
+        d["temp_pts"] = [[r["ts"], r["temp"]] for r in samples if r["temp"] is not None]
+        d["ups_charge"], d["ups_load"], d["ups_vin"] = [], [], []
+        for r in samples:
+            try:
+                ex = json.loads(r["extra"] or "{}")
+            except (TypeError, ValueError):
+                ex = {}
+            if ex.get("ups_charge") is not None:
+                d["ups_charge"].append([r["ts"], ex["ups_charge"]])
+            if ex.get("ups_load") is not None:
+                d["ups_load"].append([r["ts"], ex["ups_load"]])
+            if ex.get("ups_vin") is not None:
+                d["ups_vin"].append([r["ts"], ex["ups_vin"]])
+        d["ups"] = d.get("ups") or {}
         tr = {n: ([], []) for n in d["cfg"]["ifaces"]}
         for r in samples:
             for n, (bi, bo) in json.loads(r["ifs"] or "{}").items():
@@ -1683,14 +2148,25 @@ def page(body_tpl, refresh=None, charts=False, **ctx):
 
 def host_view(row, since, tz, full=False):
     h = dict(row)
+    now = time.time()
     with db() as c:
-        pts = [(r["ts"], r["ok"], r["ms"]) for r in
-               c.execute("SELECT ts, ok, ms FROM results WHERE host_id=? AND ts>=? ORDER BY ts", (h["id"], since))]
+        rows = c.execute(
+            f"SELECT ts, ok, ms, n, nok FROM results WHERE host_id=? AND {jobs.TIER} ORDER BY ts",
+            (h["id"], *jobs.tier_args(since, now))).fetchall()
+    pts = []
+    total_n = total_ok = 0
+    for r in rows:
+        n = r["n"] or 1
+        nok = r["nok"] if r["nok"] is not None else r["ok"]
+        total_n += n
+        total_ok += nok
+        pts.append((r["ts"], 0 if nok == 0 else 1, r["ms"]))
     h["points"] = pts
-    h["uptime"] = (100.0 * sum(p[1] for p in pts) / len(pts)) if pts else None
+    h["uptime"] = (100.0 * total_ok / total_n) if total_n else None
     h["last_seen_txt"] = fmt_ts(h["last_seen"], tz)
     h["down_for"] = fmt_dur(time.time() - h["down_since"]) if h["down_since"] else ""
-    h["sn"] = snmp_view(h, tz, full)
+    h["maint"] = host_maint(h, get_settings())
+    h["sn"] = snmp_view(h, tz, full, since)
     if not h["enabled"]:
         h["state"] = "disabled"
     return h
@@ -1741,35 +2217,119 @@ def logout():
     return redirect(url_for("login"))
 
 
+def _private_host(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return addr.is_private or addr.is_loopback
+
+
+def _wan_card(since):
+    now = time.time()
+    with db() as c:
+        status = c.execute("SELECT state, detail FROM wan_status WHERE id=1").fetchone()
+        rows = c.execute(
+            f"SELECT ts, target, loss, avg_ms, jitter FROM wan_samples WHERE {jobs.TIER} ORDER BY ts",
+            jobs.tier_args(since, now)).fetchall()
+    if not status and not rows:
+        return None
+    latest = {}
+    latency, loss = [], []
+    for row in rows:
+        latest[row["target"]] = {"target": row["target"], "loss": row["loss"], "avg_ms": row["avg_ms"], "jitter": row["jitter"]}
+        if row["avg_ms"] is not None:
+            latency.append([row["ts"], row["avg_ms"]])
+        if row["loss"] is not None:
+            loss.append([row["ts"], row["loss"]])
+    try:
+        targets = json.loads(status["detail"]) if status and status["detail"] else list(latest.values())
+    except (TypeError, ValueError):
+        targets = list(latest.values())
+    return {"state": status["state"] if status else "unknown", "targets": targets, "latency": latency, "loss": loss}
+
+
+def _traffic_cards(since):
+    now = time.time()
+    cards = []
+    with db() as c:
+        chosen = c.execute(
+            "SELECT d.host_id, d.iface, d.color_in, d.color_out, h.name FROM dash_ifaces d JOIN hosts h ON h.id=d.host_id ORDER BY h.name, d.iface").fetchall()
+        for row in chosen:
+            samples = c.execute(
+                f"SELECT ts, ifs FROM snmp_samples WHERE host_id=? AND {jobs.TIER} ORDER BY ts",
+                (row["host_id"], *jobs.tier_args(since, now))).fetchall()
+            inn, out = [], []
+            for sample in samples:
+                try:
+                    pair = json.loads(sample["ifs"] or "{}").get(row["iface"])
+                except (TypeError, ValueError):
+                    pair = None
+                if pair and pair[0] is not None:
+                    inn.append([sample["ts"], pair[0]])
+                    out.append([sample["ts"], pair[1]])
+            cards.append({"host": row["name"], "iface": row["iface"], "color_in": row["color_in"],
+                          "color_out": row["color_out"], "inn": inn, "out": out})
+    return cards
+
+
 @app.route("/")
 @viewer_required
 def index():
     tz = tzinfo()
-    since = time.time() - 86400
+    span, seconds = current_span()
+    since = time.time() - seconds
     with db() as c:
         rows = c.execute("SELECT * FROM hosts ORDER BY grp, CASE state WHEN 'down' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, name").fetchall()
     hosts = [host_view(r, since, tz) for r in rows]
+    wan = _wan_card(since)
+    for h in hosts:
+        h["lan_down"] = h["state"] == "down" and not h.get("maint") and wan and wan["state"] == "up" and _private_host(h["host"])
     groups, idx = [], {}
     for h in hosts:
         if h["grp"] not in idx:
             idx[h["grp"]] = len(groups)
             groups.append((h["grp"], []))
         groups[idx[h["grp"]]][1].append(h)
-    c = {k: sum(1 for h in hosts if h["state"] == k) for k in ("up", "down", "warn", "pending")}
-    return page(INDEX_BODY, refresh=60, charts=True, groups=groups, c=c, events=event_rows(limit=25, tz=tz),
-                now=fmt_ts(time.time(), tz))
+    counts = {k: sum(1 for h in hosts if h["state"] == k) for k in ("up", "down", "warn", "pending")}
+    alarms = _alarm_rows(tzinfo())
+    banner = None
+    lan_up = any(h["state"] == "up" and _private_host(h["host"]) for h in hosts)
+    if wan and wan["state"] == "down":
+        banner = {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
+    elif any(h.get("lan_down") for h in hosts):
+        names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
+        banner = {"cls": "warn", "text": "LAN device down: " + names}
+    return page(INDEX_BODY, refresh=60, charts=True, groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
+                now=fmt_ts(time.time(), tz), span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000,
+                wan=wan, traffic=_traffic_cards(since), banner=banner, alarms=alarms, bar=_status_bar(hosts, wan, alarms))
 
 
 @app.route("/host/<int:hid>")
 @viewer_required
 def host_page(hid):
     tz = tzinfo()
+    span, seconds = current_span()
     with db() as c:
         row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
     if not row:
         abort(404)
-    return page(HOST_BODY, refresh=60, charts=True, h=host_view(row, time.time() - 86400, tz, full=True),
-                events=event_rows("host_id=?", (hid,), 50, tz))
+    h = host_view(row, time.time() - seconds, tz, full=True)
+    sn = h.get("sn") or {}
+    h["temp_pts"] = sn.get("temp_pts")
+    h["ups"] = sn.get("ups") if sn.get("ups") and not sn["ups"].get("error") else None
+    h["ups_charge"] = sn.get("ups_charge")
+    h["ups_load"] = sn.get("ups_load")
+    h["ups_vin"] = sn.get("ups_vin")
+    with db() as c:
+        cam = c.execute("SELECT data FROM cam_state WHERE host_id=?", (hid,)).fetchone()
+        baks = c.execute("SELECT * FROM backups WHERE host_id=? ORDER BY ts DESC LIMIT 20", (hid,)).fetchall()
+    h["cam"] = json.loads(cam["data"]) if cam and cam["data"] else None
+    h["backups"] = [{"id": b["id"], "when": fmt_ts(b["ts"], tz), "ok": b["ok"], "changed": b["changed"],
+                     "error": b["error"], "bin_path": b["bin_path"]} for b in baks]
+    h["backup_diff"] = next((b["diff"] for b in baks if b["ok"] and b["changed"] and b["diff"]), "")
+    return page(HOST_BODY, refresh=60, charts=True, h=h, events=event_rows("host_id=?", (hid,), 50, tz),
+                span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000)
 
 
 @app.route("/snapshot/<name>")
@@ -1817,7 +2377,8 @@ def _secret_input(name):
 
 
 SETTINGS_BODY = """
-<div class="nav"><a href="#general">General</a><a href="#hosts">Hosts</a><a href="#telegram">Telegram</a><a href="#email">Outgoing e-mail</a>
+<div class="nav"><a href="#general">General</a><a href="#hosts">Hosts</a><a href="#alerts">Alerts</a><a href="#internet">Internet</a>
+<a href="#graphs">Dashboard graphs</a><a href="#backups">Backups</a><a href="#telegram">Telegram</a><a href="#email">Outgoing e-mail</a>
 <a href="#receiver">Incoming e-mail (devices)</a><a href="#snmp">SNMP + traps</a><a href="#webhook">Webhook</a><a href="#api">API</a><a href="#password">Passwords</a></div>
 
 <div class="card" id="hosts"><h2>Hosts</h2>
@@ -1829,17 +2390,28 @@ SETTINGS_BODY = """
 <li><b>Device type</b> — badge colour, and a hint when an alarm e-mail is parsed. Example: Hikvision camera / NVR. Pick the closest brand.</li>
 <li><b>On</b> — untick to stop pinging without deleting history. Use it while a device is powered off for maintenance.</li>
 <li><b>SNMP</b> — opens that host's SNMP page (community or v3 user, which ports to graph). Use it when the device answers SNMP.</li>
+<li><b>Fails</b> — missed pings before this host's alarm. Example: <code>3</code>. <code>0</code> uses the global “Failed pings before alert” (default 3).</li>
+<li><b>Ping s</b> — seconds between pings for this host only. Example: <code>30</code>. Empty or <code>0</code> uses the global ping interval.</li>
+<li><b>Repeat min</b> — resend the DOWN alarm while it stays down. Example: <code>15</code>. Empty uses the global repeat (default 30). <code>0</code> means never repeat for this host.</li>
+<li><b>Maintenance until</b> — no alerts for this host until that time, and the card shows MAINT. Example: tonight 22:00 while you replace a switch. Clear the field to turn it off.</li>
+<li><b>API</b> — Hikvision or Dahua username and password, checked on the recorder's own HTTP API.</li>
+<li><b>Backup</b> — MikroTik export account. Use a user that can read the config, not the full admin if you can avoid it.</li>
 </ul>
-<table><tr><th>Name</th><th>IP / hostname</th><th>Group / location</th><th>Device type</th><th>On</th><th>Status</th><th>SNMP</th><th></th></tr>
+<table><tr><th>Name</th><th>IP / hostname</th><th>Group</th><th>Type</th><th>On</th><th>Fails</th><th>Ping s</th><th>Repeat</th><th>Maintenance until</th><th></th></tr>
 {% for h in hosts %}<tr>
 <td><input type="text" form="hf{{ h.id }}" name="name" value="{{ h.name }}" required maxlength="60" style="width:150px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="host" value="{{ h.host }}" required maxlength="253" style="width:140px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="grp" value="{{ h.grp }}" maxlength="60" style="width:120px"></td>
 <td><select form="hf{{ h.id }}" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}" {{ 'selected' if k==h.device_type }}>{{ v[0] }}</option>{% endfor %}</select></td>
 <td><input type="checkbox" form="hf{{ h.id }}" name="enabled" value="1" {{ 'checked' if h.enabled }}></td>
-<td><span class="badge {{ STATE_CLS.get(h.state,'p') if h.enabled else 'p' }}">{{ STATE_TXT.get(h.state, h.state) if h.enabled else 'OFF' }}</span></td>
-<td><a href="{{ url_for('host_snmp', hid=h.id) }}">{{ ('v' + h.scfg.version) if h.scfg.enabled else 'off' }} ⚙</a></td>
-<td style="white-space:nowrap"><form id="hf{{ h.id }}" method="post" action="{{ url_for('host_save', hid=h.id) }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>Save</button></form>
+<td><input type="number" form="hf{{ h.id }}" name="fail_n" min="0" max="20" value="{{ h.fail_n or 0 }}" style="width:58px" title="0 = use the global fail count"></td>
+<td><input type="number" form="hf{{ h.id }}" name="ping_every" min="0" max="3600" value="{{ h.ping_every or '' }}" style="width:64px" placeholder="global" title="0 or empty = global ping interval"></td>
+<td><input type="number" form="hf{{ h.id }}" name="repeat_min" min="0" max="1440" value="{{ '' if h.repeat_min is not defined or h.repeat_min < 0 else h.repeat_min }}" style="width:64px" placeholder="global" title="empty = global, 0 = never"></td>
+<td><input type="datetime-local" form="hf{{ h.id }}" name="maint_local" value="{{ h.maint_local }}"></td>
+<td style="white-space:nowrap"><a href="{{ url_for('host_snmp', hid=h.id) }}">SNMP</a>
+ · <a href="{{ url_for('host_camera', hid=h.id) }}">API</a>
+ · <a href="{{ url_for('host_backup', hid=h.id) }}">Backup</a><br>
+<form id="hf{{ h.id }}" method="post" action="{{ url_for('host_save', hid=h.id) }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>Save</button></form>
 <form method="post" action="{{ url_for('host_delete', hid=h.id) }}" style="display:inline" onsubmit="return confirm('Delete {{ h.name }} and its history?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del">Delete</button></form></td></tr>
 {% endfor %}
 <tr>
@@ -1847,7 +2419,7 @@ SETTINGS_BODY = """
 <td><input type="text" form="hadd" name="host" placeholder="192.168.1.10" required maxlength="253" style="width:140px"></td>
 <td><input type="text" form="hadd" name="grp" placeholder="e.g. Cameras" maxlength="60" style="width:120px"></td>
 <td><select form="hadd" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}">{{ v[0] }}</option>{% endfor %}</select></td>
-<td><input type="checkbox" form="hadd" name="enabled" value="1" checked></td><td></td><td class="hint">after adding</td>
+<td><input type="checkbox" form="hadd" name="enabled" value="1" checked></td><td></td><td></td><td></td><td></td>
 <td><form id="hadd" method="post" action="{{ url_for('host_add') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>+ Add</button></form></td></tr></table></div>
 
 <div class="card" id="general"><h2>General</h2>
@@ -1862,8 +2434,11 @@ SETTINGS_BODY = """
 <p class="hint">How often each host is pinged. Example: <code>60</code>. Use 30 on a small site, or 120 if you watch a lot of devices.</p></div>
 <label>Ping timeout (seconds)</label><div><input type="number" name="ping_timeout" min="1" max="10" value="{{ s.ping_timeout }}">
 <p class="hint">How long one ping may take before it counts as a miss. Example: <code>2</code>. Raise it only on a slow or lossy link.</p></div>
+<span id="alerts"></span>
 <label>Failed pings before alert</label><div><input type="number" name="fail_threshold" min="1" max="20" value="{{ s.fail_threshold }}">
-<p class="hint">Misses in a row before a DOWN alert. Example: <code>3</code>. Use 2 for a fast alert, or 5 so a short blip stays quiet.</p></div>
+<p class="hint">Global default for how many missed pings in a row raise a DOWN alarm. Example: <code>3</code>. A host can override this with its own Fails column (0 on the host means “use this number”).</p></div>
+<label>Alarm repeat (minutes)</label><div><input type="number" name="repeat_min" min="0" max="1440" value="{{ s.repeat_min }}">
+<p class="hint">While a host stays down, send the alarm again every this many minutes. Example: <code>30</code>. Use <code>0</code> to never repeat. A host can override it; an empty Repeat field on the host uses this number.</p></div>
 <label>Keep history (days)</label><div><input type="number" name="retention_days" min="1" max="365" value="{{ s.retention_days }}">
 <p class="hint">How long ping and SNMP samples are kept. Example: <code>30</code>. Use fewer days on a small disk.</p></div>
 <label>Ping method</label><div><select name="ping_method">{% for m in ['auto','icmplib','system'] %}<option {{ 'selected' if s.ping_method==m }}>{{ m }}</option>{% endfor %}</select>
@@ -2010,7 +2585,7 @@ Status: <b>{{ rx_status }}</b></p>
 BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_enabled", "rx_enabled", "rx_require_auth",
                "snmp_enabled", "snmp_alert_ifdown", "snmp_alert_reboot", "trap_enabled"}
 SECTIONS = {
-    "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "fail_threshold", "retention_days",
+    "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "fail_threshold", "repeat_min", "retention_days",
                 "ping_method", "public_url", "dashboard_access"],
     "telegram": ["telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_photos"],
     "email": ["email_enabled", "smtp_host", "smtp_port", "smtp_security", "smtp_user", "smtp_password", "smtp_from", "smtp_to"],
@@ -2024,7 +2599,7 @@ CHOICES = {"ping_method": {"auto", "icmplib", "system"}, "dashboard_access": {"l
            "smtp_security": {"none", "starttls", "ssl"}, "rx_security": {"none", "starttls", "ssl"},
            "rx_forward_min": {"info", "warning", "critical", "none"}, "snmp_forward_min": {"info", "warning", "critical", "none"},
            "trap_forward_min": {"info", "warning", "critical", "none"}}
-RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold": (1, 20), "retention_days": (1, 365),
+RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold": (1, 20), "repeat_min": (0, 1440), "retention_days": (1, 365),
           "smtp_port": (1, 65535), "rx_port": (1, 65535), "rx_rate_limit": (0, 86400),
           "snmp_interval": (30, 3600), "snmp_timeout": (1, 10), "snmp_cpu_threshold": (0, 100), "trap_port": (1, 65535)}
 
@@ -2073,6 +2648,7 @@ def settings():
         hosts = [dict(r) for r in c.execute("SELECT * FROM hosts ORDER BY grp, name")]
     for h in hosts:
         h["scfg"] = host_snmp_cfg(h)
+        h["maint_local"] = ts_to_local_input(h.get("maint_until"))
     try:
         tzs = sorted(z for z in available_timezones() if z.startswith("Europe/"))
     except Exception:
@@ -2119,12 +2695,12 @@ def test_channel(ch):
         flash(f"Not saved: {e}")
         return redirect(url_for("settings") + "#" + section)
     s = get_settings()
-    text = f"🔔 Test from Wirewave Ping Monitor [{s['site_name']}] - {fmt_ts(time.time())}"
+    text = f"🔔 Test from {APP_NAME} [{s['site_name']}] - {fmt_ts(time.time())}"
     try:
         if ch == "telegram":
             send_telegram(s, text)
         elif ch == "email":
-            send_email(s, f"[{s['site_name']}] Ping Monitor test", text + "\n\nIf you can read this, e-mail alerts work.")
+            send_email(s, f"[{APP_NAME}] [{s['site_name']}] test", text + "\n\nIf you can read this, e-mail alerts work.")
         else:
             send_webhook(s, build_payload(s, "test", None, None, None, severity="info", message=text))
         flash(f"✅ Test {ch} sent successfully.")
@@ -2142,20 +2718,42 @@ def _host_form():
         raise ValueError("invalid name or IP/hostname")
     if dt not in DEVICE_TYPES:
         dt = "generic"
-    return name, host, grp, dt, 1 if request.form.get("enabled") else 0
+    raw_fail = request.form.get("fail_n", "").strip()
+    try:
+        fail_n = int(raw_fail) if raw_fail else 0
+    except ValueError:
+        raise ValueError("fails must be a number")
+    if not 0 <= fail_n <= 20:
+        raise ValueError("fails must be 0 (use the global number) or 1-20")
+    maint = local_input_to_ts(request.form.get("maint_local", ""))
+    raw_rep = request.form.get("repeat_min", "").strip()
+    try:
+        repeat_min = int(raw_rep) if raw_rep else -1
+    except ValueError:
+        raise ValueError("repeat must be a number of minutes")
+    if not -1 <= repeat_min <= 1440:
+        raise ValueError("repeat must be empty (use global), 0 (never) or 1-1440 minutes")
+    raw_ping = request.form.get("ping_every", "").strip()
+    try:
+        ping_every = int(raw_ping) if raw_ping else 0
+    except ValueError:
+        raise ValueError("ping interval must be a number of seconds")
+    if ping_every and not 10 <= ping_every <= 3600:
+        raise ValueError("host ping interval must be 10-3600 seconds, or empty to use the global interval")
+    return name, host, grp, dt, 1 if request.form.get("enabled") else 0, fail_n, maint, repeat_min, ping_every
 
 
 @app.route("/settings/hosts/add", methods=["POST"])
 @admin_required
 def host_add():
     try:
-        name, host, grp, dt, en = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every = _host_form()
     except ValueError as e:
         flash(f"Not added: {e}")
         return redirect(url_for("settings") + "#hosts")
     with _db_lock, db() as c:
-        c.execute("INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state) VALUES(?,?,?,?,?,?,?)",
-                  (name, host, grp, dt, en, time.time(), "pending" if en else "disabled"))
+        c.execute("INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, fail_n, maint_until, repeat_min, ping_every) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, host, grp, dt, en, time.time(), "pending" if en else "disabled", fail_n, maint, repeat_min, ping_every))
     flash(f"Added {name} ({host}).")
     return redirect(url_for("settings") + "#hosts")
 
@@ -2164,7 +2762,7 @@ def host_add():
 @admin_required
 def host_save(hid):
     try:
-        name, host, grp, dt, en = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every = _host_form()
     except ValueError as e:
         flash(f"Not saved: {e}")
         return redirect(url_for("settings") + "#hosts")
@@ -2176,7 +2774,8 @@ def host_save(hid):
         if old["host"] != host:
             c.execute("DELETE FROM snmp_state WHERE host_id=?", (hid,))
             SNMP.counters.pop(hid, None)
-        c.execute("UPDATE hosts SET name=?, host=?, grp=?, device_type=?, enabled=? WHERE id=?", (name, host, grp, dt, en, hid))
+        c.execute("UPDATE hosts SET name=?, host=?, grp=?, device_type=?, enabled=?, fail_n=?, maint_until=?, repeat_min=?, ping_every=? WHERE id=?",
+                  (name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, hid))
         if reset:  # new address or re-enabled: start fresh, no stale alerts
             c.execute("UPDATE hosts SET state=?, consec_fail=0, down_since=NULL, last_ms=NULL WHERE id=?",
                       ("pending" if en else "disabled", hid))
@@ -2414,9 +3013,198 @@ def _api_errors(e):
 
 
 # ----------------------------------------------------------------------------- main
+LOG_BODY = """<h2>Event log</h2>
+<p class="hint">The newest {{ keep }} alerts. Ping and device e-mail events also stay in the dashboard section “Recent events (ping + device e-mails)”.</p>
+<form method="get" class="ranges">
+<select name="source"><option value="">All types</option>{% for src in sources %}<option value="{{ src }}" {{ 'selected' if src==filt }}>{{ src }}</option>{% endfor %}</select>
+<button>Filter</button></form>
+""" + EVENTS_TABLE
+
+
+@app.route("/log")
+@viewer_required
+def event_log():
+    keep = max(10, min(5000, int(get_settings().get("event_keep") or 100)))
+    filt = request.args.get("source") or ""
+    tz = tzinfo()
+    if filt:
+        events = event_rows("source=?", (filt,), keep, tz)
+    else:
+        events = event_rows(limit=keep, tz=tz)
+    with db() as c:
+        sources = [r[0] for r in c.execute("SELECT DISTINCT source FROM events ORDER BY source")]
+    return page(LOG_BODY, events=events, sources=sources, filt=filt, keep=keep)
+
+
+@app.route("/report", methods=["GET", "POST"])
+@admin_required
+def report_page():
+    if request.method == "POST":
+        lang = request.form.get("lang") if request.form.get("lang") in ("en", "el") else "en"
+        days = int(request.form.get("days") or 7)
+        end = time.time()
+        start = end - max(1, min(days, 366)) * 86400
+        data = jobs.report_context(sys.modules[__name__], start, end, lang, request.form.get("site") or "")
+        logo = _logo_file()
+        pdf = reportpdf.build_pdf(data, logo)
+        return Response(pdf, mimetype="application/pdf",
+                        headers={"Content-Disposition": f"attachment; filename=report-{lang}.pdf"})
+    body = """<div class="card" style="max-width:640px"><h2>Report</h2>
+<p class="section-intro">Download a PDF for a client. Greek and English are separate documents.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Site name</label><div><input type="text" name="site" value="{{ s.site_name }}"></div>
+<label>Range</label><div><select name="days"><option value="7">Last 7 days</option><option value="30">Last month</option></select></div>
+<label>Language</label><div><select name="lang"><option value="en">English</option><option value="el">Greek</option></select></div>
+<span></span><div><button>Download PDF</button></div></div></form></div>"""
+    return page(body)
+
+
+@app.route("/api/report.pdf")
+@api_auth
+def api_report():
+    lang = request.args.get("lang") if request.args.get("lang") in ("en", "el") else "en"
+    end = time.time()
+    start = end - 7 * 86400
+    if request.args.get("from"):
+        try:
+            start = datetime.fromisoformat(request.args["from"]).timestamp()
+        except ValueError:
+            pass
+    if request.args.get("to"):
+        try:
+            end = datetime.fromisoformat(request.args["to"]).timestamp()
+        except ValueError:
+            pass
+    data = jobs.report_context(sys.modules[__name__], start, end, lang, request.args.get("site") or "")
+    pdf = reportpdf.build_pdf(data, _logo_file())
+    return Response(pdf, mimetype="application/pdf")
+
+
+@app.route("/settings/hosts/<int:hid>/camera", methods=["GET", "POST"])
+@admin_required
+def host_camera(hid):
+    with db() as c:
+        row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
+    if not row:
+        abort(404)
+    cfg = {}
+    try:
+        cfg = json.loads(row["cam"] or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    if request.method == "POST":
+        cfg["enabled"] = 1 if request.form.get("enabled") else 0
+        cfg["scheme"] = request.form.get("scheme") if request.form.get("scheme") in ("http", "https") else "http"
+        try:
+            cfg["port"] = int(request.form.get("port") or 80)
+        except ValueError:
+            cfg["port"] = 80
+        cfg["user"] = request.form.get("user", "").strip()
+        if request.form.get("password"):
+            cfg["password"] = encrypt_secret(request.form.get("password"))
+        with _db_lock, db() as c:
+            c.execute("UPDATE hosts SET cam=? WHERE id=?", (json.dumps(cfg), hid))
+        flash("Camera API settings saved.")
+        return redirect(url_for("host_camera", hid=hid))
+    body = """<p><a href="{{ url_for('settings') }}#hosts">← Hosts</a></p>
+<div class="card"><h2>Camera API · {{ h.name }}</h2>
+<p class="section-intro">Optional check of a Hikvision or Dahua recorder. The password is stored encrypted. NVR pictures that arrive by e-mail stay on the mail receiver; this page is the direct API.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Enabled</label><div><input type="checkbox" name="enabled" value="1" {{ 'checked' if cfg.enabled }}></div>
+<label>Scheme</label><div><select name="scheme"><option {{ 'selected' if cfg.scheme!='https' }}>http</option><option {{ 'selected' if cfg.scheme=='https' }}>https</option></select>
+<p class="hint">Use https for a self-signed recorder. The certificate is accepted.</p></div>
+<label>Port</label><div><input type="number" name="port" value="{{ cfg.port or 80 }}"></div>
+<label>Username</label><div><input type="text" name="user" value="{{ cfg.user or '' }}"></div>
+<label>Password</label><div><input type="password" name="password" placeholder="{{ 'saved — leave empty to keep' if cfg.password else 'not set' }}"></div>
+<span></span><div><button>Save</button></div></div></form></div>"""
+    return page(body, h=dict(row), cfg=cfg)
+
+
+@app.route("/settings/hosts/<int:hid>/backup", methods=["GET", "POST"])
+@admin_required
+def host_backup(hid):
+    with db() as c:
+        row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
+    if not row:
+        abort(404)
+    try:
+        cfg = json.loads(row["mtbak"] or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    if request.method == "POST":
+        cfg["enabled"] = 1 if request.form.get("enabled") else 0
+        cfg["user"] = request.form.get("user", "").strip()
+        cfg["api_port"] = int(request.form.get("api_port") or 8728)
+        cfg["ssh_port"] = int(request.form.get("ssh_port") or 22)
+        cfg["use_ssl"] = 1 if request.form.get("use_ssl") else 0
+        cfg["sensitive"] = 1 if request.form.get("sensitive") else 0
+        cfg["binary"] = 1 if request.form.get("binary") else 0
+        if request.form.get("password"):
+            cfg["password"] = encrypt_secret(request.form.get("password"))
+        with _db_lock, db() as c:
+            c.execute("UPDATE hosts SET mtbak=? WHERE id=?", (json.dumps(cfg), hid))
+        flash("Backup account saved. One export per week, keeping the last year (52) unless you change Backups to keep.")
+        if request.form.get("now"):
+            jobs.run_backup(sys.modules[__name__], dict(row) | {"mtbak": json.dumps(cfg)} if False else {**dict(row), "mtbak": json.dumps(cfg)}, "now")
+        return redirect(url_for("host_backup", hid=hid))
+    body = """<p><a href="{{ url_for('settings') }}#hosts">← Hosts</a></p>
+<div class="card"><h2>MikroTik backup · {{ h.name }}</h2>
+<p class="section-intro">Weekly text export. One per week, keeps the last year. Use a user with read and ssh (and api). Add sensitive only if you need passwords in the file. Binary backup also needs ftp and policy. Downloads require an admin login.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Enabled</label><div><input type="checkbox" name="enabled" value="1" {{ 'checked' if cfg.enabled }}></div>
+<label>Username</label><div><input type="text" name="user" value="{{ cfg.user or '' }}" placeholder="backup"></div>
+<label>Password</label><div><input type="password" name="password" placeholder="{{ 'saved — leave empty to keep' if cfg.password else 'not set' }}"></div>
+<label>API port</label><div><input type="number" name="api_port" value="{{ cfg.api_port or 8728 }}"><p class="hint">8728 plain, 8729 with API-SSL.</p></div>
+<label>API SSL</label><div><input type="checkbox" name="use_ssl" value="1" {{ 'checked' if cfg.use_ssl }}></div>
+<label>SSH port</label><div><input type="number" name="ssh_port" value="{{ cfg.ssh_port or 22 }}"></div>
+<label>Include secrets</label><div><input type="checkbox" name="sensitive" value="1" {{ 'checked' if cfg.sensitive }}><p class="hint">Runs /export show-sensitive. Needs the sensitive policy.</p></div>
+<label>Binary .backup</label><div><input type="checkbox" name="binary" value="1" {{ 'checked' if cfg.binary }}></div>
+<span></span><div><button>Save</button> <button name="now" value="1" class="sec">Backup now</button></div></div></form></div>"""
+    return page(body, h=dict(row), cfg=cfg)
+
+
+@app.route("/backup/<int:bid>")
+@admin_required
+def backup_download(bid):
+    with db() as c:
+        row = c.execute("SELECT * FROM backups WHERE id=?", (bid,)).fetchone()
+    if not row:
+        abort(404)
+    path = row["bin_path"] if request.args.get("kind") == "bin" else row["path"]
+    root = os.path.join(DATA_DIR, "backups")
+    if not path or not mtbackup.safe_under(root, path) or not os.path.isfile(path):
+        abort(404)
+    return send_file(path, as_attachment=True)
+
+
+@app.route("/settings/dashboard-graphs", methods=["POST"])
+@admin_required
+def save_dash_graphs():
+    hosts = request.form.getlist("dg_host")
+    ifaces = request.form.getlist("dg_iface")
+    with _db_lock, db() as c:
+        c.execute("DELETE FROM dash_ifaces")
+        for i, (host_id, iface) in enumerate(zip(hosts, ifaces)):
+            if not request.form.get(f"dg_on_{i}"):
+                continue
+            color_in = request.form.get(f"dg_in_{i}") or "#16a34a"
+            color_out = request.form.get(f"dg_out_{i}") or "#1d5fbf"
+            if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color_in):
+                color_in = "#16a34a"
+            if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color_out):
+                color_out = "#1d5fbf"
+            c.execute("INSERT OR REPLACE INTO dash_ifaces(host_id, iface, color_in, color_out) VALUES(?,?,?,?)",
+                      (int(host_id), iface[:64], color_in, color_out))
+    flash("Dashboard graphs saved.")
+    return redirect(url_for("settings") + "#graphs")
+
+
 def main():
     global DB_PATH, DATA_DIR, SNAP_DIR
-    ap = argparse.ArgumentParser(description="Wirewave Ping Monitor v" + VERSION)
+    ap = argparse.ArgumentParser(description=APP_NAME + " v" + VERSION)
     ap.add_argument("--host", default=os.environ.get("PINGMON_HOST", "127.0.0.1"), help="web bind address (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=int(os.environ.get("PINGMON_PORT", 8080)), help="web port (default 8080)")
     ap.add_argument("--db", default=os.environ.get("PINGMON_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pingmonitor.db")),
@@ -2459,7 +3247,7 @@ def main():
     threading.Thread(target=monitor_loop, args=(stop,), daemon=True, name="monitor").start()
     RECEIVER.restart()
     SNMP.start()
-    log.info("Wirewave Ping Monitor %s - site '%s' - web UI http://%s:%d", VERSION, s["site_name"], a.host, a.port)
+    log.info("%s %s - site '%s' - web UI http://%s:%d", APP_NAME, VERSION, s["site_name"], a.host, a.port)
     try:
         from waitress import serve
         serve(app, host=a.host, port=a.port, threads=4, ident="pingmonitor")

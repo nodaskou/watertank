@@ -4,4 +4,8 @@ icmplib>=3.0
 aiosmtpd>=1.4
 pysnmp>=7.1          # SNMP polling + trap decoding (lextudio pysnmp, asyncio API)
 cryptography>=41     # needed by pysnmp for SNMPv3 privacy (AES/DES)
+reportlab>=4.0        # PDF site reports, Greek via DejaVu
+librouteros>=3.2      # MikroTik API export (RouterOS 7)
+paramiko>=3.0         # MikroTik SSH/SFTP fallback
+pysiaalarm>=3.0       # SIA DC-09 alarm receiver
 tzdata; sys_platform == "win32"

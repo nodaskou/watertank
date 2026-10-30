@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wirewave Ping Monitor v2 - Debian installer (Debian 11/12/13, amd64 / arm64 / armhf)
+# Wirewave Network Infrastructure Monitor - Debian installer (Debian 11/12/13, amd64 / arm64 / armhf)
 # Usage:  sudo ./install.sh
 #         run again to upgrade - settings, history and the chosen listen address are kept
 #         PINGMON_HOST=127.0.0.1 sudo ./install.sh   # this machine only (no LAN)
@@ -16,6 +16,25 @@ BIND_FILE="$DATA_DIR/web-bind"
 UNIT=/etc/systemd/system/pingmonitor.service
 
 # IPv4 only. 0.0.0.0 = every interface (LAN PCs and localhost). 127.0.0.1 = this machine.
+apply_timezone() {
+  local tz="${1:-Europe/Athens}"
+  if [[ ! "$tz" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]]; then
+    echo "Invalid PINGMON_TZ: $tz" >&2
+    return 1
+  fi
+  if [[ ! -e "/usr/share/zoneinfo/$tz" ]]; then
+    echo "Unknown timezone: $tz (install tzdata)" >&2
+    return 1
+  fi
+  if command -v timedatectl >/dev/null 2>&1 && timedatectl set-timezone "$tz"; then
+    echo "    $tz via timedatectl"
+    return 0
+  fi
+  ln -sfn "/usr/share/zoneinfo/$tz" /etc/localtime
+  printf '%s\n' "$tz" > /etc/timezone || true
+  echo "    $tz via /etc/localtime"
+}
+
 valid_bind() {
   local h=$1 o
   [[ "$h" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
@@ -68,14 +87,19 @@ main() {
 
   echo "==> Installing system packages"
   apt-get update -q
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3 python3-venv iputils-ping openssl ca-certificates
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3 python3-venv iputils-ping openssl ca-certificates tzdata fonts-dejavu-core
+
+  echo "==> Timezone (${PINGMON_TZ:-Europe/Athens})"
+  apply_timezone "${PINGMON_TZ:-Europe/Athens}"
 
   echo "==> Creating system user '$APP_USER'"
   id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
 
   echo "==> Copying files to $APP_DIR"
   mkdir -p "$DATA_DIR" "$APP_DIR/assets"
-  install -m 0644 "$SRC_DIR/pingmonitor.py" "$SRC_DIR/requirements.txt" "$APP_DIR/"
+  install -m 0644 "$SRC_DIR/pingmonitor.py" "$SRC_DIR/wirelogic.py" "$SRC_DIR/camapi.py" \
+    "$SRC_DIR/mtbackup.py" "$SRC_DIR/reportpdf.py" "$SRC_DIR/jobs.py" "$SRC_DIR/siarecv.py" \
+    "$SRC_DIR/requirements.txt" "$APP_DIR/"
   if [[ -f "$SRC_DIR/assets/wirewave_logo.jpg" ]]; then
     install -m 0644 "$SRC_DIR/assets/wirewave_logo.jpg" "$APP_DIR/assets/wirewave_logo.jpg"
   else
@@ -132,11 +156,13 @@ main() {
     fi
     ufw --force allow 2525/tcp >/dev/null
     ufw --force allow 1162/udp >/dev/null
-    echo "    opened 8080/tcp (web, when listening on the LAN), 2525/tcp (device e-mail), 1162/udp (SNMP traps)"
+    ufw --force allow 12128/tcp >/dev/null
+    ufw --force allow 12128/udp >/dev/null
+    echo "    opened 8080/tcp (web, when listening on the LAN), 2525/tcp (device e-mail), 1162/udp (SNMP traps), 12128 tcp/udp (alarm panels)"
   else
     echo "==> Firewall"
     echo "    ufw is not active. If you turn it on later, run:"
-    echo "    ufw allow 8080/tcp && ufw allow 2525/tcp && ufw allow 1162/udp"
+    echo "    ufw allow 8080/tcp && ufw allow 2525/tcp && ufw allow 1162/udp && ufw allow 12128/tcp && ufw allow 12128/udp"
   fi
 
   LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
