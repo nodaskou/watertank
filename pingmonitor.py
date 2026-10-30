@@ -34,6 +34,7 @@ import re
 import secrets
 import shutil
 import smtplib
+import socket
 import sqlite3
 import ssl
 import subprocess
@@ -61,7 +62,7 @@ except ImportError:  # pragma: no cover
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_file, send_from_directory, session, url_for)
 
-VERSION = "2.2"
+VERSION = "2.3"
 APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
@@ -206,6 +207,10 @@ def _migrate(c):
             key_enc TEXT NOT NULL DEFAULT '', supervise_min INTEGER NOT NULL DEFAULT 10,
             last_ts REAL, last_text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'unknown',
             rest_state TEXT NOT NULL DEFAULT 'unknown', offline_alerted INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS sia_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL DEFAULT '',
+            raw TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
+            account TEXT NOT NULL DEFAULT '');
     """)
 
 
@@ -1888,18 +1893,21 @@ def mask(v):
     return "•" * 8 + (v[-4:] if len(v) > 8 else "")
 
 
-app.jinja_env.globals.update(csrf_token=csrf_token, DEVICE_TYPES=DEVICE_TYPES, mask=mask, role=role, fmt_bps=lambda v: fmt_bps(v))
+app.jinja_env.globals.update(csrf_token=csrf_token, DEVICE_TYPES=DEVICE_TYPES, mask=mask, role=role,
+                              fmt_bps=lambda v: fmt_bps(v), ts_to_local_input=ts_to_local_input, fmt_ts=fmt_ts)
 
 CSS = """
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f1f4f9;color:#1c2b4a}
-header{background:#0b2a55;color:#fff;padding:12px 24px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
-header h1{font-size:19px;margin:0;display:flex;align-items:center;gap:10px}header small{opacity:.75;font-weight:400}header a{color:#cfe1ff;text-decoration:none;margin-left:16px}
+header{background:#0b2a55;color:#fff;padding:12px 24px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px 16px}
+header h1{font-size:19px;margin:0;display:flex;align-items:center;gap:10px;min-width:0}header h1 span{min-width:0}header small{opacity:.75;font-weight:400}
+header>div{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center}header a{color:#cfe1ff;text-decoration:none;margin:0}
 header .logo{height:44px;width:44px;border-radius:50%;object-fit:cover;background:#fff;flex:none}
 main{max-width:1240px;margin:0 auto;padding:20px}
 .summary{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
 .pill{padding:9px 16px;border-radius:10px;color:#fff;font-weight:700;font-size:17px}
 .g{background:#16a34a}.r{background:#dc2626}.a{background:#f59e0b}.p{background:#94a3b8}
 .card{background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:16px;margin-bottom:16px}
+.card[id]{scroll-margin-top:84px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:16px}
 .dev{display:flex;align-items:center;gap:12px}
 .dot{width:52px;height:52px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:12px}
@@ -1919,8 +1927,24 @@ button{background:#1d5fbf;color:#fff;border:none;cursor:pointer}button.sec{backg
 .help-list{margin:0 0 12px;padding-left:18px;font-size:12px;color:#64748b;line-height:1.45}
 .help-list li{margin:3px 0}
 .form-grid .hint{display:block;margin:4px 0 0;line-height:1.4}
-.form-grid input[type=text],.form-grid input[type=password],.form-grid input[type=number],.form-grid input[type=url],.form-grid select{width:100%}
-.nav a{display:inline-block;margin:0 6px 8px 0;padding:6px 10px;background:#fff;border-radius:8px;text-decoration:none;color:#1d5fbf;font-size:13px;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.form-grid input[type=text],.form-grid input[type=password],.form-grid input[type=number],.form-grid input[type=url],.form-grid input[type=time],.form-grid input[type=datetime-local],.form-grid select{width:100%;max-width:100%}
+.nav{display:flex;flex-wrap:wrap;gap:6px;position:sticky;top:0;z-index:25;background:#f1f4f9;padding:8px 0 10px;margin:0 0 12px}
+.nav a{display:inline-block;margin:0;padding:7px 10px;background:#fff;border-radius:8px;text-decoration:none;color:#1d5fbf;font-size:13px;box-shadow:0 1px 2px rgba(0,0,0,.06);line-height:1.3}
+.nav a.on{background:#0b2a55;color:#fff}
+.nav-jump{display:none;margin:0 0 8px}
+.nav-jump select{width:100%;padding:10px}
+.table-wrap{display:block;width:100%;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.card{min-width:0;overflow:hidden}
+input,select,textarea{max-width:100%}
+header h1 span{overflow-wrap:anywhere}
+@media (max-width:760px){
+ header{padding:10px 12px}header h1{font-size:15px}header a{font-size:14px}
+ main{padding:12px}
+ .form-grid{grid-template-columns:1fr;gap:2px 0}.form-grid>label{padding-top:10px}
+ .nav a{font-size:12.5px;padding:8px 9px}
+ .nav-jump{display:block}
+ .grid{grid-template-columns:1fr}
+}
 .thumb{height:44px;border-radius:4px}a{color:#1d5fbf}.hint{font-size:12px;color:#64748b}
 .ranges a{display:inline-block;margin:0 6px 8px 0;padding:4px 8px;border-radius:8px;background:#fff;text-decoration:none}
 .ranges a.on{background:#0b2a55;color:#fff}
@@ -1974,7 +1998,7 @@ function paintEvents(rows){
   if(body.dataset.sig===sig) return;
   body.dataset.sig=sig;
   if(!rows || !rows.length){ body.innerHTML='<tr><td colspan="5" class="muted">No events yet.</td></tr>'; return; }
-  body.innerHTML=rows.map(e=>'<tr><td style="white-space:nowrap">'+esc(e.time)+'</td><td>'+esc(e.who)+'</td><td><span class="badge sev-'+esc(e.severity)+'">'+esc(e.severity)+'</span> '+esc(e.title)+'</td><td class="muted">'+esc(e.message)+'</td><td></td></tr>').join('');
+  body.innerHTML=rows.map(e=>'<tr><td style="white-space:nowrap">'+esc(e.time)+'</td><td>'+esc(e.who)+'</td><td><span class="badge sev-'+esc(e.severity)+'">'+esc(e.severity)+'</span> '+(e.source==='alarm'?'🚨 ':(e.source==='mail'?'📧 ':(e.source==='snmp'?'📡 ':'')))+esc(e.title)+'</td><td class="muted">'+esc(e.message)+'</td><td></td></tr>').join('');
 }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function paintAlarms(rows){
@@ -2107,7 +2131,7 @@ EVENTS_TABLE = """<table><thead><tr><th>Time</th><th>Source</th><th>Event</th><t
 {% for e in events %}<tr>
 <td style="white-space:nowrap">{{ e.time }}</td>
 <td>{% if e.host_name %}{{ e.host_name }} <span class="muted">{{ e.host_ip }}</span>{% else %}{{ e.d.get('source_label') or e.d.get('source_ip','') }}{% endif %}</td>
-<td><span class="badge sev-{{ e.severity }}">{{ e.severity }}</span> {{ '📧' if e.source=='mail' else ('📡' if e.source=='snmp' else ('🔴' if e.kind=='host_down' else '✅')) }} {{ e.title }}</td>
+<td><span class="badge sev-{{ e.severity }}">{{ e.severity }}</span> {{ '🚨' if e.source=='alarm' else ('📧' if e.source=='mail' else ('📡' if e.source=='snmp' else ('🔴' if e.kind=='host_down' else '✅'))) }} {{ e.title }}</td>
 <td class="muted">{{ e.message[:140] }}</td>
 <td>{% for a in e.att %}<a href="{{ url_for('snapshot', name=a) }}" target="_blank"><img class="thumb" src="{{ url_for('snapshot', name=a) }}"></a>{% endfor %}</td></tr>
 {% else %}<tr><td colspan="5" class="muted">No events yet.</td></tr>{% endfor %}</tbody></table>"""
@@ -2505,10 +2529,93 @@ def _secret_input(name):
             '{{ (\'saved \' + mask(s.' + name + ') + \' - leave empty to keep\') if s.' + name + ' else \'not set\' }}">')
 
 
-SETTINGS_BODY = """
-<div class="nav"><a href="#general">General</a><a href="#hosts">Hosts</a><a href="#alerts">Alerts</a><a href="#internet">Internet</a>
-<a href="#graphs">Dashboard graphs</a><a href="#backups">Backups</a><a href="#telegram">Telegram</a><a href="#email">Outgoing e-mail</a>
-<a href="#receiver">Incoming e-mail (devices)</a><a href="#snmp">SNMP + traps</a><a href="#webhook">Webhook</a><a href="#api">API</a><a href="{{ url_for('alarm_settings') }}">Alarms</a><a href="{{ url_for('backup_restore') }}">Backup</a><a href="#password">Passwords</a></div>
+SETTINGS_NAV = """
+<label class="nav-jump">Settings section
+<select onchange="if(this.value) location.href=this.value">
+<option value="">Jump to…</option>
+<option value="{{ url_for('settings') }}#general">General</option>
+<option value="{{ url_for('settings') }}#hosts">Hosts</option>
+<option value="{{ url_for('settings') }}#alerts">Alerts</option>
+<option value="{{ url_for('settings') }}#internet">Internet</option>
+<option value="{{ url_for('settings') }}#graphs">Dashboard graphs</option>
+<option value="{{ url_for('settings') }}#backups">MikroTik backups</option>
+<option value="{{ url_for('settings') }}#telegram">Telegram</option>
+<option value="{{ url_for('settings') }}#email">Outgoing e-mail</option>
+<option value="{{ url_for('settings') }}#receiver">Incoming e-mail (devices)</option>
+<option value="{{ url_for('settings') }}#snmp">SNMP + traps</option>
+<option value="{{ url_for('settings') }}#webhook">Webhook</option>
+<option value="{{ url_for('settings') }}#api">API</option>
+<option value="{{ url_for('alarm_settings') }}">Alarms</option>
+<option value="{{ url_for('backup_restore') }}">App config backup/restore</option>
+<option value="{{ url_for('settings') }}#password">Passwords</option>
+<option value="{{ url_for('diagnostics') }}">Diagnostics</option>
+</select></label>
+<nav class="nav" aria-label="Settings">
+<a href="{{ url_for('settings') }}#general">General</a>
+<a href="{{ url_for('settings') }}#hosts">Hosts</a>
+<a href="{{ url_for('settings') }}#alerts">Alerts</a>
+<a href="{{ url_for('settings') }}#internet">Internet</a>
+<a href="{{ url_for('settings') }}#graphs">Dashboard graphs</a>
+<a href="{{ url_for('settings') }}#backups">MikroTik backups</a>
+<a href="{{ url_for('settings') }}#telegram">Telegram</a>
+<a href="{{ url_for('settings') }}#email">Outgoing e-mail</a>
+<a href="{{ url_for('settings') }}#receiver">Incoming e-mail (devices)</a>
+<a href="{{ url_for('settings') }}#snmp">SNMP + traps</a>
+<a href="{{ url_for('settings') }}#webhook">Webhook</a>
+<a href="{{ url_for('settings') }}#api">API</a>
+<a href="{{ url_for('alarm_settings') }}">Alarms</a>
+<a href="{{ url_for('backup_restore') }}">App config backup/restore</a>
+<a href="{{ url_for('settings') }}#password">Passwords</a>
+<a href="{{ url_for('diagnostics') }}">Diagnostics</a>
+</nav>
+<script>
+(function(){
+  function mark(){
+    var links=document.querySelectorAll('nav.nav a');
+    links.forEach(function(a){ a.classList.remove('on'); });
+    links.forEach(function(a){
+      var path=a.pathname, hash=a.hash||'';
+      if(path!==location.pathname) return;
+      if(hash){ if((location.hash||'#general')===hash) a.classList.add('on'); }
+      else a.classList.add('on');
+    });
+  }
+  mark();
+  window.addEventListener('hashchange', mark);
+})();
+</script>
+"""
+
+SETTINGS_BODY = SETTINGS_NAV + """
+
+<div class="card" id="general"><h2>General</h2>
+<p class="section-intro">Name of this site, how often it pings, and who may open the dashboard. The address the web page itself listens on (the LAN and localhost together, or localhost only) is set by the installer, not here.</p>
+<form method="post" action="{{ url_for('save_section', section='general') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Site / client name</label><div><input type="text" name="site_name" value="{{ s.site_name }}" required maxlength="80">
+<p class="hint">Put at the start of every alert so you can tell sites apart. Example: <code>Hotel Nikiana</code>. Set one name per installation.</p></div>
+<label>Timezone</label><div><input type="text" name="timezone" value="{{ s.timezone }}" list="tzs"><datalist id="tzs">{% for z in tzs %}<option>{{ z }}</option>{% endfor %}</datalist>
+<p class="hint">Clock used for the dashboard, events and alert times. Example: <code>Europe/Athens</code>. Pick the zone where the devices are. The installer does not change this; set the PC clock with <code>timedatectl</code> as well.</p></div>
+<label>Ping interval (seconds)</label><div><input type="number" name="ping_interval" min="10" max="3600" value="{{ s.ping_interval }}">
+<p class="hint">How often each host is pinged. Example: <code>60</code>. Use 30 on a small site, or 120 if you watch a lot of devices.</p></div>
+<label>Ping timeout (seconds)</label><div><input type="number" name="ping_timeout" min="1" max="10" value="{{ s.ping_timeout }}">
+<p class="hint">How long one ping may take before it counts as a miss. Example: <code>2</code>. Raise it only on a slow or lossy link.</p></div>
+<label>Dashboard refresh (seconds)</label><div><input type="number" name="ui_refresh" min="10" max="300" value="{{ s.ui_refresh }}">
+<p class="hint">How often the dashboard, host pages and the log fetch new numbers without reloading the page. Example: <code>30</code>. Allowed range is 10–300. The graph range you picked stays put, and updates pause while the browser tab is hidden.</p></div>
+<label>Keep history (days)</label><div><input type="number" name="retention_days" min="1" max="365" value="{{ s.retention_days }}">
+<p class="hint">How long ping and SNMP samples are kept. Example: <code>30</code>. Use fewer days on a small disk.</p></div>
+<label>Ping method</label><div><select name="ping_method">{% for m in ['auto','icmplib','system'] %}<option {{ 'selected' if s.ping_method==m }}>{{ m }}</option>{% endfor %}</select>
+<p class="hint"><code>auto</code> tries a raw ICMP library, then the system <code>ping</code> command. Use <code>system</code> on Windows, or if raw ICMP is blocked. Use <code>icmplib</code> when you want the library only.</p></div>
+<label>Public URL (optional)</label><div><input type="url" name="public_url" value="{{ s.public_url }}" placeholder="https://hotel.monitor.example.com">
+<p class="hint">Address written into alert links. Example: <code>https://hotel-monitor.example.com</code>. Set this to the Cloudflare Tunnel hostname. Leave it empty if you only open the page on the LAN.</p></div>
+<label>Dashboard access</label><div><select name="dashboard_access"><option value="login" {{ 'selected' if s.dashboard_access=='login' }}>Login required (admin or viewer password)</option>
+<option value="public" {{ 'selected' if s.dashboard_access=='public' }}>Public read-only (no login)</option></select>
+<p class="hint"><b>Login required</b> is the right choice on a LAN. <b>Public read-only</b> shows the dashboard to anyone who can open the page; Settings still needs the admin password. Use public only for a wall display.</p></div>
+<label>Viewer password (dashboard only)</label><div><input type="password" name="viewer_password" autocomplete="new-password" placeholder="{{ 'set - leave empty to keep' if s.viewer_hash else 'not set' }}" style="width:60%">
+<label class="hint"><input type="checkbox" name="viewer_clear" value="1"> remove viewer password</label>
+<p class="hint">Optional second password that can see the dashboard but not change settings. Example: a password for reception. At least 6 characters. Leave it empty to keep the current one. Tick remove to clear it.</p></div>
+<span></span><div><button>Save general settings</button> <span class="hint">Ping method in use: {{ ping_name }}</span></div></div></form></div>
+
 
 <div class="card" id="hosts"><h2>Hosts</h2>
 <p class="section-intro">Each row is one device this monitor pings. Add a camera, router, access point or server you want to watch. Save a row after you change it.</p>
@@ -2526,7 +2633,7 @@ SETTINGS_BODY = """
 <li><b>API</b> — Hikvision or Dahua username and password, checked on the recorder's own HTTP API.</li>
 <li><b>Backup</b> — MikroTik export account. Use a user that can read the config, not the full admin if you can avoid it.</li>
 </ul>
-<table><tr><th>Name</th><th>IP / hostname</th><th>Group</th><th>Type</th><th>On</th><th>Fails</th><th>Ping s</th><th>Repeat</th><th>Maintenance until</th><th></th></tr>
+<div class="table-wrap"><table><tr><th>Name</th><th>IP / hostname</th><th>Group</th><th>Type</th><th>On</th><th>Fails</th><th>Ping s</th><th>Repeat</th><th>Maintenance until</th><th></th></tr>
 {% for h in hosts %}<tr>
 <td><input type="text" form="hf{{ h.id }}" name="name" value="{{ h.name }}" required maxlength="60" style="width:150px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="host" value="{{ h.host }}" required maxlength="253" style="width:140px"></td>
@@ -2549,40 +2656,95 @@ SETTINGS_BODY = """
 <td><input type="text" form="hadd" name="grp" placeholder="e.g. Cameras" maxlength="60" style="width:120px"></td>
 <td><select form="hadd" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}">{{ v[0] }}</option>{% endfor %}</select></td>
 <td><input type="checkbox" form="hadd" name="enabled" value="1" checked></td><td></td><td></td><td></td><td></td>
-<td><form id="hadd" method="post" action="{{ url_for('host_add') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>+ Add</button></form></td></tr></table></div>
+<td><form id="hadd" method="post" action="{{ url_for('host_add') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>+ Add</button></form></td></tr></table></div></div>
 
-<div class="card" id="general"><h2>General</h2>
-<p class="section-intro">Name of this site, how often it pings, and who may open the dashboard. The address the web page itself listens on (the LAN and localhost together, or localhost only) is set by the installer, not here.</p>
-<form method="post" action="{{ url_for('save_section', section='general') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="card" id="alerts"><h2>Alerts</h2>
+<p class="section-intro">When a host is called down, how often that alarm is repeated, quiet hours, and a site-wide maintenance window. Saving here does not change General, Telegram, or any other section.</p>
+<form method="post" action="{{ url_for('save_section', section='alerts') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>Site / client name</label><div><input type="text" name="site_name" value="{{ s.site_name }}" required maxlength="80">
-<p class="hint">Put at the start of every alert so you can tell sites apart. Example: <code>Hotel Nikiana</code>. Set one name per installation.</p></div>
-<label>Timezone</label><div><input type="text" name="timezone" value="{{ s.timezone }}" list="tzs"><datalist id="tzs">{% for z in tzs %}<option>{{ z }}</option>{% endfor %}</datalist>
-<p class="hint">Clock used for the dashboard, events and alert times. Example: <code>Europe/Athens</code>. Pick the zone where the devices are. The installer does not change this; set the PC clock with <code>timedatectl</code> as well.</p></div>
-<label>Ping interval (seconds)</label><div><input type="number" name="ping_interval" min="10" max="3600" value="{{ s.ping_interval }}">
-<p class="hint">How often each host is pinged. Example: <code>60</code>. Use 30 on a small site, or 120 if you watch a lot of devices.</p></div>
-<label>Ping timeout (seconds)</label><div><input type="number" name="ping_timeout" min="1" max="10" value="{{ s.ping_timeout }}">
-<p class="hint">How long one ping may take before it counts as a miss. Example: <code>2</code>. Raise it only on a slow or lossy link.</p></div>
-<span id="alerts"></span>
 <label>Failed pings before alert</label><div><input type="number" name="fail_threshold" min="1" max="20" value="{{ s.fail_threshold }}">
 <p class="hint">Global default for how many missed pings in a row raise a DOWN alarm. Example: <code>3</code>. A host can override this with its own Fails column (0 on the host means “use this number”).</p></div>
 <label>Alarm repeat (minutes)</label><div><input type="number" name="repeat_min" min="0" max="1440" value="{{ s.repeat_min }}">
-<p class="hint">While a host stays down, send the alarm again every this many minutes. Example: <code>30</code>. Use <code>0</code> to never repeat. A host can override it; an empty Repeat field on the host uses this number.</p></div>
-<label>Dashboard refresh (seconds)</label><div><input type="number" name="ui_refresh" min="10" max="300" value="{{ s.ui_refresh }}">
-<p class="hint">How often the dashboard, host pages and the log fetch new numbers without reloading the page. Example: <code>30</code>. Allowed range is 10–300. The graph range you picked stays put, and updates pause while the browser tab is hidden.</p></div>
-<label>Keep history (days)</label><div><input type="number" name="retention_days" min="1" max="365" value="{{ s.retention_days }}">
-<p class="hint">How long ping and SNMP samples are kept. Example: <code>30</code>. Use fewer days on a small disk.</p></div>
-<label>Ping method</label><div><select name="ping_method">{% for m in ['auto','icmplib','system'] %}<option {{ 'selected' if s.ping_method==m }}>{{ m }}</option>{% endfor %}</select>
-<p class="hint"><code>auto</code> tries a raw ICMP library, then the system <code>ping</code> command. Use <code>system</code> on Windows, or if raw ICMP is blocked. Use <code>icmplib</code> when you want the library only.</p></div>
-<label>Public URL (optional)</label><div><input type="url" name="public_url" value="{{ s.public_url }}" placeholder="https://hotel.monitor.example.com">
-<p class="hint">Address written into alert links. Example: <code>https://hotel-monitor.example.com</code>. Set this to the Cloudflare Tunnel hostname. Leave it empty if you only open the page on the LAN.</p></div>
-<label>Dashboard access</label><div><select name="dashboard_access"><option value="login" {{ 'selected' if s.dashboard_access=='login' }}>Login required (admin or viewer password)</option>
-<option value="public" {{ 'selected' if s.dashboard_access=='public' }}>Public read-only (no login)</option></select>
-<p class="hint"><b>Login required</b> is the right choice on a LAN. <b>Public read-only</b> shows the dashboard to anyone who can open the page; Settings still needs the admin password. Use public only for a wall display.</p></div>
-<label>Viewer password (dashboard only)</label><div><input type="password" name="viewer_password" autocomplete="new-password" placeholder="{{ 'set - leave empty to keep' if s.viewer_hash else 'not set' }}" style="width:60%">
-<label class="hint"><input type="checkbox" name="viewer_clear" value="1"> remove viewer password</label>
-<p class="hint">Optional second password that can see the dashboard but not change settings. Example: a password for reception. At least 6 characters. Leave it empty to keep the current one. Tick remove to clear it.</p></div>
-<span></span><div><button>Save general settings</button> <span class="hint">Ping method in use: {{ ping_name }}</span></div></div></form></div>
+<p class="hint">While a host stays down, send the alarm again every this many minutes. Example: <code>30</code>. Use <code>0</code> to never repeat. An empty Repeat field on the host uses this number.</p></div>
+<label>Quiet hours start</label><div><input type="time" name="quiet_start" value="{{ s.quiet_start }}">
+<p class="hint">Local time when non-critical alerts start waiting. Example: <code>22:00</code>. Leave both times empty to turn quiet hours off.</p></div>
+<label>Quiet hours end</label><div><input type="time" name="quiet_end" value="{{ s.quiet_end }}">
+<p class="hint">Local time when queued alerts are sent. Example: <code>07:00</code>. Overnight windows (22:00 to 07:00) are fine. A start that equals the end means off.</p></div>
+<label>Critical alerts during quiet hours</label><div><input type="checkbox" name="quiet_critical" value="1" {{ 'checked' if s.quiet_critical }}>
+<p class="hint">Keep sending critical alarms (host down, panel alarm) during quiet hours. Untick to queue those as well.</p></div>
+<label>Site maintenance until</label><div><input type="datetime-local" name="maintenance_until" value="{{ ts_to_local_input(s.maintenance_until) }}">
+<p class="hint">No alerts for any host until this local time. Clear the field and save to turn it off. A single host can have its own window in the Hosts table.</p></div>
+<label>Events kept in the log</label><div><input type="number" name="event_keep" min="10" max="5000" value="{{ s.event_keep }}">
+<p class="hint">How many newest events the log page keeps. Example: <code>100</code>. Graphs use ping samples, not this list. The dashboard section “Recent events (ping + device e-mails)” stays.</p></div>
+<span></span><div><button>Save alerts</button></div></div></form></div>
+
+<div class="card" id="internet"><h2>Internet</h2>
+<p class="section-intro">Probes outside the LAN so the status bar can tell a dead internet link from a dead device. Saving here does not change host list or alert rules.</p>
+<form method="post" action="{{ url_for('save_section', section='internet') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Probe enabled</label><div><input type="checkbox" name="wan_enabled" value="1" {{ 'checked' if s.wan_enabled }}>
+<p class="hint">Ping the targets below on the same cycle as the hosts. Turn it off only if this machine has no route to the internet.</p></div>
+<label>Targets</label><div><input type="text" name="wan_targets" value="{{ s.wan_targets }}" placeholder="1.1.1.1, 8.8.8.8">
+<p class="hint">Comma-separated IPs or hostnames. Example: <code>1.1.1.1, 8.8.8.8</code>. Use addresses that answer ping.</p></div>
+<label>Loss alarm (%)</label><div><input type="number" name="wan_loss_pct" min="1" max="100" value="{{ s.wan_loss_pct }}">
+<p class="hint">Packet loss at or above this percent marks the internet degraded or down. Example: <code>20</code>.</p></div>
+<label>Latency alarm (ms)</label><div><input type="number" name="wan_latency_ms" min="1" max="10000" value="{{ s.wan_latency_ms }}">
+<p class="hint">Average latency at or above this many milliseconds marks the link degraded. Example: <code>200</code>.</p></div>
+<label>Pings per target</label><div><input type="number" name="wan_count" min="1" max="20" value="{{ s.wan_count }}">
+<p class="hint">How many pings are sent to each target on a probe. Example: <code>5</code>.</p></div>
+<span></span><div><button>Save internet</button></div></div></form></div>
+
+<div class="card" id="graphs"><h2>Dashboard graphs</h2>
+<p class="section-intro">Interfaces drawn on the dashboard. In and out each have a colour. Untick and save, or press Delete, to drop one graph. Other settings are not changed.</p>
+<form method="post" action="{{ url_for('save_dash_graphs') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="table-wrap"><table><tr><th>Show</th><th>Host</th><th>Interface</th><th>In</th><th>Out</th><th></th></tr>
+{% for g in graph_rows %}
+<tr>
+<td><input type="checkbox" name="dg_on_{{ loop.index0 }}" value="1" {{ 'checked' if g.on }}></td>
+<td>{{ g.name }}<input type="hidden" name="dg_host" value="{{ g.host_id }}"></td>
+<td>{{ g.iface }}<input type="hidden" name="dg_iface" value="{{ g.iface }}"></td>
+<td><input type="color" name="dg_in_{{ loop.index0 }}" value="{{ g.color_in }}"></td>
+<td><input type="color" name="dg_out_{{ loop.index0 }}" value="{{ g.color_out }}"></td>
+<td>{% if g.saved %}<button name="remove" value="{{ g.host_id }}|{{ g.iface }}" class="del" formnovalidate>Delete</button>{% endif %}</td>
+</tr>
+{% else %}<tr><td colspan="6" class="muted">No interfaces reported by SNMP yet. Add one below, or turn SNMP on for a host and poll it.</td></tr>{% endfor %}
+<tr>
+<td>Add</td>
+<td><select name="new_host"><option value="">Choose host</option>{% for h in hosts %}<option value="{{ h.id }}">{{ h.name }}</option>{% endfor %}</select></td>
+<td><input type="text" name="new_iface" placeholder="ether1" maxlength="64"></td>
+<td><input type="color" name="new_in" value="#16a34a"></td>
+<td><input type="color" name="new_out" value="#1d5fbf"></td>
+<td></td>
+</tr>
+</table></div>
+<p><button>Save dashboard graphs</button></p>
+<p class="hint">The Add row is stored only when both a host and an interface name are filled in. Delete removes that one graph and leaves the others.</p>
+</form></div>
+
+<div class="card" id="backups"><h2>MikroTik backups</h2>
+<p class="section-intro">Weekly export of MikroTik routers. One file per week, keeping the last year (52) unless you change the number. The username and password for each router are on that host’s Backup link under Hosts. This is not the copy of this app — that page is <a href="{{ url_for('backup_restore') }}">App config backup/restore</a>.</p>
+<form method="post" action="{{ url_for('save_section', section='backups') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Weekday</label><div><select name="mt_backup_day">{% for n, label in [(0,'Monday'),(1,'Tuesday'),(2,'Wednesday'),(3,'Thursday'),(4,'Friday'),(5,'Saturday'),(6,'Sunday')] %}<option value="{{ n }}" {{ 'selected' if s.mt_backup_day==n }}>{{ label }}</option>{% endfor %}</select>
+<p class="hint">The local weekday the export runs. Example: Sunday night into Monday, pick Monday.</p></div>
+<label>Time</label><div><input type="time" name="mt_backup_time" value="{{ s.mt_backup_time }}" required>
+<p class="hint">Local time on that weekday. Example: <code>03:00</code>. A router that already has a success after this time is skipped until next week.</p></div>
+<label>Keep</label><div><input type="number" name="mt_backup_keep" min="1" max="520" value="{{ s.mt_backup_keep }}">
+<p class="hint">How many successful exports to keep per router. Example: <code>52</code> (one per week for a year). Failed attempts do not use a slot.</p></div>
+<span></span><div><button>Save MikroTik schedule</button></div></div></form>
+<h2>Routers</h2>
+<div class="table-wrap"><table><tr><th>Host</th><th>Address</th><th>Account</th><th></th></tr>
+{% for h in mt_hosts %}<tr><td>{{ h.name }}</td><td>{{ h.host }}</td><td>{{ 'on' if h.enabled else 'off' }}{% if h.user %} · {{ h.user }}{% endif %}</td>
+<td><a href="{{ url_for('host_backup', hid=h.id) }}">Account</a>
+<form method="post" action="{{ url_for('mikrotik_now', hid=h.id) }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="sec" name="now" value="1">Backup now</button></form></td></tr>
+{% else %}<tr><td colspan="4" class="muted">No hosts yet. Add a router under Hosts, then open its Backup link.</td></tr>{% endfor %}
+</table></div>
+<h2>Saved exports</h2>
+<div class="table-wrap"><table><tr><th>When</th><th>Host</th><th>Result</th><th></th></tr>
+{% for b in mt_files %}<tr><td>{{ b.when }}</td><td>{{ b.name }}</td><td>{% if b.ok %}saved{% else %}<span class="badge sev-critical">failed</span> {{ b.error }}{% endif %}</td>
+<td>{% if b.ok and b.path %}<a href="{{ url_for('backup_download', bid=b.id) }}">Download</a>{% endif %}{% if b.ok and b.bin_path %} · <a href="{{ url_for('backup_download', bid=b.id, kind='bin') }}">Binary</a>{% endif %}</td></tr>
+{% else %}<tr><td colspan="4" class="muted">No exports yet.</td></tr>{% endfor %}
+</table></div></div>
 
 <div class="card" id="telegram"><h2>Telegram</h2>
 <p class="section-intro">Sends a Telegram message when a host goes down or comes back, and for device or SNMP alerts that are set to be forwarded.</p>
@@ -2678,6 +2840,14 @@ Status: <b>{{ rx_status }}</b></p>
 <p class="hint">v1/v2c community strings to accept, separated by commas. Example: <code>wwmon</code>. Empty means any community. The sender must also be inside Allowed sender networks.</p></div>
 <label>Forward traps</label><div><select name="trap_forward_min">{% for k, v in [('info','Everything (incl. linkUp)'),('warning','Warnings + critical'),('critical','Critical only (linkDown, coldStart)'),('none','Nothing (dashboard only)')] %}<option value="{{ k }}" {{ 'selected' if s.trap_forward_min==k }}>{{ v }}</option>{% endfor %}</select>
 <p class="hint">Which traps are sent onward. Example: Critical only, so linkDown and coldStart are forwarded and linkUp stays on the dashboard.</p></div>
+<label>High temperature (°C)</label><div><input type="number" name="snmp_temp_threshold" value="{{ s.snmp_temp_threshold }}" min="0" max="150">
+<p class="hint">Alert when a polled temperature reaches this. Example: <code>75</code>. Use <code>0</code> to turn the temperature alert off.</p></div>
+<label>Interface utilisation (%)</label><div><input type="number" name="snmp_util_threshold" value="{{ s.snmp_util_threshold }}" min="0" max="100">
+<p class="hint">Alert when a graphed interface stays at or above this percent of its speed. Example: <code>80</code>. Use <code>0</code> to turn it off.</p></div>
+<label>UPS runtime alarm (minutes)</label><div><input type="number" name="ups_runtime_min" value="{{ s.ups_runtime_min }}" min="0" max="1440">
+<p class="hint">Alert when a UPS reports fewer minutes remaining than this. Example: <code>10</code>. Use <code>0</code> to turn it off.</p></div>
+<label>UPS load alarm (%)</label><div><input type="number" name="ups_load_pct" value="{{ s.ups_load_pct }}" min="0" max="100">
+<p class="hint">Alert when UPS load reaches this percent. Example: <code>80</code>. Use <code>0</code> to turn it off.</p></div>
 <span></span><div><button>Save + restart trap receiver</button></div></div></form></div>
 
 <div class="card" id="webhook"><h2>Outgoing webhook (Grok Bot / automations)</h2>
@@ -2698,8 +2868,8 @@ Status: <b>{{ rx_status }}</b></p>
 <p class="section-intro">A password for scripts that read status. It is not the admin password, and it cannot change settings.</p>
 <p class="hint">Send it as <code>Authorization: Bearer &lt;token&gt;</code> (best) or <code>?token=&lt;token&gt;</code> on <code>/api/status</code> and <code>/api/events</code>. Example: a Grok Bot poller. Show and Copy do not change it. Regenerate if it leaks; the old value stops working immediately.</p>
 <input type="password" id="apitok" value="{{ s.api_token }}" readonly style="width:420px;font-family:monospace">
-<button type="button" class="sec" onclick="const t=document.getElementById('apitok');t.type=t.type=='password'?'text':'password'">Show</button>
-<button type="button" class="sec" onclick="navigator.clipboard.writeText(document.getElementById('apitok').value).then(()=>this.textContent='Copied')">Copy</button>
+<button type="button" class="sec" onclick="const t=document.getElementById('apitok');t.type=t.type=='password'?'text':'password';this.textContent=t.type=='text'?'Hide':'Show'">Show</button>
+<button type="button" class="sec" id="api-copy" onclick="const v=document.getElementById('apitok').value; const done=()=>this.textContent='Copied'; const fallback=()=>{const i=document.createElement('textarea');i.value=v;document.body.appendChild(i);i.select();try{document.execCommand('copy')}catch(e){}i.remove();done();}; if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(v).then(done).catch(fallback);}else fallback();">Copy</button>
 <form method="post" action="{{ url_for('regen_token') }}" style="display:inline" onsubmit="return confirm('Old token stops working. Continue?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del">Regenerate</button></form></div>
 
 <div class="card" id="password"><h2>Change admin password</h2>
@@ -2714,25 +2884,35 @@ Status: <b>{{ rx_status }}</b></p>
 <span></span><div><button>Change password</button></div></div></form></div>
 """
 BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_enabled", "rx_enabled", "rx_require_auth",
-               "snmp_enabled", "snmp_alert_ifdown", "snmp_alert_reboot", "trap_enabled"}
+               "snmp_enabled", "snmp_alert_ifdown", "snmp_alert_reboot", "trap_enabled", "quiet_critical", "wan_enabled"}
 SECTIONS = {
-    "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "fail_threshold", "repeat_min", "ui_refresh", "retention_days",
+    "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "ui_refresh", "retention_days",
                 "ping_method", "public_url", "dashboard_access"],
+    "alerts": ["fail_threshold", "repeat_min", "quiet_start", "quiet_end", "quiet_critical", "maintenance_until", "event_keep"],
+    "internet": ["wan_enabled", "wan_targets", "wan_loss_pct", "wan_latency_ms", "wan_count"],
+    "backups": ["mt_backup_day", "mt_backup_time", "mt_backup_keep"],
     "telegram": ["telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_photos"],
     "email": ["email_enabled", "smtp_host", "smtp_port", "smtp_security", "smtp_user", "smtp_password", "smtp_from", "smtp_to"],
     "webhook": ["webhook_enabled", "webhook_url", "webhook_header_name", "webhook_header_value"],
     "receiver": ["rx_enabled", "rx_host", "rx_port", "rx_security", "rx_require_auth", "rx_user", "rx_password",
                  "rx_allowed_nets", "rx_forward_min", "rx_rate_limit"],
     "snmp": ["snmp_enabled", "snmp_interval", "snmp_timeout", "snmp_cpu_threshold", "snmp_alert_ifdown", "snmp_alert_reboot",
-             "snmp_forward_min", "trap_enabled", "trap_host", "trap_port", "trap_community", "trap_forward_min"],
+             "snmp_forward_min", "trap_enabled", "trap_host", "trap_port", "trap_community", "trap_forward_min",
+             "snmp_temp_threshold", "snmp_util_threshold", "ups_runtime_min", "ups_load_pct"],
 }
+SECTION_LABEL = {"general": "General", "alerts": "Alerts", "internet": "Internet", "backups": "MikroTik backups",
+                 "telegram": "Telegram", "email": "Outgoing e-mail", "webhook": "Webhook",
+                 "receiver": "Incoming e-mail", "snmp": "SNMP"}
 CHOICES = {"ping_method": {"auto", "icmplib", "system"}, "dashboard_access": {"login", "public"},
            "smtp_security": {"none", "starttls", "ssl"}, "rx_security": {"none", "starttls", "ssl"},
            "rx_forward_min": {"info", "warning", "critical", "none"}, "snmp_forward_min": {"info", "warning", "critical", "none"},
            "trap_forward_min": {"info", "warning", "critical", "none"}}
 RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold": (1, 20), "repeat_min": (0, 1440), "ui_refresh": (10, 300), "retention_days": (1, 365),
           "smtp_port": (1, 65535), "rx_port": (1, 65535), "rx_rate_limit": (0, 86400),
-          "snmp_interval": (30, 3600), "snmp_timeout": (1, 10), "snmp_cpu_threshold": (0, 100), "trap_port": (1, 65535)}
+          "snmp_interval": (30, 3600), "snmp_timeout": (1, 10), "snmp_cpu_threshold": (0, 100), "trap_port": (1, 65535),
+          "event_keep": (10, 5000), "wan_loss_pct": (1, 100), "wan_latency_ms": (1, 10000), "wan_count": (1, 20),
+          "snmp_temp_threshold": (0, 150), "snmp_util_threshold": (0, 100), "ups_runtime_min": (0, 1440), "ups_load_pct": (0, 100),
+          "mt_backup_day": (0, 6), "mt_backup_keep": (1, 520)}
 
 
 def _apply_section(section):
@@ -2744,6 +2924,25 @@ def _apply_section(section):
         v = request.form.get(k, "").strip()
         if k in SECRET_KEYS and not v:
             continue  # keep saved secret
+        if k == "maintenance_until":
+            upd[k] = int(local_input_to_ts(v))
+            continue
+        if k in ("quiet_start", "quiet_end", "mt_backup_time"):
+            if v and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", v):
+                raise ValueError(f"{k.replace('_', ' ')} must be HH:MM")
+            if k == "mt_backup_time" and not v:
+                raise ValueError("backup time must be HH:MM")
+            upd[k] = v[:5]
+            continue
+        if k == "wan_targets":
+            parts = [x.strip() for x in v.split(",") if x.strip()]
+            if not parts:
+                raise ValueError("add at least one internet target")
+            for part in parts:
+                if not HOST_RE.match(part) or part.startswith("-"):
+                    raise ValueError(f"invalid target {part}")
+            upd[k] = ", ".join(parts)
+            continue
         if k in INT_KEYS:
             try:
                 v = int(v)
@@ -2784,9 +2983,61 @@ def settings():
         tzs = sorted(z for z in available_timezones() if z.startswith("Europe/"))
     except Exception:
         tzs = ["Europe/Athens"]
+    graph_rows = _graph_rows(hosts)
+    mt_hosts, mt_files = _mikrotik_rows()
     return page(SETTINGS_BODY, hosts=hosts, tzs=tzs, rx_status=RECEIVER.status(), trap_status=SNMP.trap_status,
-                snmp_ok=SNMP.available,
+                snmp_ok=SNMP.available, graph_rows=graph_rows, mt_hosts=mt_hosts, mt_files=mt_files,
                 ping_name=_ping_impl["name"] or "not started")
+
+
+def _graph_rows(hosts):
+    """Saved dashboard graphs, plus interfaces SNMP has already reported."""
+    names = {h["id"]: h["name"] for h in hosts}
+    saved = {}
+    found = []
+    with db() as c:
+        for row in c.execute("SELECT host_id, iface, color_in, color_out FROM dash_ifaces ORDER BY host_id, iface"):
+            saved[(row["host_id"], row["iface"])] = dict(row)
+        states = c.execute("SELECT host_id, data FROM snmp_state").fetchall()
+    rows = []
+    seen = set()
+    for key, row in saved.items():
+        rows.append({"host_id": key[0], "iface": key[1], "name": names.get(key[0], "?"),
+                     "color_in": row["color_in"], "color_out": row["color_out"], "on": True, "saved": True})
+        seen.add(key)
+    for state in states:
+        try:
+            data = json.loads(state["data"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        for iface in data.get("ifaces") or []:
+            name = (iface.get("name") or "")[:64]
+            key = (state["host_id"], name)
+            if not name or key in seen or key[0] not in names:
+                continue
+            seen.add(key)
+            found.append({"host_id": key[0], "iface": name, "name": names.get(key[0], "?"),
+                          "color_in": "#16a34a", "color_out": "#1d5fbf", "on": False, "saved": False})
+    return rows + found
+
+
+def _mikrotik_rows():
+    with db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT id, name, host, mtbak FROM hosts ORDER BY name")]
+        files = [dict(r) for r in c.execute(
+            "SELECT b.id, b.ts, b.ok, b.error, b.path, b.bin_path, h.name FROM backups b "
+            "JOIN hosts h ON h.id=b.host_id ORDER BY b.ts DESC LIMIT 20")]
+    out = []
+    for host in hosts:
+        try:
+            cfg = json.loads(host.get("mtbak") or "{}")
+        except (TypeError, ValueError):
+            cfg = {}
+        out.append({"id": host["id"], "name": host["name"], "host": host["host"],
+                    "enabled": bool(cfg.get("enabled")), "user": cfg.get("user") or ""})
+    for row in files:
+        row["when"] = fmt_ts(row["ts"])
+    return out, files
 
 
 @app.route("/settings/<section>", methods=["POST"])
@@ -2796,7 +3047,7 @@ def save_section(section):
         abort(404)
     try:
         _apply_section(section)
-        flash(f"{section.capitalize()} settings saved.")
+        flash(f"{SECTION_LABEL.get(section, section)} saved.")
     except Exception as e:
         flash(f"Not saved: {e}")
         return redirect(url_for("settings") + "#" + section)
@@ -3368,7 +3619,7 @@ def host_backup(hid):
             cfg["password"] = encrypt_secret(request.form.get("password"))
         with _db_lock, db() as c:
             c.execute("UPDATE hosts SET mtbak=? WHERE id=?", (json.dumps(cfg), hid))
-        flash("Backup account saved. One export per week, keeping the last year (52) unless you change Backups to keep.")
+        flash("Backup account saved. One export per week, keeping the last year (52) unless you change MikroTik backups → Keep.")
         if request.form.get("now"):
             jobs.run_backup(sys.modules[__name__], dict(row) | {"mtbak": json.dumps(cfg)} if False else {**dict(row), "mtbak": json.dumps(cfg)}, "now")
         return redirect(url_for("host_backup", hid=hid))
@@ -3403,26 +3654,74 @@ def backup_download(bid):
     return send_file(path, as_attachment=True)
 
 
+def _color(value, fallback):
+    value = (value or "").strip()
+    return value if re.fullmatch(r"#[0-9A-Fa-f]{6}", value) else fallback
+
+
 @app.route("/settings/dashboard-graphs", methods=["POST"])
 @admin_required
 def save_dash_graphs():
+    if request.form.get("remove"):
+        host_id, _, iface = request.form.get("remove").partition("|")
+        try:
+            hid = int(host_id)
+        except ValueError:
+            hid = 0
+        with _db_lock, db() as c:
+            c.execute("DELETE FROM dash_ifaces WHERE host_id=? AND iface=?", (hid, iface[:64]))
+        flash("Dashboard graph removed.")
+        return redirect(url_for("settings") + "#graphs")
     hosts = request.form.getlist("dg_host")
     ifaces = request.form.getlist("dg_iface")
     with _db_lock, db() as c:
+        known = {r["id"] for r in c.execute("SELECT id FROM hosts")}
         c.execute("DELETE FROM dash_ifaces")
         for i, (host_id, iface) in enumerate(zip(hosts, ifaces)):
             if not request.form.get(f"dg_on_{i}"):
                 continue
-            color_in = request.form.get(f"dg_in_{i}") or "#16a34a"
-            color_out = request.form.get(f"dg_out_{i}") or "#1d5fbf"
-            if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color_in):
-                color_in = "#16a34a"
-            if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color_out):
-                color_out = "#1d5fbf"
+            try:
+                hid = int(host_id)
+            except ValueError:
+                continue
+            if hid not in known or not iface.strip():
+                continue
             c.execute("INSERT OR REPLACE INTO dash_ifaces(host_id, iface, color_in, color_out) VALUES(?,?,?,?)",
-                      (int(host_id), iface[:64], color_in, color_out))
+                      (hid, iface.strip()[:64], _color(request.form.get(f"dg_in_{i}"), "#16a34a"),
+                       _color(request.form.get(f"dg_out_{i}"), "#1d5fbf")))
+        new_iface = (request.form.get("new_iface") or "").strip()[:64]
+        try:
+            new_host = int(request.form.get("new_host") or 0)
+        except ValueError:
+            new_host = 0
+        if new_host in known and new_iface:
+            c.execute("INSERT OR REPLACE INTO dash_ifaces(host_id, iface, color_in, color_out) VALUES(?,?,?,?)",
+                      (new_host, new_iface, _color(request.form.get("new_in"), "#16a34a"),
+                       _color(request.form.get("new_out"), "#1d5fbf")))
     flash("Dashboard graphs saved.")
     return redirect(url_for("settings") + "#graphs")
+
+
+@app.route("/settings/mikrotik/<int:hid>/now", methods=["POST"])
+@admin_required
+def mikrotik_now(hid):
+    with db() as c:
+        row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
+    if not row:
+        abort(404)
+    try:
+        result = jobs.run_backup(sys.modules[__name__], dict(row), "now")
+    except Exception as e:
+        log.exception("backup now")
+        flash(f"Backup now failed: {e}")
+        return redirect(url_for("settings") + "#backups")
+    if result:
+        flash(f"Backup saved for {row['name']} via {result.get('via') or 'export'}.")
+    else:
+        with db() as c:
+            err = c.execute("SELECT error FROM backups WHERE host_id=? ORDER BY ts DESC LIMIT 1", (hid,)).fetchone()
+        flash("Backup now did not complete: " + ((err["error"] if err else "") or "see the event log."))
+    return redirect(url_for("settings") + "#backups")
 
 
 SIA = siarecv.SIAServer()
@@ -3443,20 +3742,35 @@ def _sia_map():
     return out
 
 
+def _sia_remember(peer, raw, ok, reason, account=""):
+    try:
+        with _db_lock, db() as c:
+            c.execute("INSERT INTO sia_log(ts, peer, raw, ok, reason, account) VALUES(?,?,?,?,?,?)",
+                      (time.time(), str(peer)[:64], (raw or "")[:400], 1 if ok else 0,
+                       (reason or "")[:180], (account or "")[:16]))
+            c.execute("DELETE FROM sia_log WHERE id NOT IN (SELECT id FROM sia_log ORDER BY id DESC LIMIT 40)")
+    except Exception:
+        log.debug("sia log", exc_info=True)
+
+
 def on_sia_frame(line, peer):
     s = get_settings()
     if not ip_allowed(peer, s.get("rx_allowed_nets")):
         log.warning("SIA from %s ignored (not in allowed networks)", peer)
-        return siarecv._response("NAK", "0000", "R0", "L0", "000")
+        _sia_remember(peer, line, False, "not in allowed networks")
+        return {"ok": False, "error": "not in allowed networks",
+                "reply": siarecv._response("NAK", "0000", "R0", "L0", "000")}
     info = siarecv.parse_line(line, _sia_map())
     if not info.get("ok"):
         log.info("SIA reject from %s: %s", peer, info.get("error"))
+        _sia_remember(peer, line, False, info.get("error") or "rejected", info.get("account") or "")
         return info
     account = info.get("account") or ""
     now = time.time()
     with db() as c:
         row = c.execute("SELECT * FROM sia_accounts WHERE account=?", (account,)).fetchone()
     if not row:
+        _sia_remember(peer, line, False, "unknown account", account)
         return info
     state = info.get("state") or (row["rest_state"] if info.get("heartbeat") and row["state"] == "offline" else row["state"])
     if info.get("heartbeat") and row["state"] == "offline":
@@ -3468,15 +3782,17 @@ def on_sia_frame(line, peer):
                   (now, text, text, state or row["state"], rest or "unknown", account))
     if not info.get("heartbeat"):
         host = {"id": None, "name": row["name"], "host": account, "device_type": row["panel"]}
-        add_event("sia", "sia_" + (info.get("code") or "event"), info["severity"], None,
+        add_event("alarm", "alarm", info["severity"], None,
                   info["text"][:80], f"{row['name']} ({account}): {info['text']}",
-                  {"account": account, "panel": row["panel"], "zone": info.get("zone"), "peer": peer})
+                  {"account": account, "panel": row["panel"], "zone": info.get("zone"), "peer": peer,
+                   "code": info.get("code"), "type": "alarm"})
         consider_notify(s, None, info["severity"], f"[{s['site_name']}] {row['name']}: {info['text'][:80]}",
                         f"{row['name']} account {account}\n{info['text']}\nfrom {peer}",
                         build_payload(s, "device_alert", None, host, severity=info["severity"], message=info["text"]))
     elif row["state"] == "offline":
-        add_event("sia", "sia_online", "info", None, "Panel online", f"{row['name']} sent a heartbeat again.",
-                  {"account": account})
+        add_event("alarm", "alarm", "info", None, "Panel online", f"{row['name']} sent a heartbeat again.",
+                  {"account": account, "type": "alarm", "code": "online"})
+    _sia_remember(peer, line, True, "heartbeat" if info.get("heartbeat") else (info.get("text") or "accepted"), account)
     return info
 
 
@@ -3492,7 +3808,8 @@ def sia_supervise():
         with _db_lock, db() as c:
             c.execute("UPDATE sia_accounts SET state='offline', offline_alerted=1 WHERE account=?", (row["account"],))
         msg = f"{row['name']} ({row['account']}) sent no heartbeat for {row['supervise_min']} minutes."
-        add_event("sia", "sia_offline", "critical", None, "Panel offline", msg, {"account": row["account"]})
+        add_event("alarm", "alarm", "critical", None, "Panel offline", msg,
+                  {"account": row["account"], "type": "alarm", "code": "offline"})
         consider_notify(s, None, "critical", f"[{s['site_name']}] Panel offline: {row['name']}", msg,
                         build_payload(s, "device_alert", None, None, severity="critical", message=msg))
 
@@ -3504,19 +3821,84 @@ def restart_sia():
         return
     try:
         SIA.start(s.get("sia_host") or "0.0.0.0", int(s.get("sia_port") or 12128),
-                  bool(s.get("sia_tcp")), bool(s.get("sia_udp")), on_sia_frame)
+                  bool(s.get("sia_tcp", 1)), bool(s.get("sia_udp", 1)), on_sia_frame)
     except Exception as e:
         log.error("SIA receiver failed: %s", e)
+        if not SIA.error:
+            SIA.error = str(e)
+            SIA.status_text = f"failed: {e}"
+
+
+def _send_test_alarm():
+    """Deliver one SIA-DCS burglary frame so the log and listen list show an alarm."""
+    s = get_settings()
+    with db() as c:
+        row = c.execute("SELECT account, name FROM sia_accounts ORDER BY name LIMIT 1").fetchone()
+    if not row:
+        add_event("alarm", "alarm", "info", None, "Test alarm",
+                  "Sent from Settings → Alarms. Add an account to exercise a real SIA frame.",
+                  {"type": "alarm", "code": "test"})
+        return "No account yet. A test alarm was written to the log. Add an account, then send the test again."
+    frame = siarecv.build_frame(f'"SIA-DCS"0001L0#{row["account"]}[#{row["account"]}|NBA1]')
+    if not s.get("sia_enabled"):
+        on_sia_frame(frame, "127.0.0.1")
+        return "Receiver is off, so the frame was parsed locally and written to the log. Save the receiver to listen on the port."
+    port = int(s.get("sia_port") or 12128)
+    target = ("127.0.0.1", port)
+    reply = b""
+    try:
+        if s.get("sia_tcp", 1):
+            with socket.create_connection(target, timeout=3) as sock:
+                sock.sendall(frame.encode("ascii"))
+                sock.settimeout(3)
+                reply = sock.recv(512)
+        elif s.get("sia_udp", 1):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.settimeout(3)
+                sock.sendto(frame.encode("ascii"), target)
+                reply, _ = sock.recvfrom(512)
+            finally:
+                sock.close()
+        else:
+            on_sia_frame(frame, "127.0.0.1")
+            return "TCP and UDP are both off. The frame was parsed locally."
+    except OSError as e:
+        on_sia_frame(frame, "127.0.0.1")
+        return f"Could not reach the listener ({e}). The frame was parsed locally instead."
+    text = reply.decode("ascii", "replace")
+    if "ACK" in text:
+        return f"Test frame for {row['name']} ({row['account']}) was acknowledged."
+    return "The listener answered, but not with ACK: " + text[:120]
 
 
 @app.route("/settings/alarms", methods=["GET", "POST"])
 @admin_required
 def alarm_settings():
     if request.method == "POST":
+        action = request.form.get("action") or ""
         if request.form.get("delete"):
             with _db_lock, db() as c:
                 c.execute("DELETE FROM sia_accounts WHERE account=?", (request.form.get("delete").upper(),))
             flash("Account removed.")
+            return redirect(url_for("alarm_settings"))
+        if action == "test":
+            flash(_send_test_alarm())
+            return redirect(url_for("alarm_settings"))
+        if action == "receiver":
+            host = (request.form.get("sia_host") or "0.0.0.0").strip()
+            try:
+                ipaddress.ip_address(host)
+                port = int(request.form.get("sia_port") or 12128)
+                if not 1 <= port <= 65535:
+                    raise ValueError("port")
+            except ValueError:
+                flash("Not saved: listen address must be an IP and the port must be 1-65535.")
+                return redirect(url_for("alarm_settings"))
+            set_settings(sia_enabled=1 if request.form.get("sia_enabled") else 0, sia_host=host, sia_port=port,
+                         sia_tcp=1 if request.form.get("sia_tcp") else 0, sia_udp=1 if request.form.get("sia_udp") else 0)
+            restart_sia()
+            flash(f"Alarm receiver saved. {SIA.status()}")
             return redirect(url_for("alarm_settings"))
         account = (request.form.get("account") or "").strip().upper()
         name = (request.form.get("name") or "").strip()[:60]
@@ -3544,20 +3926,32 @@ def alarm_settings():
                          name=excluded.name, panel=excluded.panel, key_enc=excluded.key_enc,
                          supervise_min=excluded.supervise_min""",
                       (account, name, panel, key_enc, max(1, min(supervise, 1440))))
-        set_settings(sia_enabled=1 if request.form.get("sia_enabled") else 0,
-                     sia_port=int(request.form.get("sia_port") or 12128))
-        restart_sia()
-        flash("Alarm account saved. This monitor is not a certified receiving centre.")
+        flash("Alarm account saved. The receiver switch is unchanged. This monitor is not a certified receiving centre.")
         return redirect(url_for("alarm_settings"))
     with db() as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM sia_accounts ORDER BY name")]
-    body = """<div class="card"><h2>Alarm panels (SIA DC-09)</h2>
+        log_rows = [dict(r) for r in c.execute("SELECT * FROM sia_log ORDER BY id DESC LIMIT 20")]
+    for row in rows:
+        row["seen"] = fmt_ts(row["last_ts"]) if row["last_ts"] else "never"
+    for row in log_rows:
+        row["when"] = fmt_ts(row["ts"])
+    body = SETTINGS_NAV + """<div class="card"><h2>Alarms (SIA DC-09)</h2>
 <p class="section-intro"><b>Information only.</b> This is not a certified alarm receiving centre (ARC/CMS). Keep Ajax, TrikdisConfig/Protegus, Hik-Connect and the Dahua app as the primary monitoring. TRK, the proprietary Trikdis protocol, is not supported — use SIA DC-09.</p>
-<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<p class="hint">Status: <b>{{ sia_status }}</b>. Senders must be inside the incoming e-mail allowed networks (<code>{{ s.rx_allowed_nets }}</code>). Change that list under Incoming e-mail (devices). NVR and camera events stay on the camera API and the e-mail receiver.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="receiver">
 <div class="form-grid">
 <label>Receiver enabled</label><div><input type="checkbox" name="sia_enabled" value="1" {{ 'checked' if s.sia_enabled }}>
-<p class="hint">Listens on TCP and UDP port {{ s.sia_port }} on all interfaces. Only senders in the e-mail receiver's allowed networks are accepted. Example port: <code>12128</code>.</p></div>
+<p class="hint">Opens the port below. Example: port <code>12128</code>. Saving an account does not change this switch.</p></div>
+<label>Listen address</label><div><input type="text" name="sia_host" value="{{ s.sia_host }}" placeholder="0.0.0.0"></div>
 <label>Port</label><div><input type="number" name="sia_port" min="1" max="65535" value="{{ s.sia_port }}"></div>
+<label>TCP</label><div><input type="checkbox" name="sia_tcp" value="1" {{ 'checked' if s.sia_tcp }}></div>
+<label>UDP</label><div><input type="checkbox" name="sia_udp" value="1" {{ 'checked' if s.sia_udp }}></div>
+<span></span><div><button>Save receiver</button></div></div></form>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="test">
+<p><button class="sec" name="test" value="1">Send test event</button> <span class="hint">Sends one SIA-DCS burglary frame to this machine and shows it in the log, Recent events, and the listen list below.</span></p></form>
+<h2>Account</h2>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="account">
+<div class="form-grid">
 <label>Account</label><div><input type="text" name="account" placeholder="1234" maxlength="16">
 <p class="hint">The object / account number in the panel, 3-16 hex digits. Example: <code>1234</code>.</p></div>
 <label>Name</label><div><input type="text" name="name" placeholder="Office Ajax"></div>
@@ -3577,12 +3971,60 @@ def alarm_settings():
 <li><b>Hikvision AX PRO / AX Hybrid</b> — Hik-Connect or the panel web page → Communication → Alarm receiving centre. Protocol SIA-DCS or ADM-CID, this IP and port, account, optional encryption, and a heartbeat interval.</li>
 <li><b>Dahua AirShield / ARC</b> — ARC settings → SIA DC-09 or Contact ID over IP. Account, this IP and port, heartbeat. Camera and NVR events stay on the camera API and the e-mail receiver, not here.</li>
 </ul>
-<table><tr><th>Name</th><th>Account</th><th>Panel</th><th>State</th><th></th></tr>
-{% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.state }}</td>
-<td><button form="del{{ a.account }}" class="del">Remove</button></td></tr>{% else %}<tr><td colspan="5" class="muted">No accounts yet.</td></tr>{% endfor %}</table>
+<div class="table-wrap"><table><tr><th>Name</th><th>Account</th><th>Panel</th><th>State</th><th>Last heard</th><th></th></tr>
+{% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.state }}</td><td>{{ a.seen }}</td>
+<td><button form="del{{ a.account }}" class="del">Delete</button></td></tr>{% else %}<tr><td colspan="6" class="muted">No accounts yet.</td></tr>{% endfor %}</table></div>
 {% for a in rows %}<form id="del{{ a.account }}" method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="delete" value="{{ a.account }}"></form>{% endfor %}
+<h2>Listen log</h2>
+<p class="hint">The last raw frames, including ones that were rejected, and why.</p>
+<div class="table-wrap"><table><tr><th>When</th><th>From</th><th>Account</th><th>Result</th><th>Frame</th></tr>
+{% for r in log_rows %}<tr><td>{{ r.when }}</td><td>{{ r.peer }}</td><td>{{ r.account }}</td><td>{{ 'accepted' if r.ok else r.reason }}</td><td class="muted">{{ r.raw }}</td></tr>
+{% else %}<tr><td colspan="5" class="muted">No frames yet.</td></tr>{% endfor %}</table></div>
 </div>"""
-    return page(body, rows=rows)
+    return page(body, rows=rows, log_rows=log_rows, sia_status=SIA.status())
+
+
+@app.route("/settings/diagnostics")
+@admin_required
+def diagnostics():
+    sia_pkg = "not installed"
+    try:
+        import pysiaalarm
+        sia_pkg = getattr(pysiaalarm, "__version__", None) or "installed"
+    except Exception as e:
+        sia_pkg = f"not importable ({e})"
+    bind = ""
+    path = os.path.join(DATA_DIR, "web-bind")
+    if os.path.isfile(path):
+        try:
+            bind = open(path, encoding="utf-8").read().strip()
+        except OSError:
+            bind = ""
+    with db() as c:
+        rejects = [dict(r) for r in c.execute(
+            "SELECT ts, peer, reason FROM sia_log WHERE ok=0 ORDER BY id DESC LIMIT 8")]
+    for row in rejects:
+        row["when"] = fmt_ts(row["ts"])
+    body = SETTINGS_NAV + """<div class="card"><h2>Diagnostics</h2>
+<p class="section-intro">What this process is doing right now. It does not change settings.</p>
+<table class="kv">
+<tr><td>App</td><td>{{ version }} · Python {{ py }}</td></tr>
+<tr><td>Web</td><td>this page is {{ web }}{% if bind %} · saved bind {{ bind }}{% endif %}</td></tr>
+<tr><td>Incoming e-mail</td><td>{{ smtp }}{% if smtp_err %} · {{ smtp_err }}{% endif %}</td></tr>
+<tr><td>SNMP traps</td><td>{{ trap }}{% if not snmp_ok %} · pysnmp not installed{% endif %}</td></tr>
+<tr><td>SIA</td><td>{{ sia }}{% if sia_err %} · {{ sia_err }}{% endif %} · pysiaalarm {{ sia_pkg }}</td></tr>
+<tr><td>SIA port</td><td>{{ 'on' if s.sia_enabled else 'off' }} · {{ s.sia_host }}:{{ s.sia_port }} · TCP {{ 'on' if s.sia_tcp else 'off' }} · UDP {{ 'on' if s.sia_udp else 'off' }}</td></tr>
+<tr><td>Allowed networks</td><td>{{ s.rx_allowed_nets }}</td></tr>
+</table>
+<h2>Last rejected SIA frames</h2>
+<div class="table-wrap"><table><tr><th>When</th><th>From</th><th>Reason</th></tr>
+{% for r in rejects %}<tr><td>{{ r.when }}</td><td>{{ r.peer }}</td><td>{{ r.reason }}</td></tr>
+{% else %}<tr><td colspan="3" class="muted">None.</td></tr>{% endfor %}</table></div>
+</div>"""
+    return page(body, version=VERSION, py=platform.python_version(), web=request.host, bind=bind,
+                smtp=RECEIVER.status(), smtp_err=RECEIVER.error or "", trap=SNMP.trap_status,
+                snmp_ok=SNMP.available, sia=SIA.status(), sia_err=SIA.error or "", sia_pkg=sia_pkg,
+                rejects=rejects)
 
 
 @app.route("/settings/backup", methods=["GET", "POST"])
@@ -3679,7 +4121,8 @@ def backup_restore():
         copies = configbackup.list_local(DATA_DIR)
     except OSError:
         copies = []
-    body = """<div class="card"><h2>Backup / restore</h2>
+    body = SETTINGS_NAV + """<div class="card"><h2>App config backup/restore</h2>
+<p class="hint">This page copies the monitor’s own settings, hosts and accounts. Router exports are under <a href="{{ url_for('settings') }}#backups">MikroTik backups</a>.</p>
 <p class="section-intro">Download this installation to keep off the machine, or to move it onto a new thin client. The file is encrypted with the passphrase you type. An unencrypted copy of passwords and tokens is refused.</p>
 <h2>Download</h2>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="download">
