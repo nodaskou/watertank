@@ -130,6 +130,8 @@ DEFAULTS = {
     "ui_refresh": 30,
     "public_ip": "", "public_ip_isp": "", "public_ip_at": 0,
     "sia_enabled": 0, "sia_host": "0.0.0.0", "sia_port": 12128, "sia_tcp": 1, "sia_udp": 1,
+    # strict ±20s, tolerant (sia_ts_window seconds), local (panel clock is site local), off
+    "sia_ts_mode": "tolerant", "sia_ts_window": 600,
 }
 INT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, int)}
 SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password"}
@@ -206,12 +208,21 @@ def _migrate(c):
             account TEXT PRIMARY KEY, name TEXT NOT NULL, panel TEXT NOT NULL DEFAULT 'ajax',
             key_enc TEXT NOT NULL DEFAULT '', supervise_min INTEGER NOT NULL DEFAULT 10,
             last_ts REAL, last_text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'unknown',
-            rest_state TEXT NOT NULL DEFAULT 'unknown', offline_alerted INTEGER NOT NULL DEFAULT 0);
+            rest_state TEXT NOT NULL DEFAULT 'unknown', offline_alerted INTEGER NOT NULL DEFAULT 0,
+            ts_mode TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS sia_log(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL DEFAULT '',
             raw TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
-            account TEXT NOT NULL DEFAULT '');
+            account TEXT NOT NULL DEFAULT '', protocol TEXT NOT NULL DEFAULT '',
+            frame_ts TEXT NOT NULL DEFAULT '', server_utc TEXT NOT NULL DEFAULT '',
+            delta_s INTEGER, flag TEXT NOT NULL DEFAULT '');
     """)
+    _add_col(c, "sia_accounts", "ts_mode", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "sia_log", "protocol", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "sia_log", "frame_ts", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "sia_log", "server_utc", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "sia_log", "delta_s", "INTEGER")
+    _add_col(c, "sia_log", "flag", "TEXT NOT NULL DEFAULT ''")
 
 
 def init_db():
@@ -3736,21 +3747,53 @@ def _sia_map():
     for row in rows:
         key = decrypt_secret(row["key_enc"]) if row["key_enc"] else None
         try:
-            out[row["account"].upper()] = SIAAccount(row["account"], key=key or None, allowed_timeband=(1200, 1200))
+            # allowed_timeband=None turns off pysiaalarm's clock check. That check uses
+            # datetime.now(account timezone) and was rejecting panels that send local time.
+            out[row["account"].upper()] = SIAAccount(row["account"], key=key or None, allowed_timeband=None)
         except Exception as e:
             log.warning("SIA account %s skipped: %s", row["account"], e)
     return out
 
 
-def _sia_remember(peer, raw, ok, reason, account=""):
+def _sia_remember(peer, raw, ok, reason, account="", protocol="", frame_ts="", server_utc="", delta_s=None, flag=""):
     try:
         with _db_lock, db() as c:
-            c.execute("INSERT INTO sia_log(ts, peer, raw, ok, reason, account) VALUES(?,?,?,?,?,?)",
-                      (time.time(), str(peer)[:64], (raw or "")[:400], 1 if ok else 0,
-                       (reason or "")[:180], (account or "")[:16]))
-            c.execute("DELETE FROM sia_log WHERE id NOT IN (SELECT id FROM sia_log ORDER BY id DESC LIMIT 40)")
+            c.execute("""INSERT INTO sia_log(ts, peer, raw, ok, reason, account, protocol, frame_ts, server_utc, delta_s, flag)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                      (time.time(), str(peer)[:64], (raw or "")[:500], 1 if ok else 0,
+                       (reason or "")[:240], (account or "")[:16], (protocol or "")[:16],
+                       (frame_ts or "")[:40], (server_utc or "")[:40], delta_s, (flag or "")[:80]))
+            c.execute("DELETE FROM sia_log WHERE id NOT IN (SELECT id FROM sia_log ORDER BY id DESC LIMIT 80)")
     except Exception:
         log.debug("sia log", exc_info=True)
+
+
+def _sia_log_view(rows):
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["when"] = fmt_ts(row["ts"])
+        item["delta"] = siarecv.format_delta(row["delta_s"]) if row["delta_s"] is not None else ""
+        flag = row["flag"] or ""
+        if row["ok"]:
+            item["result"] = "accepted" + (f" · {flag}" if flag else "")
+        else:
+            item["result"] = row["reason"] or "rejected"
+        out.append(item)
+    return out
+
+
+def _clock_for(account_mode):
+    """Global timestamp policy, unless this account picked its own."""
+    s = get_settings()
+    mode = (account_mode or "").strip() or (s.get("sia_ts_mode") or "tolerant")
+    if mode not in siarecv.TS_MODES:
+        mode = "tolerant"
+    try:
+        window = int(s.get("sia_ts_window") or 600)
+    except (TypeError, ValueError):
+        window = 600
+    return mode, max(20, min(window, 86400)), tzinfo()
 
 
 def on_sia_frame(line, peer):
@@ -3763,15 +3806,30 @@ def on_sia_frame(line, peer):
     info = siarecv.parse_line(line, _sia_map())
     if not info.get("ok"):
         log.info("SIA reject from %s: %s", peer, info.get("error"))
-        _sia_remember(peer, line, False, info.get("error") or "rejected", info.get("account") or "")
+        _sia_remember(peer, line, False, info.get("error") or "rejected", info.get("account") or "",
+                      info.get("protocol") or "")
         return info
     account = info.get("account") or ""
     now = time.time()
     with db() as c:
         row = c.execute("SELECT * FROM sia_accounts WHERE account=?", (account,)).fetchone()
     if not row:
-        _sia_remember(peer, line, False, "unknown account", account)
+        _sia_remember(peer, line, False, "unknown account", account, info.get("protocol") or "")
+        info["ok"] = False
+        info["error"] = "unknown account"
+        info["reply"] = siarecv._response("NAK", info.get("sequence"), info.get("receiver"), info.get("line"), account)
         return info
+    mode, window, zone = _clock_for(row["ts_mode"] if "ts_mode" in row.keys() else "")
+    decision = siarecv.judge_timestamp(info.get("stamp"), mode, window, zone)
+    if not decision["accept"]:
+        log.info("SIA timestamp reject from %s account %s: %s", peer, account, decision["reason"])
+        _sia_remember(peer, line, False, decision["reason"], account, info.get("protocol") or "",
+                      decision["frame_ts"], decision["server_utc"], decision["delta_s"], decision["flag"])
+        info["ok"] = False
+        info["error"] = decision["reason"]
+        info["reply"] = siarecv.nak_frame(info.get("sequence"), info.get("receiver"), info.get("line"), account)
+        return info
+    info["ts_flag"] = decision["flag"]
     state = info.get("state") or (row["rest_state"] if info.get("heartbeat") and row["state"] == "offline" else row["state"])
     if info.get("heartbeat") and row["state"] == "offline":
         state = row["rest_state"] or "unknown"
@@ -3792,7 +3850,11 @@ def on_sia_frame(line, peer):
     elif row["state"] == "offline":
         add_event("alarm", "alarm", "info", None, "Panel online", f"{row['name']} sent a heartbeat again.",
                   {"account": account, "type": "alarm", "code": "online"})
-    _sia_remember(peer, line, True, "heartbeat" if info.get("heartbeat") else (info.get("text") or "accepted"), account)
+    reason = "heartbeat" if info.get("heartbeat") else (info.get("text") or "accepted")
+    if decision["flag"]:
+        reason = f"{reason} · {decision['flag']}"
+    _sia_remember(peer, line, True, reason, account, info.get("protocol") or "",
+                  decision["frame_ts"], decision["server_utc"], decision["delta_s"], decision["flag"])
     return info
 
 
@@ -3895,8 +3957,17 @@ def alarm_settings():
             except ValueError:
                 flash("Not saved: listen address must be an IP and the port must be 1-65535.")
                 return redirect(url_for("alarm_settings"))
+            mode = request.form.get("sia_ts_mode") or "tolerant"
+            if mode not in siarecv.TS_MODES:
+                mode = "tolerant"
+            try:
+                minutes = int(request.form.get("sia_ts_window_min") or 10)
+            except ValueError:
+                minutes = 10
+            minutes = max(1, min(minutes, 24 * 60))
             set_settings(sia_enabled=1 if request.form.get("sia_enabled") else 0, sia_host=host, sia_port=port,
-                         sia_tcp=1 if request.form.get("sia_tcp") else 0, sia_udp=1 if request.form.get("sia_udp") else 0)
+                         sia_tcp=1 if request.form.get("sia_tcp") else 0, sia_udp=1 if request.form.get("sia_udp") else 0,
+                         sia_ts_mode=mode, sia_ts_window=minutes * 60)
             restart_sia()
             flash(f"Alarm receiver saved. {SIA.status()}")
             return redirect(url_for("alarm_settings"))
@@ -3917,15 +3988,18 @@ def alarm_settings():
         if not name:
             flash("Give the panel a name, for example Ajax office.")
             return redirect(url_for("alarm_settings"))
+        ts_mode = request.form.get("ts_mode") or ""
+        if ts_mode not in ("",) + siarecv.TS_MODES:
+            ts_mode = ""
         with db() as c:
             old = c.execute("SELECT key_enc FROM sia_accounts WHERE account=?", (account,)).fetchone()
         key_enc = encrypt_secret(key) if key else (old["key_enc"] if old else "")
         with _db_lock, db() as c:
-            c.execute("""INSERT INTO sia_accounts(account, name, panel, key_enc, supervise_min)
-                         VALUES(?,?,?,?,?) ON CONFLICT(account) DO UPDATE SET
+            c.execute("""INSERT INTO sia_accounts(account, name, panel, key_enc, supervise_min, ts_mode)
+                         VALUES(?,?,?,?,?,?) ON CONFLICT(account) DO UPDATE SET
                          name=excluded.name, panel=excluded.panel, key_enc=excluded.key_enc,
-                         supervise_min=excluded.supervise_min""",
-                      (account, name, panel, key_enc, max(1, min(supervise, 1440))))
+                         supervise_min=excluded.supervise_min, ts_mode=excluded.ts_mode""",
+                      (account, name, panel, key_enc, max(1, min(supervise, 1440)), ts_mode))
         flash("Alarm account saved. The receiver switch is unchanged. This monitor is not a certified receiving centre.")
         return redirect(url_for("alarm_settings"))
     with db() as c:
@@ -3933,8 +4007,7 @@ def alarm_settings():
         log_rows = [dict(r) for r in c.execute("SELECT * FROM sia_log ORDER BY id DESC LIMIT 20")]
     for row in rows:
         row["seen"] = fmt_ts(row["last_ts"]) if row["last_ts"] else "never"
-    for row in log_rows:
-        row["when"] = fmt_ts(row["ts"])
+    log_rows = _sia_log_view(log_rows)
     body = SETTINGS_NAV + """<div class="card"><h2>Alarms (SIA DC-09)</h2>
 <p class="section-intro"><b>Information only.</b> This is not a certified alarm receiving centre (ARC/CMS). Keep Ajax, TrikdisConfig/Protegus, Hik-Connect and the Dahua app as the primary monitoring. TRK, the proprietary Trikdis protocol, is not supported — use SIA DC-09.</p>
 <p class="hint">Status: <b>{{ sia_status }}</b>. Senders must be inside the incoming e-mail allowed networks (<code>{{ s.rx_allowed_nets }}</code>). Change that list under Incoming e-mail (devices). NVR and camera events stay on the camera API and the e-mail receiver.</p>
@@ -3946,6 +4019,15 @@ def alarm_settings():
 <label>Port</label><div><input type="number" name="sia_port" min="1" max="65535" value="{{ s.sia_port }}"></div>
 <label>TCP</label><div><input type="checkbox" name="sia_tcp" value="1" {{ 'checked' if s.sia_tcp }}></div>
 <label>UDP</label><div><input type="checkbox" name="sia_udp" value="1" {{ 'checked' if s.sia_udp }}></div>
+<label>Timestamp check</label><div><select name="sia_ts_mode">
+<option value="strict" {{ 'selected' if s.sia_ts_mode=='strict' }}>Strict (±20 seconds, DC-09)</option>
+<option value="tolerant" {{ 'selected' if s.sia_ts_mode=='tolerant' }}>Tolerant (window below)</option>
+<option value="local" {{ 'selected' if s.sia_ts_mode=='local' }}>Panel uses local time</option>
+<option value="off" {{ 'selected' if s.sia_ts_mode=='off' }}>Off (ignore the clock)</option>
+</select>
+<p class="hint">The digits in the frame are compared with UTC now. Strict is ±20 seconds. Tolerant is the window below (default 10 minutes). Panel uses local time subtracts this site's timezone offset, including daylight saving, and then uses that window. Off accepts any clock. If the gap is within 2 minutes of the site's UTC offset, the frame is accepted anyway and marked “panel sends local time”.</p></div>
+<label>Tolerant window (minutes)</label><div><input type="number" name="sia_ts_window_min" min="1" max="1440" value="{{ (s.sia_ts_window or 600) // 60 }}">
+<p class="hint">Used by Tolerant, and after the local-time offset is removed. Example: <code>10</code>.</p></div>
 <span></span><div><button>Save receiver</button></div></div></form>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="test">
 <p><button class="sec" name="test" value="1">Send test event</button> <span class="hint">Sends one SIA-DCS burglary frame to this machine and shows it in the log, Recent events, and the listen list below.</span></p></form>
@@ -3963,6 +4045,14 @@ def alarm_settings():
 <p class="hint">Optional. 16, 24 or 32 hex characters (AES-128/192/256). Stored encrypted. Leave empty when saving to keep the current key.</p></div>
 <label>Heartbeat timeout (min)</label><div><input type="number" name="supervise_min" value="10" min="1" max="1440">
 <p class="hint">Alarm “panel offline” if no NULL heartbeat arrives in this many minutes. Example: <code>10</code>. Match the panel's ping interval and add a couple of minutes.</p></div>
+<label>Timestamp check</label><div><select name="ts_mode">
+<option value="">Use the global setting ({{ s.sia_ts_mode }})</option>
+<option value="strict">Strict (±20 seconds)</option>
+<option value="tolerant">Tolerant</option>
+<option value="local">Panel uses local time</option>
+<option value="off">Off (ignore the clock)</option>
+</select>
+<p class="hint">Leave this on the global setting unless this one panel keeps a different clock. Saving the account stores this choice and does not change the receiver switch.</p></div>
 <span></span><div><button>Save account</button></div></div></form>
 <h2>How to point the panel here</h2>
 <ul class="help-list">
@@ -3971,15 +4061,15 @@ def alarm_settings():
 <li><b>Hikvision AX PRO / AX Hybrid</b> — Hik-Connect or the panel web page → Communication → Alarm receiving centre. Protocol SIA-DCS or ADM-CID, this IP and port, account, optional encryption, and a heartbeat interval.</li>
 <li><b>Dahua AirShield / ARC</b> — ARC settings → SIA DC-09 or Contact ID over IP. Account, this IP and port, heartbeat. Camera and NVR events stay on the camera API and the e-mail receiver, not here.</li>
 </ul>
-<div class="table-wrap"><table><tr><th>Name</th><th>Account</th><th>Panel</th><th>State</th><th>Last heard</th><th></th></tr>
-{% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.state }}</td><td>{{ a.seen }}</td>
-<td><button form="del{{ a.account }}" class="del">Delete</button></td></tr>{% else %}<tr><td colspan="6" class="muted">No accounts yet.</td></tr>{% endfor %}</table></div>
+<div class="table-wrap"><table><tr><th>Name</th><th>Account</th><th>Panel</th><th>Clock</th><th>State</th><th>Last heard</th><th></th></tr>
+{% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.ts_mode or 'global' }}</td><td>{{ a.state }}</td><td>{{ a.seen }}</td>
+<td><button form="del{{ a.account }}" class="del">Delete</button></td></tr>{% else %}<tr><td colspan="7" class="muted">No accounts yet.</td></tr>{% endfor %}</table></div>
 {% for a in rows %}<form id="del{{ a.account }}" method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="delete" value="{{ a.account }}"></form>{% endfor %}
-<h2>Listen log</h2>
-<p class="hint">The last raw frames, including ones that were rejected, and why.</p>
-<div class="table-wrap"><table><tr><th>When</th><th>From</th><th>Account</th><th>Result</th><th>Frame</th></tr>
-{% for r in log_rows %}<tr><td>{{ r.when }}</td><td>{{ r.peer }}</td><td>{{ r.account }}</td><td>{{ 'accepted' if r.ok else r.reason }}</td><td class="muted">{{ r.raw }}</td></tr>
-{% else %}<tr><td colspan="5" class="muted">No frames yet.</td></tr>{% endfor %}</table></div>
+<h2>Last raw frames</h2>
+<p class="hint">Accepted and rejected. Frame time is the clock digits in the message, read as UTC. Difference is that time minus server UTC. A NAK for a clock rejection includes the server's UTC time so the panel can sync.</p>
+<div class="table-wrap"><table><tr><th>When</th><th>From</th><th>Account</th><th>Protocol</th><th>Frame time</th><th>Server UTC</th><th>Difference</th><th>Result</th><th>Raw frame</th></tr>
+{% for r in log_rows %}<tr><td>{{ r.when }}</td><td>{{ r.peer }}</td><td>{{ r.account }}</td><td>{{ r.protocol }}</td><td>{{ r.frame_ts }}</td><td>{{ r.server_utc }}</td><td>{{ r.delta }}</td><td>{{ r.result }}</td><td class="muted">{{ r.raw }}</td></tr>
+{% else %}<tr><td colspan="9" class="muted">No frames yet.</td></tr>{% endfor %}</table></div>
 </div>"""
     return page(body, rows=rows, log_rows=log_rows, sia_status=SIA.status())
 
@@ -4001,10 +4091,10 @@ def diagnostics():
         except OSError:
             bind = ""
     with db() as c:
-        rejects = [dict(r) for r in c.execute(
-            "SELECT ts, peer, reason FROM sia_log WHERE ok=0 ORDER BY id DESC LIMIT 8")]
-    for row in rejects:
-        row["when"] = fmt_ts(row["ts"])
+        rejects = _sia_log_view([dict(r) for r in c.execute(
+            "SELECT * FROM sia_log WHERE ok=0 ORDER BY id DESC LIMIT 20")])
+        frames = _sia_log_view([dict(r) for r in c.execute(
+            "SELECT * FROM sia_log ORDER BY id DESC LIMIT 40")])
     body = SETTINGS_NAV + """<div class="card"><h2>Diagnostics</h2>
 <p class="section-intro">What this process is doing right now. It does not change settings.</p>
 <table class="kv">
@@ -4015,16 +4105,23 @@ def diagnostics():
 <tr><td>SIA</td><td>{{ sia }}{% if sia_err %} · {{ sia_err }}{% endif %} · pysiaalarm {{ sia_pkg }}</td></tr>
 <tr><td>SIA port</td><td>{{ 'on' if s.sia_enabled else 'off' }} · {{ s.sia_host }}:{{ s.sia_port }} · TCP {{ 'on' if s.sia_tcp else 'off' }} · UDP {{ 'on' if s.sia_udp else 'off' }}</td></tr>
 <tr><td>Allowed networks</td><td>{{ s.rx_allowed_nets }}</td></tr>
+<tr><td>Timestamp check</td><td>{{ s.sia_ts_mode }} · ±{{ (s.sia_ts_window or 600) // 60 }} min when tolerant or local</td></tr>
 </table>
-<h2>Last rejected SIA frames</h2>
-<div class="table-wrap"><table><tr><th>When</th><th>From</th><th>Reason</th></tr>
-{% for r in rejects %}<tr><td>{{ r.when }}</td><td>{{ r.peer }}</td><td>{{ r.reason }}</td></tr>
-{% else %}<tr><td colspan="3" class="muted">None.</td></tr>{% endfor %}</table></div>
+<h2>Rejected SIA frames</h2>
+<p class="hint">Frame time, server UTC and the difference. Account and protocol are the fields from the message.</p>
+<div class="table-wrap"><table><tr><th>When</th><th>From</th><th>Account</th><th>Protocol</th><th>Frame time</th><th>Server UTC</th><th>Difference</th><th>Reason</th></tr>
+{% for r in rejects %}<tr><td>{{ r.when }}</td><td>{{ r.peer }}</td><td>{{ r.account }}</td><td>{{ r.protocol }}</td><td>{{ r.frame_ts }}</td><td>{{ r.server_utc }}</td><td>{{ r.delta }}</td><td>{{ r.result }}</td></tr>
+{% else %}<tr><td colspan="8" class="muted">None.</td></tr>{% endfor %}</table></div>
+<h2>Last raw frames</h2>
+<p class="hint">Accepted and rejected.</p>
+<div class="table-wrap"><table><tr><th>When</th><th>From</th><th>Account</th><th>Protocol</th><th>Frame time</th><th>Server UTC</th><th>Difference</th><th>Result</th><th>Raw frame</th></tr>
+{% for r in frames %}<tr><td>{{ r.when }}</td><td>{{ r.peer }}</td><td>{{ r.account }}</td><td>{{ r.protocol }}</td><td>{{ r.frame_ts }}</td><td>{{ r.server_utc }}</td><td>{{ r.delta }}</td><td>{{ r.result }}</td><td class="muted">{{ r.raw }}</td></tr>
+{% else %}<tr><td colspan="9" class="muted">None.</td></tr>{% endfor %}</table></div>
 </div>"""
     return page(body, version=VERSION, py=platform.python_version(), web=request.host, bind=bind,
                 smtp=RECEIVER.status(), smtp_err=RECEIVER.error or "", trap=SNMP.trap_status,
                 snmp_ok=SNMP.available, sia=SIA.status(), sia_err=SIA.error or "", sia_pkg=sia_pkg,
-                rejects=rejects)
+                rejects=rejects, frames=frames)
 
 
 @app.route("/settings/backup", methods=["GET", "POST"])

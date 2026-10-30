@@ -9,6 +9,7 @@ import re
 import socket
 import threading
 import time
+from datetime import datetime, timezone
 
 from pysiaalarm.account import SIAAccount
 from pysiaalarm.errors import EventFormatError, NoAccountError
@@ -51,6 +52,114 @@ def _response(kind, sequence, receiver, line, account):
     account = account or "000"
     body = f'"{kind}"{sequence}{receiver}{line}#{account}[]'
     return build_frame(body).encode("ascii")
+
+
+# DC-09's own limit is about ±20 s. Tolerant is the default window.
+TS_MODES = ("strict", "tolerant", "local", "off")
+STRICT_SECONDS = 20
+# A frame this close to the site's UTC offset is a local-time clock, not a wrong UTC clock.
+LOCAL_MATCH_SECONDS = 120
+
+
+def format_delta(seconds):
+    """Signed gap between the frame clock and server UTC, for the listen log."""
+    if seconds is None:
+        return ""
+    sign = "+" if seconds >= 0 else "-"
+    left = abs(int(seconds))
+    hours, rem = divmod(left, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{sign}{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{sign}{minutes}m {secs:02d}s"
+    return f"{sign}{secs}s"
+
+
+def nak_frame(sequence, receiver, line, account, when=None):
+    """NAK that carries the receiver's current UTC time so the panel can set its clock.
+
+    DC-09 puts ``_HH:MM:SS,MM-DD-YYYY`` after the empty data block. The time is UTC,
+    which is what a panel is supposed to store.
+    """
+    when = when or datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    when = when.astimezone(timezone.utc)
+    receiver = receiver if receiver and receiver != "None" else "R0"
+    line = line if line and line != "None" else "L0"
+    sequence = sequence or "0000"
+    account = (account or "000").upper()
+    stamp = when.strftime("_%H:%M:%S,%m-%d-%Y")
+    body = f'"NAK"{sequence}{receiver}{line}#{account}[]{stamp}'
+    return build_frame(body).encode("ascii")
+
+
+def _site_offset(tz, now):
+    """Seconds east of UTC for the site timezone at ``now`` (DST included)."""
+    try:
+        offset = now.astimezone(tz).utcoffset()
+    except Exception:
+        return 0
+    if offset is None:
+        return 0
+    return int(offset.total_seconds())
+
+
+def judge_timestamp(stamp, mode, window_s, tz, now=None):
+    """Decide whether a panel clock is close enough to accept.
+
+    ``stamp`` is the time the panel wrote, labeled UTC the way the parser reads the
+    digits. It is compared with UTC now. pysiaalarm's own window is not consulted.
+
+    ``mode`` is strict (±20 s), tolerant (``window_s``, default 10 minutes), local
+    (treat the digits as the site's local time, then apply the tolerant window),
+    or off. In strict and tolerant, a gap within two minutes of the site's UTC
+    offset is accepted and flagged as local time.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    server_utc = now.strftime("%H:%M:%S %m-%d-%Y UTC")
+    mode = mode if mode in TS_MODES else "tolerant"
+    window = max(1, int(window_s or 600))
+    if stamp is None:
+        return {"accept": True, "reason": "", "flag": "", "delta_s": None,
+                "frame_ts": "", "server_utc": server_utc}
+    if not isinstance(stamp, datetime):
+        return {"accept": True, "reason": "", "flag": "", "delta_s": None,
+                "frame_ts": "", "server_utc": server_utc}
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    as_utc = stamp.astimezone(timezone.utc)
+    frame_ts = as_utc.strftime("%H:%M:%S %m-%d-%Y")
+    delta = int(round((as_utc - now).total_seconds()))
+    offset = _site_offset(tz, now)
+
+    def pack(accept, reason, flag=""):
+        return {"accept": accept, "reason": reason, "flag": flag, "delta_s": delta,
+                "frame_ts": frame_ts, "server_utc": server_utc}
+
+    if mode == "off":
+        return pack(True, "")
+    if mode == "local":
+        corrected = delta - offset
+        if abs(corrected) <= window:
+            return pack(True, "", "panel sends local time")
+        return pack(False, _ts_reason("local", window, frame_ts, server_utc, corrected))
+    limit = STRICT_SECONDS if mode == "strict" else window
+    if abs(delta) <= limit:
+        return pack(True, "")
+    # UTC+0 has no separate local clock, so this does not widen a strict check there.
+    if abs(offset) >= 60 and abs(delta - offset) <= LOCAL_MATCH_SECONDS:
+        return pack(True, "", "panel sends local time")
+    return pack(False, _ts_reason(mode, limit, frame_ts, server_utc, delta))
+
+
+def _ts_reason(mode, limit, frame_ts, server_utc, delta):
+    return (f"timestamp out of range ({mode} ±{format_delta(limit).lstrip('+')}, "
+            f"frame {frame_ts} as UTC, server {server_utc}, {format_delta(delta)})")
 
 
 def normalize(line):
@@ -145,23 +254,26 @@ def parse_line(line, accounts):
     if event.account and event.sia_account is None:
         return {"ok": False, "error": "unknown account", "account": event.account,
                 "reply": _response("NAK", event.sequence, event.receiver, event.line, event.account)}
-    if not event.valid_timestamp:
-        return {"ok": False, "error": "timestamp out of range", "account": event.account,
-                "reply": _response("NAK", event.sequence, event.receiver, event.line, event.account)}
+    # The clock check lives in judge_timestamp. pysiaalarm's valid_timestamp uses the
+    # account timezone for "now" and is not consulted.
     text, zone = _describe(event)
     mtype = event.message_type.value if isinstance(event.message_type, MessageTypes) else str(event.message_type)
+    stamp = event.timestamp if isinstance(event.timestamp, datetime) else None
     return {
         "ok": True,
         "account": (event.account or "").upper(),
         "code": event.code,
         "message_type": mtype,
+        "protocol": mtype,
         "heartbeat": event.message_type == MessageTypes.NULL,
         "severity": _severity(event.code, event.message_type),
         "text": text,
         "zone": zone,
         "state": _state_for(event.code, event.message_type),
+        "sequence": event.sequence,
         "receiver": event.receiver,
         "line": event.line,
+        "stamp": stamp,
         "reply": _response("ACK", event.sequence, event.receiver, event.line, event.account),
     }
 

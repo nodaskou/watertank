@@ -32,6 +32,8 @@ Alarms use a failed-ping count (global default 3, overridable per host) and a re
 
 Alarm panels (Ajax, Trikdis, Hikvision AX PRO / AX Hybrid, Dahua AirShield / ARC) can send SIA DC-09 to TCP/UDP port 12128. Open **Settings → Alarms** for the account, the optional AES key, and the click-path on each brand. Trikdis TRK toward Protegus is not accepted. This is technical monitoring, not a certified alarm receiving centre; keep the vendor app as the primary path. NVR and camera events stay on the camera API and the e-mail receiver.
 
+The frame clock is compared as UTC with UTC now. The default check is tolerant (±10 minutes). Strict is the DC-09 ±20 seconds. If the gap is within two minutes of this site's timezone offset, the frame is accepted and marked “panel sends local time”. “Panel uses local time” always subtracts that offset (daylight saving included). Off ignores the clock. A frame rejected only for the clock is answered with a NAK that carries the receiver's UTC time, so the panel can sync. The same choice can be set on one account. Diagnostics lists rejected frames with both clocks and the gap, and the last raw frames whether they were accepted or not.
+
 ## Update
 
 ```bash
