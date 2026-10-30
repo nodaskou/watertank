@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import base64
 import getpass
+import configbackup
 import jobs
 import mtbackup
 import reportpdf
@@ -125,6 +126,7 @@ DEFAULTS = {
     "mt_backup_day": 0, "mt_backup_time": "03:00", "mt_backup_keep": 52,
     "ups_runtime_min": 10, "ups_load_pct": 80,
     "event_keep": 100,
+    "ui_refresh": 30,
     "public_ip": "", "public_ip_isp": "", "public_ip_at": 0,
     "sia_enabled": 0, "sia_host": "0.0.0.0", "sia_port": 12128, "sia_tcp": 1, "sia_udp": 1,
 }
@@ -879,6 +881,9 @@ def monitor_loop(stop):
                 if start - int(s.get("public_ip_at") or 0) >= 600:
                     refresh_public_ip()
                 sia_supervise()
+                if configbackup.local_due(DATA_DIR, start) and s.get("secret_key"):
+                    with db() as c:
+                        configbackup.write_local(c, DATA_DIR, VERSION, s["secret_key"])
             except Exception:
                 log.exception("schedule lookup failed")
             stop.wait(max(1, interval - (time.time() - start)))
@@ -1933,7 +1938,7 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 {% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
 <link rel="icon" href="{{ url_for('brand_logo') }}" type="image/jpeg">
 <title>{{ s.site_name }} - """ + APP_NAME + """</title><style>""" + CSS + """</style>
-{% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body>
+{% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body{% if hid is defined and hid %} data-live-id="{{ hid }}"{% endif %}>
 <header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>""" + APP_NAME + """ <small>· {{ s.site_name }}</small></span></h1><div>
 <a href="{{ url_for('index') }}">Dashboard</a>
 {% if role() %}<a href="{{ url_for('event_log') }}">Log</a>{% endif %}
@@ -1941,7 +1946,124 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 {% if role() %}<a href="{{ url_for('logout') }}">Logout ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">Login</a>{% endif %}
 </div></header><main>
 {% with m = get_flashed_messages() %}{% for x in m %}<div class="flash">{{ x }}</div>{% endfor %}{% endwith %}
-{{ body|safe }}</main></body></html>"""
+{{ body|safe }}</main>
+{% if live %}<script>
+const LIVE = {{ live|tojson }};
+const EVERY = {{ ui_refresh|tojson }} * 1000;
+function liveSpan(){ const u=new URL(location.href); return u.searchParams.get('span')||'24h'; }
+function setText(id, value){ const n=document.getElementById(id); if(n) n.textContent=value; }
+function showErr(msg){ const n=document.getElementById('live-err'); if(!n) return; n.hidden=false; n.textContent=msg||'update failed'; }
+function hideErr(){ const n=document.getElementById('live-err'); if(n) n.hidden=true; }
+function pingData(points){
+  const up=[], down=[];
+  (points||[]).forEach(p=>{ const x=p[0]*1000; if(p[1]) up.push({x:x,y:p[2]}); else down.push({x:x,y:0}); });
+  return [up, down];
+}
+function touchChart(id, assign){
+  if(typeof Chart==='undefined') return;
+  const ch=Chart.getChart(id); if(!ch) return;
+  assign(ch);
+  if(typeof WIN!=='undefined' && ch.options.scales && ch.options.scales.x){
+    const now=Date.now(); ch.options.scales.x.min=now-WIN; ch.options.scales.x.max=now;
+  }
+  ch.update('none');
+}
+function paintEvents(rows){
+  const body=document.getElementById('events-body'); if(!body) return;
+  const sig=JSON.stringify(rows||[]);
+  if(body.dataset.sig===sig) return;
+  body.dataset.sig=sig;
+  if(!rows || !rows.length){ body.innerHTML='<tr><td colspan="5" class="muted">No events yet.</td></tr>'; return; }
+  body.innerHTML=rows.map(e=>'<tr><td style="white-space:nowrap">'+esc(e.time)+'</td><td>'+esc(e.who)+'</td><td><span class="badge sev-'+esc(e.severity)+'">'+esc(e.severity)+'</span> '+esc(e.title)+'</td><td class="muted">'+esc(e.message)+'</td><td></td></tr>').join('');
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function paintAlarms(rows){
+  const body=document.getElementById('alarms-body'); if(!body) return;
+  const sig=JSON.stringify(rows||[]);
+  if(body.dataset.sig===sig) return;
+  body.dataset.sig=sig;
+  if(!rows || !rows.length){ body.innerHTML=''; return; }
+  body.innerHTML=rows.map(a=>'<tr><td>'+esc(a.name)+' <span class="muted">'+esc(a.panel)+'</span></td><td>'+esc(a.account)+'</td><td><span class="badge '+(a.state==='alarm'||a.state==='offline'?'sev-critical':(a.state==='armed'||a.state==='disarmed'?'sev-info':'sev-warning'))+'">'+esc(a.state)+'</span></td><td class="muted">'+esc(a.last_text)+'</td></tr>').join('');
+}
+function applyLive(data){
+  if(data.bar){
+    const bar=document.getElementById('bar');
+    if(bar){ bar.className='statusbar '+data.bar.level; }
+    setText('bar-why', data.bar.reason);
+    const net=document.getElementById('bar-net');
+    if(net) net.textContent='Internet '+(data.bar.latency==null?'—':Math.round(data.bar.latency)+' ms')+' · loss '+(data.bar.loss==null?'—':Math.round(data.bar.loss)+'%');
+    const ip=document.getElementById('bar-ip');
+    if(ip) ip.textContent='Public IP '+(data.bar.ip||'—')+(data.bar.isp?' · '+data.bar.isp:'');
+    setText('bar-checked', 'checked '+(data.bar.checked||'—'));
+  }
+  const ban=document.getElementById('banner');
+  if(ban){
+    if(data.banner){ ban.hidden=false; ban.className='banner '+data.banner.cls; ban.textContent=data.banner.text; }
+    else ban.hidden=true;
+  }
+  if(data.counts){
+    setText('pill-up', 'UP '+data.counts.up);
+    setText('pill-down', 'DOWN '+data.counts.down);
+    const w=document.getElementById('pill-warn'); if(w) w.textContent='UNSTABLE '+(data.counts.warn||0);
+    const p=document.getElementById('pill-pending'); if(p) p.textContent='PENDING '+(data.counts.pending||0);
+  }
+  (data.hosts||[]).forEach(h=>{
+    const dot=document.getElementById('dot'+h.id);
+    if(dot){ dot.className='dot '+(h.cls||'p'); dot.textContent=h.state_txt||''; }
+    setText('ms'+h.id, h.last_ms==null?'—':(Math.round(h.last_ms*10)/10).toFixed(1)+' ms');
+    setText('up'+h.id, h.uptime==null?'—':h.uptime.toFixed(1)+'%');
+    const seen=document.getElementById('seen'+h.id);
+    if(seen){
+      const label=seen.previousSibling;
+      if(h.state==='down'){ if(label) label.textContent='Down for'; seen.textContent=h.down_for||''; seen.style.color='#dc2626'; }
+      else { if(label) label.textContent='Last seen'; seen.textContent=h.last_seen||''; seen.style.color=''; }
+    }
+    touchChart('c'+h.id, ch=>{ const d=pingData(h.points); ch.data.datasets[0].data=d[0]; ch.data.datasets[1].data=d[1]; });
+    touchChart('big', ch=>{ if(String(data.host_id)!==String(h.id)) return; const d=pingData(h.points); ch.data.datasets[0].data=d[0]; ch.data.datasets[1].data=d[1]; });
+  });
+  if(data.wan){
+    touchChart('wanlat', ch=>{
+      ch.data.datasets[0].data=(data.wan.latency||[]).map(p=>({x:p[0]*1000,y:p[1]}));
+      ch.data.datasets[1].data=(data.wan.loss||[]).map(p=>({x:p[0]*1000,y:p[1]}));
+    });
+  }
+  (data.traffic||[]).forEach(g=>{
+    touchChart('dg'+g.key, ch=>{
+      ch.data.datasets[0].data=(g.inn||[]).map(p=>({x:p[0]*1000,y:p[1]}));
+      ch.data.datasets[1].data=(g.out||[]).map(p=>({x:p[0]*1000,y:p[1]}));
+    });
+  });
+  (data.series||[]).forEach(s=>touchChart(s.id, ch=>{
+    (s.sets||[]).forEach((pts,i)=>{ if(ch.data.datasets[i]) ch.data.datasets[i].data=(pts||[]).map(p=>({x:p[0]*1000,y:p[1]})); });
+  }));
+  paintAlarms(data.alarms);
+  paintEvents(data.events);
+  setText('live-at', 'last updated '+(data.now||''));
+}
+async function liveTick(){
+  if(document.hidden) return;
+  const q=new URLSearchParams(location.search);
+  q.set('page', LIVE);
+  if(!q.get('span')) q.set('span', liveSpan());
+  if(LIVE==='host' && document.body.dataset.liveId) q.set('id', document.body.dataset.liveId);
+  let res;
+  try{ res=await fetch('/api/live?'+q.toString(), {headers:{'Accept':'application/json'}, credentials:'same-origin'}); }
+  catch(e){ showErr('update failed'); return; }
+  if(res.status===401){ location.href='/login?next='+encodeURIComponent(location.pathname+location.search); return; }
+  if(!res.ok){ showErr('update failed'); return; }
+  try{ applyLive(await res.json()); hideErr(); }
+  catch(e){ showErr('update failed'); }
+}
+let liveTimer=null;
+function liveArm(){
+  clearInterval(liveTimer);
+  if(document.hidden) return;
+  liveTimer=setInterval(liveTick, EVERY);
+}
+document.addEventListener('visibilitychange', ()=>{ if(document.hidden) clearInterval(liveTimer); else { liveTick(); liveArm(); } });
+liveArm();
+</script>{% endif %}
+</body></html>"""
 
 CHART_JS = """<script>
 const TZ = {{ s.timezone|tojson }};
@@ -1981,25 +2103,26 @@ LOGIN_BODY = """<div class="card" style="max-width:360px;margin:60px auto"><h2>L
 <input type="hidden" name="csrf" value="{{ csrf_token() }}"><br><br><button style="width:100%">Login</button></form>
 <p class="hint">Admin password = dashboard + settings. Viewer password (if set) = dashboard only.</p></div>"""
 
-EVENTS_TABLE = """<table><tr><th>Time</th><th>Source</th><th>Event</th><th>Details</th><th></th></tr>
+EVENTS_TABLE = """<table><thead><tr><th>Time</th><th>Source</th><th>Event</th><th>Details</th><th></th></tr></thead><tbody id="events-body">
 {% for e in events %}<tr>
 <td style="white-space:nowrap">{{ e.time }}</td>
 <td>{% if e.host_name %}{{ e.host_name }} <span class="muted">{{ e.host_ip }}</span>{% else %}{{ e.d.get('source_label') or e.d.get('source_ip','') }}{% endif %}</td>
 <td><span class="badge sev-{{ e.severity }}">{{ e.severity }}</span> {{ '📧' if e.source=='mail' else ('📡' if e.source=='snmp' else ('🔴' if e.kind=='host_down' else '✅')) }} {{ e.title }}</td>
 <td class="muted">{{ e.message[:140] }}</td>
 <td>{% for a in e.att %}<a href="{{ url_for('snapshot', name=a) }}" target="_blank"><img class="thumb" src="{{ url_for('snapshot', name=a) }}"></a>{% endfor %}</td></tr>
-{% else %}<tr><td colspan="5" class="muted">No events yet.</td></tr>{% endfor %}</table>"""
+{% else %}<tr><td colspan="5" class="muted">No events yet.</td></tr>{% endfor %}</tbody></table>"""
 
 INDEX_BODY = CHART_JS + """
-<div class="statusbar {{ bar.level }}">
- <span class="why">{{ bar.reason }}</span>
- <span>Internet {% if bar.latency is not none %}{{ '%.0f'|format(bar.latency) }} ms{% else %}—{% endif %}
+<div class="statusbar {{ bar.level }}" id="bar">
+ <span class="why" id="bar-why">{{ bar.reason }}</span>
+ <span id="bar-net">Internet {% if bar.latency is not none %}{{ '%.0f'|format(bar.latency) }} ms{% else %}—{% endif %}
   · loss {% if bar.loss is not none %}{{ '%.0f'|format(bar.loss) }}%{% else %}—{% endif %}</span>
- <span>Public IP {{ bar.ip or '—' }}{% if bar.isp %} · {{ bar.isp }}{% endif %}</span>
- <span class="muted" style="color:rgba(255,255,255,.85)">checked {{ bar.checked }}</span>
+ <span id="bar-ip">Public IP {{ bar.ip or '—' }}{% if bar.isp %} · {{ bar.isp }}{% endif %}</span>
+ <span class="muted" id="bar-checked" style="color:rgba(255,255,255,.85)">checked {{ bar.checked }}</span>
 </div>
-{% if banner %}<div class="banner {{ banner.cls }}">{{ banner.text }}</div>{% endif %}
+<div id="banner" class="banner {{ banner.cls if banner else '' }}" {% if not banner %}hidden{% endif %}>{{ banner.text if banner else '' }}</div>
 <p class="ranges">{% for key, label in spans %}<a href="?span={{ key }}" class="{{ 'on' if span==key else '' }}">{{ label }}</a>{% endfor %}</p>
+<p class="hint"><span id="live-at">last updated {{ now }}</span> · <span id="live-err" hidden style="color:#b91c1c">update failed</span></p>
 <p class="hint">12 hours and 24 hours use each ping. A week keeps 5-minute averages after the last two days. A month keeps 1-hour averages after the first week.</p>
 {% if wan and wan.state %}<div class="card"><h2>Internet {% if wan.state=='down' %}<span class="badge sev-critical">down</span>{% elif wan.state=='degraded' %}<span class="badge sev-warning">degraded</span>{% else %}<span class="badge sev-info">up</span>{% endif %}</h2>
 <p class="muted">{% for t in wan.targets %}{{ t.target }}: loss {{ t.loss }}%{% if t.avg_ms is not none %} · {{ '%.0f'|format(t.avg_ms) }} ms{% endif %}{% if t.jitter is not none %} · jitter {{ t.jitter }} ms{% endif %}<br>{% endfor %}</p>
@@ -2007,24 +2130,24 @@ INDEX_BODY = CHART_JS + """
 <script>drawSeries('wanlat',[{label:'Latency',color:'#1d5fbf',data:{{ wan.latency|tojson }}},{label:'Loss %',color:'#dc2626',data:{{ wan.loss|tojson }}}],{});</script>
 </div>{% endif %}
 {% if traffic %}<h2>Interface graphs</h2><div class="grid">{% for g in traffic %}<div class="card"><b>{{ g.host }} · {{ g.iface }}</b>
-<div class="chartbox"><canvas id="dg{{ loop.index }}"></canvas></div>
-<script>drawSeries('dg{{ loop.index }}',[{label:'In',color:{{ g.color_in|tojson }},fill:'rgba(22,163,74,.12)',data:{{ g.inn|tojson }}},{label:'Out',color:{{ g.color_out|tojson }},data:{{ g.out|tojson }}}],{bps:true});</script>
+<div class="chartbox"><canvas id="dg{{ g.key }}"></canvas></div>
+<script>drawSeries('dg{{ g.key }}',[{label:'In',color:{{ g.color_in|tojson }},fill:'rgba(22,163,74,.12)',data:{{ g.inn|tojson }}},{label:'Out',color:{{ g.color_out|tojson }},data:{{ g.out|tojson }}}],{bps:true});</script>
 </div>{% endfor %}</div>{% endif %}
 <div class="summary">
- <div class="pill g">UP {{ c.up }}</div><div class="pill r">DOWN {{ c.down }}</div>
+ <div class="pill g" id="pill-up">UP {{ c.up }}</div><div class="pill r" id="pill-down">DOWN {{ c.down }}</div>
  {% if c.warn %}<div class="pill a">UNSTABLE {{ c.warn }}</div>{% endif %}
  {% if c.pending %}<div class="pill p">PENDING {{ c.pending }}</div>{% endif %}
- <span class="muted">Ping every {{ s.ping_interval }}s · alert after {{ s.fail_threshold }} failed pings · refresh 60s · {{ now }} ({{ s.timezone }})</span>
+ <span class="muted">Ping every {{ s.ping_interval }}s · alert after {{ s.fail_threshold }} failed pings · refresh {{ s.ui_refresh }}s · {{ now }} ({{ s.timezone }})</span>
 </div>
 {% for g, hs in groups %}<div class="grp">{{ g or 'Devices' }}</div><div class="grid">
-{% for h in hs %}<div class="card"><div class="dev">
- <div class="dot {{ STATE_CLS.get(h.state,'p') }}">{{ STATE_TXT.get(h.state,'…') }}</div>
+{% for h in hs %}<div class="card" id="hc{{ h.id }}"><div class="dev">
+ <div class="dot {{ STATE_CLS.get(h.state,'p') }}" id="dot{{ h.id }}">{{ STATE_TXT.get(h.state,'…') }}</div>
  <div style="flex:1"><a href="{{ url_for('host_page', hid=h.id) }}" style="color:inherit;text-decoration:none"><h3>{{ h.name }}</h3></a>
  <div class="muted"><span class="badge" style="background:{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[2] }}">{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[1] }}</span> {{ h.host }}
  {% if h.maint %}<span class="badge" style="background:#7c3aed">MAINT</span>{% endif %}{% if h.lan_down %} · LAN device down{% endif %}</div></div></div>
- <div class="stats"><div>Last ping<b>{{ '%.1f ms'|format(h.last_ms) if h.last_ms is not none else '—' }}</b></div>
- <div>Uptime 24h<b>{{ '%.1f%%'|format(h.uptime) if h.uptime is not none else '—' }}</b></div>
- <div>{% if h.state=='down' %}Down for<b style="color:#dc2626">{{ h.down_for }}</b>{% else %}Last seen<b style="font-size:13px">{{ h.last_seen_txt }}</b>{% endif %}</div></div>
+ <div class="stats"><div>Last ping<b id="ms{{ h.id }}">{{ '%.1f ms'|format(h.last_ms) if h.last_ms is not none else '—' }}</b></div>
+ <div>Uptime<b id="up{{ h.id }}">{{ '%.1f%%'|format(h.uptime) if h.uptime is not none else '—' }}</b></div>
+ <div>{% if h.state=='down' %}Down for{% else %}Last seen{% endif %}<b id="seen{{ h.id }}" style="{{ 'color:#dc2626' if h.state=='down' else 'font-size:13px' }}">{{ h.down_for if h.state=='down' else h.last_seen_txt }}</b></div></div>
  {% if h.sn %}<div class="snmpline">📡 {% if h.sn.error and h.sn.stale %}<span style="color:#dc2626">SNMP: {{ h.sn.error[:60] }}</span>{% else %}
  up <b>{{ h.sn.uptime_txt }}</b>{% if h.sn.cpu is not none %} · CPU <b>{{ '%.0f'|format(h.sn.cpu) }}%</b>{% endif %}{% if h.sn.mem_pct is not none %} · RAM <b>{{ '%.0f'|format(h.sn.mem_pct) }}%</b>{% endif %}
  {% if h.sn.extra.temp %} · <b>{{ h.sn.extra.temp }}°C</b>{% endif %}{% if h.sn.extra.voltage %} · <b>{{ h.sn.extra.voltage }} V</b>{% endif %}{% if h.sn.extra.wireless_clients is defined %} · <b>{{ h.sn.extra.wireless_clients }}</b> Wi-Fi clients{% endif %}
@@ -2033,13 +2156,14 @@ INDEX_BODY = CHART_JS + """
 </div>{% endfor %}</div>{% else %}<div class="card">No hosts yet. {% if role()=='admin' %}<a href="{{ url_for('settings') }}#hosts">Add hosts in Settings</a>.{% endif %}</div>{% endfor %}
 {% if alarms %}<div class="card"><h2>Alarms</h2>
 <p class="hint">For information and technical monitoring only. This is not a certified alarm receiving centre (ARC/CMS). Keep the panel maker's own app (Ajax, Trikdis, Hikvision or Dahua) as the primary monitoring.</p>
-<table><tr><th>Panel</th><th>Account</th><th>State</th><th>Last event</th></tr>
-{% for a in alarms %}<tr><td>{{ a.name }} <span class="muted">{{ a.panel }}</span></td><td>{{ a.account }}</td>
+<table><thead><tr><th>Panel</th><th>Account</th><th>State</th><th>Last event</th></tr></thead>
+<tbody id="alarms-body">{% for a in alarms %}<tr><td>{{ a.name }} <span class="muted">{{ a.panel }}</span></td><td>{{ a.account }}</td>
 <td><span class="badge {{ 'sev-critical' if a.state in ('alarm','offline') else ('sev-info' if a.state in ('armed','disarmed') else 'sev-warning') }}">{{ a.state }}</span></td>
-<td class="muted">{{ a.last_text }}</td></tr>{% endfor %}</table></div>{% endif %}
+<td class="muted">{{ a.last_text }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
 <div class="card" style="margin-top:16px"><h2>Recent events (ping + device e-mails)</h2>""" + EVENTS_TABLE + """</div>"""
 
 HOST_BODY = CHART_JS + """<p class="ranges">{% for key, label in spans %}<a href="?span={{ key }}" class="{{ 'on' if span==key else '' }}">{{ label }}</a>{% endfor %}</p>
+<p class="hint"><span id="live-at">last updated {{ now }}</span> · <span id="live-err" hidden style="color:#b91c1c">update failed</span></p>
 <div class="card"><div class="dev">
 <div class="dot {{ STATE_CLS.get(h.state,'p') }}">{{ STATE_TXT.get(h.state,'…') }}</div>
 <div><h3>{{ h.name }}</h3><div class="muted">{{ DEVICE_TYPES.get(h.device_type, DEVICE_TYPES['generic'])[0] }} · {{ h.host }} · {{ h.grp }} ·
@@ -2141,10 +2265,12 @@ def snmp_view(h, tz, full=False, since=None):
     return d
 
 
-def page(body_tpl, refresh=None, charts=False, **ctx):
+def page(body_tpl, refresh=None, charts=False, live=None, **ctx):
     s = get_settings()
     body = render_template_string(body_tpl, s=s, **ctx)
-    return render_template_string(LAYOUT, body=body, s=s, refresh=refresh, charts=charts)
+    ui = max(10, min(300, int(s.get("ui_refresh") or 30)))
+    return render_template_string(LAYOUT, body=body, s=s, refresh=refresh, charts=charts, live=live, ui_refresh=ui,
+                                  hid=ctx.get("hid"))
 
 
 def host_view(row, since, tz, full=False):
@@ -2269,8 +2395,9 @@ def _traffic_cards(since):
                 if pair and pair[0] is not None:
                     inn.append([sample["ts"], pair[0]])
                     out.append([sample["ts"], pair[1]])
+            key = f"{row['host_id']}-{len(cards)}"
             cards.append({"host": row["name"], "iface": row["iface"], "color_in": row["color_in"],
-                          "color_out": row["color_out"], "inn": inn, "out": out})
+                          "color_out": row["color_out"], "inn": inn, "out": out, "key": key})
     return cards
 
 
@@ -2301,7 +2428,7 @@ def index():
     elif any(h.get("lan_down") for h in hosts):
         names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
         banner = {"cls": "warn", "text": "LAN device down: " + names}
-    return page(INDEX_BODY, refresh=60, charts=True, groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
+    return page(INDEX_BODY, charts=True, live="dashboard", groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
                 now=fmt_ts(time.time(), tz), span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000,
                 wan=wan, traffic=_traffic_cards(since), banner=banner, alarms=alarms, bar=_status_bar(hosts, wan, alarms))
 
@@ -2329,8 +2456,9 @@ def host_page(hid):
     h["backups"] = [{"id": b["id"], "when": fmt_ts(b["ts"], tz), "ok": b["ok"], "changed": b["changed"],
                      "error": b["error"], "bin_path": b["bin_path"]} for b in baks]
     h["backup_diff"] = next((b["diff"] for b in baks if b["ok"] and b["changed"] and b["diff"]), "")
-    return page(HOST_BODY, refresh=60, charts=True, h=h, events=event_rows("host_id=?", (hid,), 50, tz),
-                span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000)
+    return page(HOST_BODY, charts=True, live="host", h=h, events=event_rows("host_id=?", (hid,), 50, tz),
+                span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000, hid=hid,
+                now=fmt_ts(time.time(), tz))
 
 
 @app.route("/snapshot/<name>")
@@ -2380,7 +2508,7 @@ def _secret_input(name):
 SETTINGS_BODY = """
 <div class="nav"><a href="#general">General</a><a href="#hosts">Hosts</a><a href="#alerts">Alerts</a><a href="#internet">Internet</a>
 <a href="#graphs">Dashboard graphs</a><a href="#backups">Backups</a><a href="#telegram">Telegram</a><a href="#email">Outgoing e-mail</a>
-<a href="#receiver">Incoming e-mail (devices)</a><a href="#snmp">SNMP + traps</a><a href="#webhook">Webhook</a><a href="#api">API</a><a href="{{ url_for('alarm_settings') }}">Alarms</a><a href="#password">Passwords</a></div>
+<a href="#receiver">Incoming e-mail (devices)</a><a href="#snmp">SNMP + traps</a><a href="#webhook">Webhook</a><a href="#api">API</a><a href="{{ url_for('alarm_settings') }}">Alarms</a><a href="{{ url_for('backup_restore') }}">Backup</a><a href="#password">Passwords</a></div>
 
 <div class="card" id="hosts"><h2>Hosts</h2>
 <p class="section-intro">Each row is one device this monitor pings. Add a camera, router, access point or server you want to watch. Save a row after you change it.</p>
@@ -2440,6 +2568,8 @@ SETTINGS_BODY = """
 <p class="hint">Global default for how many missed pings in a row raise a DOWN alarm. Example: <code>3</code>. A host can override this with its own Fails column (0 on the host means “use this number”).</p></div>
 <label>Alarm repeat (minutes)</label><div><input type="number" name="repeat_min" min="0" max="1440" value="{{ s.repeat_min }}">
 <p class="hint">While a host stays down, send the alarm again every this many minutes. Example: <code>30</code>. Use <code>0</code> to never repeat. A host can override it; an empty Repeat field on the host uses this number.</p></div>
+<label>Dashboard refresh (seconds)</label><div><input type="number" name="ui_refresh" min="10" max="300" value="{{ s.ui_refresh }}">
+<p class="hint">How often the dashboard, host pages and the log fetch new numbers without reloading the page. Example: <code>30</code>. Allowed range is 10–300. The graph range you picked stays put, and updates pause while the browser tab is hidden.</p></div>
 <label>Keep history (days)</label><div><input type="number" name="retention_days" min="1" max="365" value="{{ s.retention_days }}">
 <p class="hint">How long ping and SNMP samples are kept. Example: <code>30</code>. Use fewer days on a small disk.</p></div>
 <label>Ping method</label><div><select name="ping_method">{% for m in ['auto','icmplib','system'] %}<option {{ 'selected' if s.ping_method==m }}>{{ m }}</option>{% endfor %}</select>
@@ -2586,7 +2716,7 @@ Status: <b>{{ rx_status }}</b></p>
 BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_enabled", "rx_enabled", "rx_require_auth",
                "snmp_enabled", "snmp_alert_ifdown", "snmp_alert_reboot", "trap_enabled"}
 SECTIONS = {
-    "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "fail_threshold", "repeat_min", "retention_days",
+    "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "fail_threshold", "repeat_min", "ui_refresh", "retention_days",
                 "ping_method", "public_url", "dashboard_access"],
     "telegram": ["telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_photos"],
     "email": ["email_enabled", "smtp_host", "smtp_port", "smtp_security", "smtp_user", "smtp_password", "smtp_from", "smtp_to"],
@@ -2600,7 +2730,7 @@ CHOICES = {"ping_method": {"auto", "icmplib", "system"}, "dashboard_access": {"l
            "smtp_security": {"none", "starttls", "ssl"}, "rx_security": {"none", "starttls", "ssl"},
            "rx_forward_min": {"info", "warning", "critical", "none"}, "snmp_forward_min": {"info", "warning", "critical", "none"},
            "trap_forward_min": {"info", "warning", "critical", "none"}}
-RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold": (1, 20), "repeat_min": (0, 1440), "retention_days": (1, 365),
+RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold": (1, 20), "repeat_min": (0, 1440), "ui_refresh": (10, 300), "retention_days": (1, 365),
           "smtp_port": (1, 65535), "rx_port": (1, 65535), "rx_rate_limit": (0, 86400),
           "snmp_interval": (30, 3600), "snmp_timeout": (1, 10), "snmp_cpu_threshold": (0, 100), "trap_port": (1, 65535)}
 
@@ -3013,9 +3143,101 @@ def _api_errors(e):
     return e
 
 
+def _events_public(rows):
+    out = []
+    for e in rows:
+        who = (e.get("host_name") or "").strip()
+        if e.get("host_ip"):
+            who = (who + " " + e["host_ip"]).strip()
+        if not who:
+            d = e.get("d") or {}
+            who = d.get("source_label") or d.get("source_ip") or e.get("source") or ""
+        out.append({"time": e.get("time") or "", "severity": e.get("severity") or "", "title": e.get("title") or "",
+                    "message": (e.get("message") or "")[:140], "who": who, "source": e.get("source") or ""})
+    return out
+
+
+def _live_allowed():
+    if role() in ("admin", "viewer") or get_settings().get("dashboard_access") == "public":
+        return True
+    return False
+
+
+@app.route("/api/live")
+def api_live():
+    """JSON snapshot for the open page. 401 sends the browser back to login."""
+    if not _live_allowed():
+        return jsonify(error="login"), 401
+    kind = request.args.get("page") or "dashboard"
+    tz = tzinfo()
+    span, seconds = current_span()
+    since = time.time() - seconds
+    now = fmt_ts(time.time(), tz)
+    if kind == "log":
+        keep = max(10, min(5000, int(get_settings().get("event_keep") or 100)))
+        filt = request.args.get("source") or ""
+        events = event_rows("source=?", (filt,), keep, tz) if filt else event_rows(limit=keep, tz=tz)
+        return jsonify(now=now, events=_events_public(events))
+    if kind == "host":
+        try:
+            hid = int(request.args.get("id") or 0)
+        except ValueError:
+            hid = 0
+        with db() as c:
+            row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
+        if not row:
+            return jsonify(error="missing"), 404
+        h = host_view(row, since, tz, full=True)
+        sn = h.get("sn") or {}
+        series = []
+        if sn.get("cpu_pts") or sn.get("mem_pts"):
+            series.append({"id": "res", "sets": [sn.get("cpu_pts") or [], sn.get("mem_pts") or []]})
+        if sn.get("temp_pts"):
+            series.append({"id": "temp", "sets": [sn.get("temp_pts")]})
+        if sn.get("ups_charge"):
+            series.append({"id": "upc", "sets": [sn.get("ups_charge")]})
+        if sn.get("ups_load"):
+            series.append({"id": "upl", "sets": [sn.get("ups_load")]})
+        if sn.get("ups_vin"):
+            series.append({"id": "upv", "sets": [sn.get("ups_vin")]})
+        for i, (name, pts) in enumerate(sn.get("traffic") or [], start=1):
+            series.append({"id": f"t{i}", "sets": [pts[0], pts[1]]})
+        return jsonify(now=now, host_id=hid, events=_events_public(event_rows("host_id=?", (hid,), 50, tz)),
+                       hosts=[{"id": h["id"], "state": h["state"], "state_txt": STATE_TXT.get(h["state"], ""),
+                               "cls": STATE_CLS.get(h["state"], "p"), "last_ms": h.get("last_ms"),
+                               "uptime": h.get("uptime"), "down_for": h.get("down_for") or "",
+                               "last_seen": h.get("last_seen_txt") or "", "points": h.get("points") or []}],
+                       series=series)
+    with db() as c:
+        rows = c.execute("SELECT * FROM hosts ORDER BY grp, name").fetchall()
+    hosts = [host_view(r, since, tz) for r in rows]
+    wan = _wan_card(since)
+    for h in hosts:
+        h["lan_down"] = h["state"] == "down" and not h.get("maint") and wan and wan["state"] == "up" and _private_host(h["host"])
+    counts = {k: sum(1 for h in hosts if h["state"] == k) for k in ("up", "down", "warn", "pending")}
+    alarms = _alarm_rows(tz)
+    lan_up = any(h["state"] == "up" and _private_host(h["host"]) for h in hosts)
+    banner = None
+    if wan and wan.get("state") == "down":
+        banner = {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
+    elif any(h.get("lan_down") for h in hosts):
+        banner = {"cls": "warn", "text": "LAN device down: " + ", ".join(h["name"] for h in hosts if h.get("lan_down"))}
+    bar = _status_bar(hosts, wan, alarms)
+    traffic = _traffic_cards(since)
+    return jsonify(now=now, bar=bar, banner=banner, counts=counts, alarms=alarms,
+                   events=_events_public(event_rows(limit=25, tz=tz)),
+                   hosts=[{"id": h["id"], "state": h["state"], "state_txt": STATE_TXT.get(h["state"], ""),
+                           "cls": STATE_CLS.get(h["state"], "p"), "last_ms": h.get("last_ms"),
+                           "uptime": h.get("uptime"), "down_for": h.get("down_for") or "",
+                           "last_seen": h.get("last_seen_txt") or "", "points": h.get("points") or []} for h in hosts],
+                   wan={"latency": (wan or {}).get("latency") or [], "loss": (wan or {}).get("loss") or []} if wan else None,
+                   traffic=[{"key": g["key"], "inn": g["inn"], "out": g["out"]} for g in traffic])
+
+
 # ----------------------------------------------------------------------------- main
 LOG_BODY = """<h2>Event log</h2>
 <p class="hint">The newest {{ keep }} alerts. Ping and device e-mail events also stay in the dashboard section “Recent events (ping + device e-mails)”.</p>
+<p class="hint"><span id="live-at">last updated just now</span> · <span id="live-err" hidden style="color:#b91c1c">update failed</span></p>
 <form method="get" class="ranges">
 <select name="source"><option value="">All types</option>{% for src in sources %}<option value="{{ src }}" {{ 'selected' if src==filt }}>{{ src }}</option>{% endfor %}</select>
 <button>Filter</button></form>
@@ -3034,7 +3256,7 @@ def event_log():
         events = event_rows(limit=keep, tz=tz)
     with db() as c:
         sources = [r[0] for r in c.execute("SELECT DISTINCT source FROM events ORDER BY source")]
-    return page(LOG_BODY, events=events, sources=sources, filt=filt, keep=keep)
+    return page(LOG_BODY, live="log", events=events, sources=sources, filt=filt, keep=keep)
 
 
 @app.route("/report", methods=["GET", "POST"])
@@ -3363,6 +3585,152 @@ def alarm_settings():
     return page(body, rows=rows)
 
 
+@app.route("/settings/backup", methods=["GET", "POST"])
+@admin_required
+def backup_restore():
+    """Download or restore an encrypted configuration. Secrets are never written in the clear."""
+    if request.method == "POST" and request.form.get("action") == "download":
+        phrase = request.form.get("passphrase") or ""
+        again = request.form.get("passphrase2") or ""
+        if phrase != again:
+            flash("The two passphrases do not match.")
+            return redirect(url_for("backup_restore"))
+        try:
+            with db() as c:
+                doc = configbackup.build_document(c, DATA_DIR, VERSION, include_history=bool(request.form.get("history")))
+            blob = configbackup.dumps(doc, phrase)
+        except configbackup.BackupError as e:
+            flash(str(e))
+            return redirect(url_for("backup_restore"))
+        name = "wirewave-config.wwnim" if not request.form.get("history") else "wirewave-full.wwnim"
+        return Response(blob, mimetype="application/octet-stream",
+                        headers={"Content-Disposition": f"attachment; filename={name}"})
+    if request.method == "POST" and request.form.get("action") == "preview":
+        upload = request.files.get("file") if request.files else None
+        phrase = request.form.get("passphrase") or ""
+        raw = upload.read() if upload else b""
+        try:
+            doc = configbackup.loads(raw, phrase)
+        except configbackup.BackupError as e:
+            flash(str(e))
+            return redirect(url_for("backup_restore"))
+        folder = configbackup.config_dir(DATA_DIR)
+        token = secrets.token_hex(16)
+        path = os.path.join(folder, f"incoming-{token}.wwnim")
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        os.chmod(path, 0o640)
+        session["cfg_token"] = token
+        session["cfg_preview"] = configbackup.preview(doc)
+        return redirect(url_for("backup_restore"))
+    if request.method == "POST" and request.form.get("action") == "apply":
+        token = session.get("cfg_token")
+        if not token or token != request.form.get("token"):
+            flash("The preview expired. Upload the file again.")
+            return redirect(url_for("backup_restore"))
+        path = os.path.join(configbackup.config_dir(DATA_DIR), f"incoming-{token}.wwnim")
+        try:
+            with open(path, "rb") as fh:
+                doc = configbackup.loads(fh.read(), request.form.get("passphrase") or "")
+            mode = "replace" if request.form.get("mode") == "replace" else "merge"
+            with _db_lock, db() as c:
+                key = get_settings().get("secret_key")
+                if key:
+                    configbackup.write_local(c, DATA_DIR, VERSION, key)
+                configbackup.apply_document(c, doc, DATA_DIR, set(DEFAULTS), mode)
+        except configbackup.BackupError as e:
+            flash(str(e))
+            return redirect(url_for("backup_restore"))
+        except OSError:
+            flash("The uploaded backup is no longer available. Upload it again.")
+            return redirect(url_for("backup_restore"))
+        session.pop("cfg_token", None)
+        session.pop("cfg_preview", None)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            RECEIVER.restart()
+            restart_sia()
+        except Exception as e:
+            log.error("restart after restore: %s", e)
+        flash(f"Restored ({mode}). A copy of the previous configuration was saved under data/config-backups/. "
+              "If the web port changed, run: sudo systemctl restart pingmonitor")
+        return redirect(url_for("backup_restore"))
+    if request.method == "POST" and request.form.get("action") == "restore-local":
+        name = os.path.basename(request.form.get("name") or "")
+        path = os.path.join(configbackup.config_dir(DATA_DIR), name)
+        key = get_settings().get("secret_key") or ""
+        try:
+            with open(path, "rb") as fh:
+                doc = configbackup.loads(fh.read(), key)
+            mode = "replace" if request.form.get("mode") == "replace" else "merge"
+            with _db_lock, db() as c:
+                configbackup.write_local(c, DATA_DIR, VERSION, key)
+                configbackup.apply_document(c, doc, DATA_DIR, set(DEFAULTS), mode)
+        except (configbackup.BackupError, OSError) as e:
+            flash(f"Could not restore that copy: {e}")
+            return redirect(url_for("backup_restore"))
+        flash("Restored the local copy. The previous configuration was saved first.")
+        return redirect(url_for("backup_restore"))
+    copies = []
+    try:
+        copies = configbackup.list_local(DATA_DIR)
+    except OSError:
+        copies = []
+    body = """<div class="card"><h2>Backup / restore</h2>
+<p class="section-intro">Download this installation to keep off the machine, or to move it onto a new thin client. The file is encrypted with the passphrase you type. An unencrypted copy of passwords and tokens is refused.</p>
+<h2>Download</h2>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="download">
+<div class="form-grid">
+<label>Passphrase</label><div><input type="password" name="passphrase" required minlength="8" autocomplete="new-password">
+<p class="hint">At least 8 characters. You will need this exact passphrase to restore. Example: a long phrase you do not use for the admin login. It is not stored on this machine.</p></div>
+<label>Repeat passphrase</label><div><input type="password" name="passphrase2" required minlength="8" autocomplete="new-password"></div>
+<label>Include history</label><div><input type="checkbox" name="history" value="1">
+<p class="hint">Also pack ping samples, the event log and MikroTik export files. Leave this off for a smaller config-only file (settings, hosts, SNMP, camera API, alarm accounts, graph colours).</p></div>
+<span></span><div><button>Download backup</button></div></div></form>
+<h2>Restore</h2>
+<p class="hint">Upload the file and the passphrase to see what is inside. Nothing is changed until you choose merge or replace. A local copy of the current configuration is saved first.</p>
+<form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="preview">
+<div class="form-grid">
+<label>Backup file</label><div><input type="file" name="file" required></div>
+<label>Passphrase</label><div><input type="password" name="passphrase" required autocomplete="current-password"></div>
+<span></span><div><button class="sec">Preview</button></div></div></form>
+{% if preview %}
+<div class="card" style="box-shadow:none;border:1px solid #e2e8f0">
+<p><b>{{ preview.hosts }}</b> hosts · <b>{{ preview.settings }}</b> settings · <b>{{ preview.graphs }}</b> dashboard graphs · <b>{{ preview.alarms }}</b> alarm accounts{% if preview.history %} · history included ({{ preview.samples }} ping samples, {{ preview.events }} events){% else %} · config only{% endif %}</p>
+<p class="muted">Written by version {{ preview.version }} at {{ preview.created }}.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="apply"><input type="hidden" name="token" value="{{ token }}">
+<label>Passphrase again</label> <input type="password" name="passphrase" required>
+<button name="mode" value="merge">Merge hosts</button>
+<button name="mode" value="replace" class="sec">Replace hosts</button>
+<p class="hint">Merge updates hosts that have the same IP and adds the rest. Replace removes hosts that are not in the file. Settings, alarm accounts and graph colours are taken from the file either way.</p>
+</form></div>{% endif %}
+<h2>Automatic copies</h2>
+<p class="hint">A config-only backup is written about once a day into <code>/opt/pingmonitor/data/config-backups/</code>. The last 14 are kept. They are encrypted with this installation's own key, so they are safe on disk and can be restored here. To move to another machine, use Download and a passphrase you choose.</p>
+<table><tr><th>File</th><th>Size</th><th></th></tr>
+{% for f in copies %}<tr><td>{{ f.name }}</td><td>{{ f.size }} bytes</td>
+<td><a href="{{ url_for('backup_local_download', name=f.name) }}">Download</a>
+<form method="post" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="restore-local"><input type="hidden" name="name" value="{{ f.name }}">
+<button name="mode" value="merge" class="sec">Restore (merge)</button></form></td></tr>
+{% else %}<tr><td colspan="3" class="muted">None yet. The first copy is written within a day of running, or just before a restore.</td></tr>{% endfor %}</table>
+</div>"""
+    return page(body, preview=session.get("cfg_preview"), token=session.get("cfg_token"), copies=copies)
+
+
+@app.route("/settings/backup/local/<name>")
+@admin_required
+def backup_local_download(name):
+    safe = os.path.basename(name)
+    if safe != name or not safe.startswith("config-") or not safe.endswith(".wwnim"):
+        abort(404)
+    path = os.path.join(configbackup.config_dir(DATA_DIR), safe)
+    if not os.path.isfile(path):
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=safe)
+
+
 def main():
     global DB_PATH, DATA_DIR, SNAP_DIR
     ap = argparse.ArgumentParser(description=APP_NAME + " v" + VERSION)
@@ -3375,6 +3743,11 @@ def main():
     ap.add_argument("--password-stdin", action="store_true", help="with --set-password: read the password from stdin")
     ap.add_argument("--check-setup", action="store_true", help="exit 0 if an admin password is set, 3 if not")
     ap.add_argument("--show-token", action="store_true", help="print the API token and exit")
+    ap.add_argument("--export-config", metavar="FILE", help="write an encrypted config backup and exit")
+    ap.add_argument("--import-config", metavar="FILE", help="restore an encrypted config backup and exit")
+    ap.add_argument("--passphrase-file", metavar="FILE", help="file containing the backup passphrase (one line)")
+    ap.add_argument("--with-history", action="store_true", help="with --export-config, include ping history, events and router backups")
+    ap.add_argument("--replace-hosts", action="store_true", help="with --import-config, delete hosts that are not in the backup")
     ap.add_argument("--debug", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -3387,6 +3760,34 @@ def main():
     init_db()
     s = get_settings()
 
+    if a.export_config or a.import_config:
+        if not a.passphrase_file:
+            sys.exit("Pass the passphrase in a file: --passphrase-file (it is not accepted on the command line).")
+        with open(a.passphrase_file, encoding="utf-8") as fh:
+            passphrase = fh.readline().rstrip("\r\n")
+        try:
+            if a.export_config:
+                with db() as c:
+                    doc = configbackup.build_document(c, DATA_DIR, VERSION, include_history=a.with_history)
+                blob = configbackup.dumps(doc, passphrase)
+                with open(a.export_config, "wb") as fh:
+                    fh.write(blob)
+                os.chmod(a.export_config, 0o600)
+                info = configbackup.preview(doc)
+                print(f"Wrote encrypted backup ({info['hosts']} hosts, {info['settings']} settings).")
+                return
+            with open(a.import_config, "rb") as fh:
+                doc = configbackup.loads(fh.read(), passphrase)
+            info = configbackup.preview(doc)
+            mode = "replace" if a.replace_hosts else "merge"
+            with _db_lock, db() as c:
+                if s.get("secret_key"):
+                    configbackup.write_local(c, DATA_DIR, VERSION, s["secret_key"])
+                configbackup.apply_document(c, doc, DATA_DIR, set(DEFAULTS), mode)
+            print(f"Restored {info['hosts']} hosts ({mode}). Settings sections: {info['settings']} keys.")
+        except configbackup.BackupError as e:
+            sys.exit(str(e))
+        return
     if a.check_setup:
         sys.exit(0 if s["admin_hash"] else 3)
     if a.show_token:

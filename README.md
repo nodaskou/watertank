@@ -24,6 +24,8 @@ To listen on this machine only, run `PINGMON_HOST=127.0.0.1 sudo ./install.sh`. 
 
 The installer sets the OS timezone to `Europe/Athens` (`timedatectl`, or a symlink to `/usr/share/zoneinfo` if that is not available). Override it with `PINGMON_TZ=Europe/Athens sudo ./install.sh`. The app's own timezone setting already defaults to `Europe/Athens`.
 
+The dashboard, each host page and the log refresh themselves every 30 seconds (Settings → General → Dashboard refresh, 10–300). The page is not reloaded, so the graph range stays as you left it, and the refresh pauses while the browser tab is in the background. The corner shows the time of the last update. If the session has expired, the next update sends you to the login page.
+
 The dashboard opens with a status bar: internet latency and packet loss, the site's public IP (and the provider name when a lookup works), and the time of the last check. The bar is green when the internet, every host, the UPS and the alarm panels are quiet. It is red for a down internet, down devices, a UPS on battery or an alarm, and amber for high latency, high loss or maintenance. A change of public IP is logged and sent as an info alert.
 
 Alarms use a failed-ping count (global default 3, overridable per host) and a repeat interval (global default 30 minutes, `0` = do not repeat, also overridable per host). Each host can also use its own ping interval; empty means the global one.
