@@ -1,0 +1,12 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local data and secrets
+*.db
+*.sqlite*
+config.json
+data/
+logs/

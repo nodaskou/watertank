@@ -1,0 +1,7 @@
+Flask>=3.0
+waitress>=3.0
+icmplib>=3.0
+aiosmtpd>=1.4
+pysnmp>=7.1          # SNMP polling + trap decoding (lextudio pysnmp, asyncio API)
+cryptography>=41     # needed by pysnmp for SNMPv3 privacy (AES/DES)
+tzdata; sys_platform == "win32"
