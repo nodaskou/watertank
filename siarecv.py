@@ -8,6 +8,7 @@ This is a technical monitor, not a certified alarm receiving centre.
 import re
 import socket
 import threading
+import time
 
 from pysiaalarm.account import SIAAccount
 from pysiaalarm.errors import EventFormatError, NoAccountError
@@ -184,19 +185,46 @@ class SIAServer:
         self.stop = threading.Event()
         self.error = None
         port = int(port)
-        if tcp:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((host, port))
-            sock.listen(16)
-            sock.settimeout(1.0)
-            self.tcp = sock
-        if udp:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((host, port))
-            sock.settimeout(1.0)
-            self.udp = sock
+        opened = []
+
+        def bind_sock(kind):
+            last = None
+            for attempt in range(20):
+                sock = socket.socket(socket.AF_INET, kind)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind((host, port))
+                    return sock
+                except OSError as e:
+                    last = e
+                    sock.close()
+                    if getattr(e, "errno", None) not in (98, 48) or attempt == 19:
+                        raise
+                    time.sleep(0.05)
+            raise last
+
+        try:
+            if tcp:
+                sock = bind_sock(socket.SOCK_STREAM)
+                sock.listen(16)
+                sock.settimeout(1.0)
+                self.tcp = sock
+                opened.append(sock)
+            if udp:
+                sock = bind_sock(socket.SOCK_DGRAM)
+                sock.settimeout(1.0)
+                self.udp = sock
+                opened.append(sock)
+        except OSError as e:
+            for sock in opened:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            self.tcp = self.udp = None
+            self.error = str(e)
+            self.status_text = f"failed to listen on {host}:{port}: {e}"
+            raise
         bits = []
         if tcp:
             bits.append("tcp")
@@ -211,10 +239,17 @@ class SIAServer:
         for sock in (self.tcp, self.udp):
             if sock:
                 try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
                     sock.close()
                 except OSError:
                     pass
         self.tcp = self.udp = None
+        thread = self.thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
         self.status_text = "stopped"
 
     def _loop(self, on_event):

@@ -47,7 +47,7 @@ The first update from an older install, which always listened on `127.0.0.1`, sw
 A small, single-file network monitor for hotel and client sites. It runs on a Debian machine. People on the LAN open it directly, and you can also publish it with Cloudflare Tunnel.
 
 * **Ping** every host on a fixed interval, with a latency graph and green/red state. It alerts after N failed pings and again on recovery.
-* **Settings page** (admin only) covers: hosts, general, Telegram, outgoing e-mail (SMTP), the incoming device-mail receiver, SNMP and traps, the webhook, the API token and the password.
+* **Settings page** (admin only). The menu is General, Hosts, Alerts, Internet, Dashboard graphs, MikroTik backups, Telegram, Outgoing e-mail, Incoming e-mail (devices), SNMP + traps, Webhook, API, Alarms, App config backup/restore, Passwords, and Diagnostics. Each item opens its own section. Saving one section leaves the others as they were. MikroTik backups are the weekly router exports. App config backup/restore is the encrypted copy of this installation.
 * **Read-only dashboard** (an info screen; nothing can be changed there).
 * **Incoming e-mail receiver**: cameras, NVRs and controllers e-mail their alarms to the monitor. It parses them (Hikvision, Dahua, UniFi, UISP, Omada, MikroTik, ...), shows them as events and forwards them.
 * **SNMP**: per-host polling of uptime, CPU, RAM, interface traffic and link state, plus brand extras. A **trap receiver** handles linkDown/linkUp/coldStart/warmStart.
