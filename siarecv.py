@@ -24,6 +24,8 @@ CRITICAL = {"BA", "FA", "PA", "HA", "MA", "QA", "GA", "KA", "WA", "TA", "SA"}
 ARM = {"CL", "CA", "CG", "NL"}
 DISARM = {"OP", "OA", "OG", "OR"}
 WARNING = {"AT", "YT", "YC", "YX", "XT", "XQ", "YM"}
+# Second letter R is the restore of the matching alarm (BA → BR, FA → FR, TA → TR).
+RESTORE = {code[0] + "R" for code in CRITICAL if len(code) == 2}
 
 
 def crc16(msg):
@@ -259,6 +261,8 @@ def _state_for(code, message_type):
         return "armed"
     if code in DISARM:
         return "disarmed"
+    if code in RESTORE:
+        return "restored"
     return None
 
 

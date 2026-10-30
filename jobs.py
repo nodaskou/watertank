@@ -314,21 +314,18 @@ def camera_poll(pm, only_id=None):
             continue
         if not cfg.get("enabled") and not only_id:
             continue
-        if host.get("device_type") not in ("hikvision", "dahua"):
+        brand = cfg.get("brand") if cfg.get("brand") in ("hikvision", "dahua") else host.get("device_type")
+        if brand not in ("hikvision", "dahua"):
             continue
         with pm.db() as c:
             prev_row = c.execute("SELECT ts, data FROM cam_state WHERE host_id=?", (host["id"],)).fetchone()
         if not only_id and prev_row and now - (prev_row["ts"] or 0) < interval:
             continue
         password = pm.decrypt_secret(cfg.get("password") or "")
-        base = f"{cfg.get('scheme') or 'http'}://{host['host']}:{int(cfg.get('port') or 80)}"
-        try:
-            result = camapi.check_device(host["device_type"], camapi.fetch_for(base, cfg.get("user") or "", password))
-        except Exception as e:
-            result = {"ok": False, "brand": host["device_type"], "device": {}, "disks": [], "channels": [],
-                      "error": str(e), "problems": [{"key": "unreachable", "kind": "cam_unreachable",
-                                                     "severity": "critical", "title": "Recorder unreachable",
-                                                     "message": str(e)}]}
+        scheme = cfg.get("scheme") or "http"
+        port = int(cfg.get("port") or (443 if scheme == "https" else 80))
+        base = f"{scheme}://{host['host']}:{port}"
+        result = camapi.run_check(brand, base, cfg.get("user") or "", password, timeout=15)
         prev = {}
         if prev_row and prev_row["data"]:
             try:

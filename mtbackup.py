@@ -56,6 +56,74 @@ def ids_to_prune(rows, keep):
     return drop
 
 
+def _probe_hint(text):
+    low = (text or "").lower()
+    if "timed out" in low or "timeout" in low:
+        return "The router did not answer within 15 seconds. Check the IP and that this machine can reach the API or SSH port."
+    if "refused" in low or "errno 111" in low:
+        return "Nothing is listening. API is port 8728, or 8729 when API-SSL is ticked. SSH is usually port 22."
+    if "invalid user" in low or "bad" in low and "auth" in low or "authentication" in low or "login" in low:
+        return "The username or password was rejected. Use a user that can log in to the API and to SSH."
+    return "The login failed. The user needs the api and ssh policies, and read access. A binary backup also needs ftp."
+
+
+def probe(host, user, password, api_port=8728, use_ssl=False, ssh_port=22, timeout=15):
+    """Log in and read the identity. Does not export the config."""
+    errors = []
+    try:
+        return {"ok": True, "via": "API", "detail": _identity_api(host, user, password, api_port, use_ssl, timeout),
+                "error": "", "hint": ""}
+    except Exception as e:
+        errors.append(f"API: {e}")
+    try:
+        return {"ok": True, "via": "SSH", "detail": _identity_ssh(host, user, password, ssh_port, timeout),
+                "error": "", "hint": ""}
+    except Exception as e:
+        errors.append(f"SSH: {e}")
+    text = "; ".join(errors)
+    return {"ok": False, "via": "", "detail": "", "error": text[:500], "hint": _probe_hint(text)}
+
+
+def _identity_api(host, user, password, port, use_ssl, timeout):
+    from librouteros import connect
+    kwargs = dict(username=user, password=password, host=host, port=int(port or (8729 if use_ssl else 8728)),
+                  timeout=timeout)
+    if use_ssl:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_ciphers("ADH:@SECLEVEL=0")
+        except ssl.SSLError:
+            pass
+        kwargs["ssl_wrapper"] = ctx.wrap_socket
+    api = connect(**kwargs)
+    try:
+        rows = list(api.path("system", "identity"))
+        name = ""
+        if rows:
+            name = rows[0].get("name") or ""
+        return name or "logged in"
+    finally:
+        try:
+            api.close()
+        except Exception:
+            pass
+
+
+def _identity_ssh(host, user, password, port, timeout):
+    client = _ssh_client(host, user, password, port, timeout)
+    try:
+        _stdin, stdout, stderr = client.exec_command(":put [/system identity get name]", timeout=timeout)
+        text = stdout.read().decode("utf-8", "replace").strip()
+        err = stderr.read().decode("utf-8", "replace").strip()
+        if not text and err:
+            raise RuntimeError(err)
+        return text or "logged in"
+    finally:
+        client.close()
+
+
 def export_text(host, user, password, api_port=8728, use_ssl=False, ssh_port=22, sensitive=False, timeout=40):
     """Return (text, via). Tries the API, then SSH."""
     errors = []

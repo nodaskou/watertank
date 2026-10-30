@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import base64
 import getpass
+import camapi
 import configbackup
 import jobs
 import mtbackup
@@ -210,7 +211,8 @@ def _migrate(c):
             last_ts REAL, last_text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'unknown',
             rest_state TEXT NOT NULL DEFAULT 'unknown', offline_alerted INTEGER NOT NULL DEFAULT 0,
             ts_mode TEXT NOT NULL DEFAULT '',
-            skew_s INTEGER, skew_n INTEGER NOT NULL DEFAULT 0);
+            skew_s INTEGER, skew_n INTEGER NOT NULL DEFAULT 0,
+            ack_at REAL NOT NULL DEFAULT 0, ack_by TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS sia_log(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL DEFAULT '',
             raw TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
@@ -221,6 +223,8 @@ def _migrate(c):
     _add_col(c, "sia_accounts", "ts_mode", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_accounts", "skew_s", "INTEGER")
     _add_col(c, "sia_accounts", "skew_n", "INTEGER NOT NULL DEFAULT 0")
+    _add_col(c, "sia_accounts", "ack_at", "REAL NOT NULL DEFAULT 0")
+    _add_col(c, "sia_accounts", "ack_by", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "protocol", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "frame_ts", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "server_utc", "TEXT NOT NULL DEFAULT ''")
@@ -797,14 +801,51 @@ def refresh_public_ip():
                         build_payload(s, "public_ip_change", None, None, severity="info", message=msg))
 
 
+PANEL_FACE = {
+    "ajax": ("Ajax", "#16a34a"),
+    "trikdis": ("Trikdis", "#0f766e"),
+    "hik_ax": ("Hikvision", "#c8102e"),
+    "dahua_arc": ("Dahua", "#e05a00"),
+    "other": ("Panel", "#64748b"),
+}
+
+
 def _alarm_rows(tz):
     try:
         with db() as c:
             rows = c.execute("SELECT * FROM sia_accounts ORDER BY name").fetchall()
     except Exception:
         return []
-    return [{"name": r["name"], "panel": r["panel"], "account": r["account"], "state": r["state"] or "unknown",
-             "last_text": r["last_text"] or ""} for r in rows]
+    site = get_settings().get("site_name") or ""
+    out = []
+    for r in rows:
+        state = r["state"] or "unknown"
+        ack_at = r["ack_at"] if "ack_at" in r.keys() else 0
+        acked = bool(ack_at) and state == "alarm"
+        if state == "alarm":
+            label, cls = "ALARM", "r"
+        elif state == "armed":
+            label, cls = "Armed", "g"
+        elif state == "disarmed":
+            label, cls = "Disarmed", "g"
+        elif state == "offline":
+            label, cls = "Offline", "a"
+        elif state == "online":
+            label, cls = "Online", "g"
+        else:
+            label, cls = "Unknown", "p"
+        brand, color = PANEL_FACE.get(r["panel"], PANEL_FACE["other"])
+        skew = r["skew_s"] if "skew_s" in r.keys() else None
+        out.append({
+            "name": r["name"], "panel": r["panel"], "account": r["account"], "state": state,
+            "last_text": r["last_text"] or "", "last_time": fmt_ts(r["last_ts"], tz) if r["last_ts"] else "",
+            "site": site, "brand": brand, "color": color, "label": label, "cls": cls,
+            "flash": state == "alarm" and not acked, "acked": acked,
+            "ack_by": (r["ack_by"] if "ack_by" in r.keys() else "") or "",
+            "ack_time": fmt_ts(ack_at, tz) if ack_at else "",
+            "skew": siarecv.clock_warning(skew) if skew else "",
+        })
+    return out
 
 
 def _status_bar(hosts, wan, alarms):
@@ -857,6 +898,7 @@ def _status_bar(hosts, wan, alarms):
         "ip": s.get("public_ip") or "",
         "isp": s.get("public_ip_isp") or "",
         "checked": fmt_ts(s.get("public_ip_at"), tzinfo()) if s.get("public_ip_at") else "—",
+        "alarm_flash": any(a.get("flash") for a in (alarms or [])),
     }
 
 
@@ -1967,6 +2009,20 @@ header h1 span{overflow-wrap:anywhere}
 .statusbar{position:sticky;top:0;z-index:30;display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:10px 16px;border-radius:10px;margin:0 0 14px;color:#fff}
 .statusbar.ok{background:#15803d}.statusbar.warn{background:#b45309}.statusbar.bad{background:#b91c1c}
 .statusbar .why{font-weight:700}
+.alarm-pill{display:inline-block;margin-right:6px;padding:3px 8px;border-radius:8px;background:#b91c1c;color:#fff;font-weight:700;font-size:13px}
+.alarm-tile.flash,.statusbar.alarm,.alarm-pill.flash{animation:alarmflash .8s steps(2,end) infinite}
+.alarm-tile.flash{background:#b91c1c;color:#fff}
+.alarm-tile.flash a,.alarm-tile.held a{color:#fff}
+.alarm-tile.held{background:#b91c1c;color:#fff}
+.alarm-tile .dot{background:#fff;color:#b91c1c}
+.alarm-tile:not(.flash):not(.held) .dot.g{background:#16a34a;color:#fff}
+.alarm-tile:not(.flash):not(.held) .dot.a{background:#f59e0b;color:#fff}
+.alarm-tile:not(.flash):not(.held) .dot.p{background:#94a3b8;color:#fff}
+.tile-link{color:inherit;text-decoration:none;display:block}
+@keyframes alarmflash{0%,100%{background:#b91c1c;color:#fff}50%{background:#450a0a;color:#fecaca}}
+@media (prefers-reduced-motion: reduce){
+ .alarm-tile.flash,.statusbar.alarm,.alarm-pill.flash{animation:none;background:#b91c1c;color:#fff}
+}
 .snmpline{font-size:12.5px;color:#334155;margin:2px 0 8px}.lnk{display:inline-block;color:#fff;border-radius:6px;padding:1px 6px;margin:0 4px 3px 0;font-size:11.5px;font-weight:600}
 .lnk small{font-weight:400;opacity:.9}.kv td:first-child{color:#64748b;width:160px}
 code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
@@ -1974,7 +2030,7 @@ code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
 
 LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 {% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
-<link rel="icon" href="{{ url_for('brand_logo') }}" type="image/jpeg">
+<link rel="icon" id="site-icon" href="{{ url_for('brand_logo') }}" type="image/jpeg">
 <title>{{ s.site_name }} - """ + APP_NAME + """</title><style>""" + CSS + """</style>
 {% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body{% if hid is defined and hid %} data-live-id="{{ hid }}"{% endif %}>
 <header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>""" + APP_NAME + """ <small>· {{ s.site_name }}</small></span></h1><div>
@@ -1988,6 +2044,10 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 {% if live %}<script>
 const LIVE = {{ live|tojson }};
 const EVERY = {{ ui_refresh|tojson }} * 1000;
+const CAN_ACK = {{ (role()=='admin')|tojson }};
+const BASE_TITLE = document.title;
+let alarmBlink = null;
+let alarmOn = false;
 function liveSpan(){ const u=new URL(location.href); return u.searchParams.get('span')||'24h'; }
 function setText(id, value){ const n=document.getElementById(id); if(n) n.textContent=value; }
 function showErr(msg){ const n=document.getElementById('live-err'); if(!n) return; n.hidden=false; n.textContent=msg||'update failed'; }
@@ -2016,13 +2076,75 @@ function paintEvents(rows){
 }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function paintAlarms(rows){
-  const body=document.getElementById('alarms-body'); if(!body) return;
-  const sig=JSON.stringify(rows||[]);
-  if(body.dataset.sig===sig) return;
-  body.dataset.sig=sig;
-  if(!rows || !rows.length){ body.innerHTML=''; return; }
-  body.innerHTML=rows.map(a=>'<tr><td>'+esc(a.name)+' <span class="muted">'+esc(a.panel)+'</span></td><td>'+esc(a.account)+'</td><td><span class="badge '+(a.state==='alarm'||a.state==='offline'?'sev-critical':(a.state==='armed'||a.state==='disarmed'?'sev-info':'sev-warning'))+'">'+esc(a.state)+'</span></td><td class="muted">'+esc(a.last_text)+'</td></tr>').join('');
+  const grid=document.getElementById('alarm-grid');
+  const section=document.getElementById('alarm-section');
+  const pills=document.getElementById('bar-alarms');
+  const list=rows||[];
+  const hot=list.some(a=>a.flash);
+  if(section) section.hidden=!list.length;
+  if(pills){
+    pills.innerHTML=list.filter(a=>a.flash).map(a=>'<span class="alarm-pill flash">'+esc(a.name)+' · ALARM</span>').join('');
+  }
+  const bar=document.getElementById('bar');
+  if(bar) bar.classList.toggle('alarm', hot);
+  if(grid){
+    const sig=JSON.stringify(list.map(a=>({a:a.account,s:a.state,f:a.flash,t:a.last_text,k:a.acked,w:a.skew})));
+    if(grid.dataset.sig!==sig){
+      grid.dataset.sig=sig;
+      grid.innerHTML=list.map(a=>{
+        const tile=a.flash?'flash':(a.state==='alarm'?'held':'');
+        const ack=a.acked?('<p class="hint">Acknowledged '+(a.ack_time||'')+' by '+esc(a.ack_by||'admin')+'</p>'):'';
+        const skew=a.skew?('<p class="hint">'+esc(a.skew)+'</p>'):'';
+        const btn=(a.flash && CAN_ACK)?'<button type="button" data-ack="'+esc(a.account)+'">Acknowledge</button>':'';
+        return '<div class="card alarm-tile '+tile+'" id="at-'+esc(a.account)+'"><a class="tile-link" href="/alarms/'+encodeURIComponent(a.account)+'">'
+          +'<div class="dev"><div class="dot '+(a.cls||'p')+'">'+esc(a.label||a.state)+'</div><div><h3>'+esc(a.name)+' <span class="muted">'+esc(a.site||'')+'</span></h3>'
+          +'<div class="muted"><span class="badge" style="background:'+esc(a.color||'#64748b')+'">'+esc(a.brand||'')+'</span> '+esc(a.account)+'</div></div></div>'
+          +'<p class="muted">'+esc(a.last_text||'No events yet')+(a.last_time?' · '+esc(a.last_time):'')+'</p>'+skew+ack
+          +'</a>'+btn+'</div>';
+      }).join('');
+    }
+  }
+  const reduced=window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if(hot){
+    if(reduced){ document.title='⚠ ALARM – '+BASE_TITLE; }
+    else if(!alarmBlink){
+      alarmBlink=setInterval(()=>{ alarmOn=!alarmOn; document.title=alarmOn?('⚠ ALARM – '+BASE_TITLE):BASE_TITLE; }, 1000);
+    }
+    setFaviconBadge(true);
+  } else {
+    if(alarmBlink){ clearInterval(alarmBlink); alarmBlink=null; }
+    document.title=BASE_TITLE;
+    setFaviconBadge(false);
+  }
 }
+function setFaviconBadge(on){
+  const link=document.getElementById('site-icon'); if(!link) return;
+  if(!link.dataset.plain) link.dataset.plain=link.href;
+  if(!on){ link.href=link.dataset.plain; link.dataset.badged=''; return; }
+  if(link.dataset.badged==='1') return;
+  const img=new Image();
+  img.onload=function(){
+    const c=document.createElement('canvas'); c.width=32; c.height=32;
+    const g=c.getContext('2d'); g.drawImage(img,0,0,32,32);
+    g.fillStyle='#dc2626'; g.beginPath(); g.arc(24,8,7,0,6.3); g.fill();
+    g.strokeStyle='#fff'; g.lineWidth=2; g.stroke();
+    link.href=c.toDataURL('image/png');
+    link.dataset.badged='1';
+  };
+  img.src=link.dataset.plain;
+}
+document.addEventListener('click', function(ev){
+  const btn=ev.target.closest && ev.target.closest('[data-ack]');
+  if(!btn) return;
+  ev.preventDefault();
+  const holder=document.getElementById('page-csrf');
+  const csrf=holder?holder.dataset.csrf:'';
+  fetch('/alarms/'+encodeURIComponent(btn.dataset.ack)+'/ack', {
+    method:'POST', credentials:'same-origin',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'csrf='+encodeURIComponent(csrf)
+  }).then(function(r){ if(r.ok) liveTick(); });
+});
 function applyLive(data){
   if(data.bar){
     const bar=document.getElementById('bar');
@@ -2151,8 +2273,9 @@ EVENTS_TABLE = """<table><thead><tr><th>Time</th><th>Source</th><th>Event</th><t
 {% else %}<tr><td colspan="5" class="muted">No events yet.</td></tr>{% endfor %}</tbody></table>"""
 
 INDEX_BODY = CHART_JS + """
-<div class="statusbar {{ bar.level }}" id="bar">
+<div class="statusbar {{ bar.level }}{% if bar.alarm_flash %} alarm{% endif %}" id="bar">
  <span class="why" id="bar-why">{{ bar.reason }}</span>
+ <span id="bar-alarms">{% for a in alarms %}{% if a.flash %}<span class="alarm-pill flash">{{ a.name }} · ALARM</span>{% endif %}{% endfor %}</span>
  <span id="bar-net">Internet {% if bar.latency is not none %}{{ '%.0f'|format(bar.latency) }} ms{% else %}—{% endif %}
   · loss {% if bar.loss is not none %}{{ '%.0f'|format(bar.loss) }}%{% else %}—{% endif %}</span>
  <span id="bar-ip">Public IP {{ bar.ip or '—' }}{% if bar.isp %} · {{ bar.isp }}{% endif %}</span>
@@ -2190,17 +2313,31 @@ INDEX_BODY = CHART_JS + """
  up <b>{{ h.sn.uptime_txt }}</b>{% if h.sn.cpu is not none %} · CPU <b>{{ '%.0f'|format(h.sn.cpu) }}%</b>{% endif %}{% if h.sn.mem_pct is not none %} · RAM <b>{{ '%.0f'|format(h.sn.mem_pct) }}%</b>{% endif %}
  {% if h.sn.extra.temp %} · <b>{{ h.sn.extra.temp }}°C</b>{% endif %}{% if h.sn.extra.voltage %} · <b>{{ h.sn.extra.voltage }} V</b>{% endif %}{% if h.sn.extra.wireless_clients is defined %} · <b>{{ h.sn.extra.wireless_clients }}</b> Wi-Fi clients{% endif %}
  <div style="margin-top:4px">{% for i in h.sn.watched %}<span class="lnk {{ 'g' if i.oper=='up' else 'r' }}" title="{{ i.alias }} {{ i.oper }}">{{ i.name }} {{ '▲' if i.oper=='up' else '▼' }}{% if i.in_bps is not none %} <small>{{ fmt_bps(i.in_bps) }}↓ {{ fmt_bps(i.out_bps) }}↑</small>{% endif %}</span>{% endfor %}</div>{% endif %}</div>{% endif %}
+ {% if h.cam_line %}<div class="snmpline">🎥 {% if h.cam and not h.cam.ok %}<span style="color:#dc2626">{{ h.cam_line }}</span>{% else %}{{ h.cam_line }}{% endif %}</div>{% endif %}
  <div class="chartbox"><canvas id="c{{ h.id }}"></canvas></div><script>drawChart('c{{ h.id }}', {{ h.points|tojson }});</script>
 </div>{% endfor %}</div>{% else %}<div class="card">No hosts yet. {% if role()=='admin' %}<a href="{{ url_for('settings') }}#hosts">Add hosts in Settings</a>.{% endif %}</div>{% endfor %}
-{% if alarms %}<div class="card"><h2>Alarms</h2>
-<p class="hint">For information and technical monitoring only. This is not a certified alarm receiving centre (ARC/CMS). Keep the panel maker's own app (Ajax, Trikdis, Hikvision or Dahua) as the primary monitoring.</p>
-<table><thead><tr><th>Panel</th><th>Account</th><th>State</th><th>Last event</th></tr></thead>
-<tbody id="alarms-body">{% for a in alarms %}<tr><td>{{ a.name }} <span class="muted">{{ a.panel }}</span></td><td>{{ a.account }}</td>
-<td><span class="badge {{ 'sev-critical' if a.state in ('alarm','offline') else ('sev-info' if a.state in ('armed','disarmed') else 'sev-warning') }}">{{ a.state }}</span></td>
-<td class="muted">{{ a.last_text }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+<div id="alarm-section" {% if not alarms %}hidden{% endif %}>
+<div class="grp">Alarm panels</div>
+<p class="hint">For information only. This is not a certified alarm receiving centre. A tile flashes red while an alarm is active, until the panel sends a restore or an admin acknowledges it.</p>
+<div class="grid" id="alarm-grid">{% for a in alarms %}
+<div class="card alarm-tile {{ 'flash' if a.flash else ('held' if a.state=='alarm' else '') }}" id="at-{{ a.account }}">
+<a class="tile-link" href="{{ url_for('alarm_panel', account=a.account) }}">
+<div class="dev"><div class="dot {{ a.cls }}">{{ a.label }}</div>
+<div><h3>{{ a.name }} <span class="muted">{{ a.site }}</span></h3>
+<div class="muted"><span class="badge" style="background:{{ a.color }}">{{ a.brand }}</span> {{ a.account }}</div></div></div>
+<p class="muted">{{ a.last_text or 'No events yet' }}{% if a.last_time %} · {{ a.last_time }}{% endif %}</p>
+{% if a.skew %}<p class="hint">{{ a.skew }}</p>{% endif %}
+{% if a.acked %}<p class="hint">Acknowledged {{ a.ack_time }} by {{ a.ack_by }}</p>{% endif %}
+</a>
+{% if a.flash and role()=='admin' %}<button type="button" data-ack="{{ a.account }}">Acknowledge</button>{% endif %}
+</div>{% endfor %}</div></div>
+<span id="page-csrf" data-csrf="{{ csrf_token() }}" hidden></span>
 <div class="card" style="margin-top:16px"><h2>Recent events (ping + device e-mails)</h2>""" + EVENTS_TABLE + """</div>"""
 
-HOST_BODY = CHART_JS + """<p class="ranges">{% for key, label in spans %}<a href="?span={{ key }}" class="{{ 'on' if span==key else '' }}">{{ label }}</a>{% endfor %}</p>
+HOST_BODY = CHART_JS + """{% if role()=='admin' %}<p class="hint"><a href="{{ url_for('host_snmp', hid=h.id) }}">SNMP</a>
+{% if h.device_type in ('hikvision', 'dahua') %} · <a href="{{ url_for('host_camera', hid=h.id) }}">Camera API</a>{% endif %}
+{% if h.device_type=='mikrotik' %} · <a href="{{ url_for('host_backup', hid=h.id) }}">MikroTik backup</a>{% endif %}</p>{% endif %}
+<p class="ranges">{% for key, label in spans %}<a href="?span={{ key }}" class="{{ 'on' if span==key else '' }}">{{ label }}</a>{% endfor %}</p>
 <p class="hint"><span id="live-at">last updated {{ now }}</span> · <span id="live-err" hidden style="color:#b91c1c">update failed</span></p>
 <div class="card"><div class="dev">
 <div class="dot {{ STATE_CLS.get(h.state,'p') }}">{{ STATE_TXT.get(h.state,'…') }}</div>
@@ -2237,10 +2374,18 @@ last seen {{ h.last_seen_txt }} · uptime 24h {{ '%.1f%%'|format(h.uptime) if h.
 <div class="grid">{% if h.ups_charge %}<div style="height:160px"><canvas id="upc"></canvas></div><script>drawSeries('upc',[{label:'Battery %',color:'#16a34a',data:{{ h.ups_charge|tojson }}}],{});</script>{% endif %}
 {% if h.ups_load %}<div style="height:160px"><canvas id="upl"></canvas></div><script>drawSeries('upl',[{label:'Load %',color:'#1d5fbf',data:{{ h.ups_load|tojson }}}],{});</script>{% endif %}
 {% if h.ups_vin %}<div style="height:160px"><canvas id="upv"></canvas></div><script>drawSeries('upv',[{label:'Input V',color:'#a855f7',data:{{ h.ups_vin|tojson }}}],{plain:true});</script>{% endif %}</div></div>{% endif %}
-{% if h.cam %}<div class="card"><h2>Recorder {% if not h.cam.ok %}<span class="badge sev-critical">{{ h.cam.error or 'no reply' }}</span>{% endif %}</h2>
-<p class="muted">{{ h.cam.device.model or '' }} {{ h.cam.device.firmware or '' }} {{ h.cam.device.name or '' }}</p>
-{% if h.cam.disks %}<table><tr><th>Disk</th><th>Status</th><th>Free</th></tr>{% for d in h.cam.disks %}<tr><td>{{ d.name }}</td><td>{{ d.status }}</td><td>{{ d.free_mb or '—' }} MB</td></tr>{% endfor %}</table>{% endif %}
-{% if h.cam.channels %}<p class="hint">{% for ch in h.cam.channels %}Channel {{ ch.id }} {{ 'offline' if ch.online is sameas false else 'online' }} {{ ch.name or '' }} · {% endfor %}</p>{% endif %}
+{% if h.cam %}<div class="card"><h2>Recorder {% if not h.cam.ok %}<span class="badge sev-critical">{{ h.cam.error or 'no reply' }}</span>{% else %}<span class="badge sev-info">ok</span>{% endif %}
+{% if role()=='admin' %} · <a href="{{ url_for('host_camera', hid=h.id) }}">Camera API</a>{% endif %}</h2>
+<p class="muted">Last check {{ h.cam_when or '—' }}{% if h.cam.http_status %} · HTTP {{ h.cam.http_status }}{% endif %}</p>
+<p class="muted">{{ h.cam.device.model or '' }}{% if h.cam.device.serial %} · {{ h.cam.device.serial }}{% endif %} {{ h.cam.device.firmware or '' }} {{ h.cam.device.name or '' }}</p>
+{% if h.cam.hint %}<p class="hint">{{ h.cam.hint }}</p>{% endif %}
+{% if h.cam.disks %}<table><tr><th>Disk</th><th>Status</th><th>Capacity</th><th>Free</th><th>Errors</th></tr>
+{% for d in h.cam.disks %}<tr><td>{{ d.name }}</td><td>{{ d.status }}</td><td>{{ d.capacity_mb if d.capacity_mb is not none else '—' }} MB</td><td>{{ d.free_mb if d.free_mb is not none else '—' }} MB</td><td>{{ d.errors or ('yes' if d.problem else 'none') }}</td></tr>{% endfor %}</table>{% endif %}
+{% if h.cam.channels %}<table><tr><th>Camera</th><th>Name</th><th>Online</th><th>Video loss</th><th>Recording</th></tr>
+{% for ch in h.cam.channels %}<tr><td>{{ ch.id }}</td><td>{{ ch.name or '—' }}</td>
+<td>{{ 'offline' if ch.online is sameas false else ('online' if ch.online else '—') }}</td>
+<td>{{ 'yes' if ch.video_loss else ('no' if ch.video_loss is sameas false else '—') }}</td>
+<td>{{ 'yes' if ch.recording else ('no' if ch.recording is sameas false else '—') }}</td></tr>{% endfor %}</table>{% endif %}
 </div>{% endif %}
 {% if h.backups %}<div class="card"><h2>Config backups</h2>
 <table><tr><th>When</th><th>Result</th><th></th></tr>{% for b in h.backups %}<tr>
@@ -2332,6 +2477,25 @@ def host_view(row, since, tz, full=False):
     h["down_for"] = fmt_dur(time.time() - h["down_since"]) if h["down_since"] else ""
     h["maint"] = host_maint(h, get_settings())
     h["sn"] = snmp_view(h, tz, full, since)
+    h["cam"] = None
+    h["cam_line"] = ""
+    with db() as c:
+        cam = c.execute("SELECT data FROM cam_state WHERE host_id=?", (h["id"],)).fetchone()
+    if cam and cam["data"]:
+        try:
+            h["cam"] = json.loads(cam["data"])
+        except (TypeError, ValueError):
+            h["cam"] = None
+    if h["cam"]:
+        if h["cam"].get("ok"):
+            dev = h["cam"].get("device") or {}
+            off = sum(1 for ch in h["cam"].get("channels") or [] if ch.get("online") is False)
+            h["cam_line"] = (f"{dev.get('model') or h['cam'].get('brand') or 'NVR'} · "
+                             f"{len(h['cam'].get('disks') or [])} disks · "
+                             f"{len(h['cam'].get('channels') or [])} cameras"
+                             + (f" · {off} offline" if off else ""))
+        else:
+            h["cam_line"] = h["cam"].get("error") or "camera API failed"
     if not h["enabled"]:
         h["state"] = "disabled"
     return h
@@ -2491,12 +2655,63 @@ def host_page(hid):
         cam = c.execute("SELECT data FROM cam_state WHERE host_id=?", (hid,)).fetchone()
         baks = c.execute("SELECT * FROM backups WHERE host_id=? ORDER BY ts DESC LIMIT 20", (hid,)).fetchall()
     h["cam"] = json.loads(cam["data"]) if cam and cam["data"] else None
+    h["cam_when"] = fmt_ts(h["cam"].get("ts"), tz) if h.get("cam") and h["cam"].get("ts") else ""
     h["backups"] = [{"id": b["id"], "when": fmt_ts(b["ts"], tz), "ok": b["ok"], "changed": b["changed"],
                      "error": b["error"], "bin_path": b["bin_path"]} for b in baks]
     h["backup_diff"] = next((b["diff"] for b in baks if b["ok"] and b["changed"] and b["diff"]), "")
     return page(HOST_BODY, charts=True, live="host", h=h, events=event_rows("host_id=?", (hid,), 50, tz),
                 span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000, hid=hid,
                 now=fmt_ts(time.time(), tz))
+
+
+@app.route("/alarms/<account>")
+@viewer_required
+def alarm_panel(account):
+    account = (account or "").upper()
+    tz = tzinfo()
+    with db() as c:
+        row = c.execute("SELECT * FROM sia_accounts WHERE account=?", (account,)).fetchone()
+    if not row:
+        abort(404)
+    panel = _alarm_rows(tz)
+    one = next((a for a in panel if a["account"] == account), None)
+    if not one:
+        abort(404)
+    events = event_rows("host_ip=?", (account,), 50, tz)
+    body = """<p><a href="{{ url_for('index') }}">← Dashboard</a></p>
+<div class="card alarm-tile {{ 'flash' if a.flash else ('held' if a.state=='alarm' else '') }}">
+<div class="dev"><div class="dot {{ a.cls }}">{{ a.label }}</div>
+<div><h3>{{ a.name }} <span class="muted">{{ a.site }}</span></h3>
+<div class="muted"><span class="badge" style="background:{{ a.color }}">{{ a.brand }}</span> {{ a.account }} · {{ a.label }}</div></div></div>
+<p>{{ a.last_text or 'No events yet' }}{% if a.last_time %} · {{ a.last_time }}{% endif %}</p>
+{% if a.skew %}<p class="hint">{{ a.skew }}</p>{% endif %}
+{% if a.acked %}<p class="hint">Acknowledged {{ a.ack_time }} by {{ a.ack_by }}</p>{% endif %}
+{% if a.flash and role()=='admin' %}
+<form method="post" action="{{ url_for('alarm_ack', account=a.account) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<button>Acknowledge</button></form>{% endif %}
+</div>
+<div class="card"><h2>Events</h2>""" + EVENTS_TABLE + """</div>
+{% if a.flash %}<script>document.title='⚠ ALARM – '+document.title;</script>{% endif %}"""
+    return page(body, a=one, events=events)
+
+
+@app.route("/alarms/<account>/ack", methods=["POST"])
+@admin_required
+def alarm_ack(account):
+    account = (account or "").upper()
+    now = time.time()
+    with db() as c:
+        row = c.execute("SELECT * FROM sia_accounts WHERE account=?", (account,)).fetchone()
+    if not row:
+        abort(404)
+    with _db_lock, db() as c:
+        c.execute("UPDATE sia_accounts SET ack_at=?, ack_by=? WHERE account=?", (now, "admin", account))
+    host = {"id": None, "name": row["name"], "host": account, "device_type": row["panel"]}
+    add_event("alarm", "alarm", "info", host, "Alarm acknowledged",
+              f"{row['name']} ({account}) acknowledged by admin at {fmt_ts(now)}.",
+              {"account": account, "panel": row["panel"], "type": "alarm", "ack_by": "admin"})
+    flash(f"Acknowledged {row['name']}.")
+    return redirect(request.referrer or url_for("alarm_panel", account=account))
 
 
 @app.route("/snapshot/<name>")
@@ -2644,7 +2859,7 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <li><b>Ping s</b> — seconds between pings for this host only. Example: <code>30</code>. Empty or <code>0</code> uses the global ping interval.</li>
 <li><b>Repeat min</b> — resend the DOWN alarm while it stays down. Example: <code>15</code>. Empty uses the global repeat (default 30). <code>0</code> means never repeat for this host.</li>
 <li><b>Maintenance until</b> — no alerts for this host until that time, and the card shows MAINT. Example: tonight 22:00 while you replace a switch. Clear the field to turn it off.</li>
-<li><b>API</b> — Hikvision or Dahua username and password, checked on the recorder's own HTTP API.</li>
+<li><b>Camera API</b> — shown for a Hikvision or Dahua host. Username and password for the recorder's own HTTP API, with a Test button.</li>
 <li><b>Backup</b> — MikroTik export account. Use a user that can read the config, not the full admin if you can avoid it.</li>
 </ul>
 <div class="table-wrap"><table><tr><th>Name</th><th>IP / hostname</th><th>Group</th><th>Type</th><th>On</th><th>Fails</th><th>Ping s</th><th>Repeat</th><th>Maintenance until</th><th></th></tr>
@@ -2659,8 +2874,8 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <td><input type="number" form="hf{{ h.id }}" name="repeat_min" min="0" max="1440" value="{{ '' if h.repeat_min is not defined or h.repeat_min < 0 else h.repeat_min }}" style="width:64px" placeholder="global" title="empty = global, 0 = never"></td>
 <td><input type="datetime-local" form="hf{{ h.id }}" name="maint_local" value="{{ h.maint_local }}"></td>
 <td style="white-space:nowrap"><a href="{{ url_for('host_snmp', hid=h.id) }}">SNMP</a>
- · <a href="{{ url_for('host_camera', hid=h.id) }}">API</a>
- · <a href="{{ url_for('host_backup', hid=h.id) }}">Backup</a><br>
+ {% if h.device_type in ('hikvision', 'dahua') %}· <a href="{{ url_for('host_camera', hid=h.id) }}"><b>Camera API</b></a>{% endif %}
+ {% if h.device_type == 'mikrotik' %}· <a href="{{ url_for('host_backup', hid=h.id) }}">Backup</a>{% endif %}<br>
 <form id="hf{{ h.id }}" method="post" action="{{ url_for('host_save', hid=h.id) }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>Save</button></form>
 <form method="post" action="{{ url_for('host_delete', hid=h.id) }}" style="display:inline" onsubmit="return confirm('Delete {{ h.name }} and its history?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del">Delete</button></form></td></tr>
 {% endfor %}
@@ -3223,8 +3438,9 @@ SNMP_HOST_BODY = """<p><a href="{{ url_for('settings') }}#hosts">← Settings / 
 <td><input type="checkbox" name="g_{{ i.name }}" value="1" {{ 'checked' if i.name in (c.ifaces or []) }}></td>
 <td><input type="checkbox" name="a_{{ i.name }}" value="1" {{ 'checked' if i.name in (c.alert_ifaces or []) }}></td></tr>{% endfor %}</table>
 {% else %}<p class="hint">Interfaces appear here after the first successful poll or a test. Physical interfaces that are up are selected automatically. Run Save + test now once SNMP answers.</p>{% endif %}
-<p><button>Save</button> <button name="test" value="1" class="sec">Save + test now</button></p></form>
-{% if test %}<div class="card" style="border:1px solid #e2e8f0;box-shadow:none">{% if test.error %}❌ <b>SNMP test failed:</b> {{ test.error }}{% else %}
+{% if snmp_last %}<p class="hint">Last poll {{ snmp_last.when }}{% if snmp_last.error %} · {{ snmp_last.error }}{% elif snmp_last.sysName %} · {{ snmp_last.sysName }}{% endif %}</p>{% endif %}
+<p><button name="do" value="save">Save</button> <button name="do" value="test" class="sec">Test</button> <button name="do" value="test" class="sec">Save + test now</button></p></form>
+{% if test %}<div class="card" id="snmp-test" style="border:1px solid #e2e8f0;box-shadow:none">{% if test.error %}❌ <b>SNMP test failed:</b> {{ test.error }}{% else %}
 ✅ <b>{{ test.sysName }}</b> answered in {{ test.took }} s - {{ test.sysDescr[:150] if test.sysDescr }}<br>uptime {{ test.uptime_txt }} · CPU {{ test.cpu if test.cpu is not none else 'n/a' }} · RAM {{ test.mem_pct if test.mem_pct is not none else 'n/a' }}% · {{ test.ifaces|length }} interfaces{% for k, v in test.extra.items() %} · {{ k }} {{ v }}{% endfor %}{% endif %}</div>{% endif %}
 </div><script>document.querySelector('select[name=version]').dispatchEvent(new Event('change'))</script>
 """
@@ -3240,7 +3456,11 @@ def host_snmp(hid):
         abort(404)
     h = dict(row)
     cfg = host_snmp_cfg(h)
-    ifaces = (json.loads(st["data"]).get("ifaces") if st else None) or []
+    state = json.loads(st["data"]) if st and st["data"] else {}
+    ifaces = state.get("ifaces") or []
+    snmp_last = None
+    if state.get("ts"):
+        snmp_last = {"when": fmt_ts(state.get("ts")), "error": state.get("error") or "", "sysName": state.get("sysName") or ""}
     test = None
     if request.method == "POST":
         f = request.form
@@ -3273,7 +3493,7 @@ def host_snmp(hid):
         h["snmp"] = json.dumps(cfg)
         SNMP.last_poll.pop(hid, None)  # poll soon
         flash("SNMP settings saved.")
-        if not f.get("test"):
+        if f.get("do") != "test" and not f.get("test"):
             return redirect(url_for("host_snmp", hid=hid))
         t0 = time.time()
         try:
@@ -3288,7 +3508,7 @@ def host_snmp(hid):
                     c.execute("UPDATE hosts SET snmp=? WHERE id=?", (json.dumps(cfg), hid))
         except Exception as e:
             test = {"error": _snmp_err(e) if not isinstance(e, RuntimeError) else str(e)}
-    return page(SNMP_HOST_BODY, h=h, c=cfg, ifaces=ifaces, test=test)
+    return page(SNMP_HOST_BODY, h=h, c=cfg, ifaces=ifaces, test=test, snmp_last=snmp_last)
 
 
 @app.route("/settings/api/regenerate", methods=["POST"])
@@ -3569,45 +3789,137 @@ def api_report():
     return Response(pdf, mimetype="application/pdf")
 
 
+def _camera_brand(host_type, chosen):
+    if chosen in ("hikvision", "dahua"):
+        return chosen
+    if host_type in ("hikvision", "dahua"):
+        return host_type
+    return ""
+
+
+def _load_cam(row):
+    try:
+        cfg = json.loads(row["cam"] or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return cfg
+
+
+def _apply_cam_form(cfg):
+    cfg["enabled"] = 1 if request.form.get("enabled") else 0
+    cfg["scheme"] = request.form.get("scheme") if request.form.get("scheme") in ("http", "https") else "http"
+    cfg["brand"] = request.form.get("brand") if request.form.get("brand") in ("auto", "hikvision", "dahua") else "auto"
+    try:
+        port = int(request.form.get("port") or 0)
+    except ValueError:
+        port = 0
+    if port <= 0 or port > 65535:
+        port = 443 if cfg["scheme"] == "https" else 80
+    if cfg["scheme"] == "https" and port == 80 and request.form.get("port") in ("", "80"):
+        port = 443
+    if cfg["scheme"] == "http" and port == 443 and request.form.get("port") in ("", "443"):
+        port = 80
+    cfg["port"] = port
+    cfg["user"] = request.form.get("user", "").strip()
+    if request.form.get("password"):
+        cfg["password"] = encrypt_secret(request.form.get("password"))
+    return cfg
+
+
+def _run_camera_test(host, cfg):
+    brand = _camera_brand(host.get("device_type"), cfg.get("brand"))
+    password = decrypt_secret(cfg.get("password") or "")
+    if not cfg.get("user") or not password:
+        return {"ok": False, "brand": brand, "device": {}, "disks": [], "channels": [],
+                "error": "Enter the username and password first.",
+                "hint": "Type the NVR user and password, then Test. Leave the password blank only when one is already saved.",
+                "http_status": 0, "http_detail": "", "ts": time.time()}
+    scheme = cfg.get("scheme") or "http"
+    port = int(cfg.get("port") or (443 if scheme == "https" else 80))
+    base = f"{scheme}://{host['host']}:{port}"
+    result = camapi.run_check(brand, base, cfg.get("user") or "", password, timeout=15)
+    result["ts"] = time.time()
+    with _db_lock, db() as c:
+        c.execute("INSERT OR REPLACE INTO cam_state(host_id, ts, data) VALUES(?,?,?)",
+                  (host["id"], result["ts"], json.dumps(result)))
+    return result
+
+
 @app.route("/settings/hosts/<int:hid>/camera", methods=["GET", "POST"])
 @admin_required
 def host_camera(hid):
     with db() as c:
         row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
+        stored = c.execute("SELECT data FROM cam_state WHERE host_id=?", (hid,)).fetchone()
     if not row:
         abort(404)
-    cfg = {}
-    try:
-        cfg = json.loads(row["cam"] or "{}")
-    except (TypeError, ValueError):
-        cfg = {}
+    host = dict(row)
+    cfg = _load_cam(row)
+    test = None
     if request.method == "POST":
-        cfg["enabled"] = 1 if request.form.get("enabled") else 0
-        cfg["scheme"] = request.form.get("scheme") if request.form.get("scheme") in ("http", "https") else "http"
-        try:
-            cfg["port"] = int(request.form.get("port") or 80)
-        except ValueError:
-            cfg["port"] = 80
-        cfg["user"] = request.form.get("user", "").strip()
-        if request.form.get("password"):
-            cfg["password"] = encrypt_secret(request.form.get("password"))
+        cfg = _apply_cam_form(cfg)
         with _db_lock, db() as c:
             c.execute("UPDATE hosts SET cam=? WHERE id=?", (json.dumps(cfg), hid))
-        flash("Camera API settings saved.")
-        return redirect(url_for("host_camera", hid=hid))
-    body = """<p><a href="{{ url_for('settings') }}#hosts">← Hosts</a></p>
+        action = request.form.get("do") or "save"
+        if action in ("test", "save_test"):
+            test = _run_camera_test(host, cfg)
+            flash("Camera API test finished." if test.get("ok") else "Camera API test failed.")
+        else:
+            flash("Camera API settings saved.")
+            return redirect(url_for("host_camera", hid=hid))
+    if test is None and stored and stored["data"]:
+        try:
+            test = json.loads(stored["data"])
+        except (TypeError, ValueError):
+            test = None
+    if test and test.get("ts"):
+        test["when"] = fmt_ts(test.get("ts"))
+    body = """<p><a href="{{ url_for('settings') }}#hosts">← Hosts</a> · <a href="{{ url_for('host_page', hid=h.id) }}">{{ h.name }}</a></p>
 <div class="card"><h2>Camera API · {{ h.name }}</h2>
-<p class="section-intro">Optional check of a Hikvision or Dahua recorder. The password is stored encrypted. NVR pictures that arrive by e-mail stay on the mail receiver; this page is the direct API.</p>
+<p class="section-intro">Checks a Hikvision or Dahua recorder over its own HTTP API. The password is stored encrypted. Save keeps the form. Test and Save + Test run the check now (about 15 seconds) with the password you just typed, or the saved one if the field is empty.</p>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
 <label>Enabled</label><div><input type="checkbox" name="enabled" value="1" {{ 'checked' if cfg.enabled }}></div>
-<label>Scheme</label><div><select name="scheme"><option {{ 'selected' if cfg.scheme!='https' }}>http</option><option {{ 'selected' if cfg.scheme=='https' }}>https</option></select>
-<p class="hint">Use https for a self-signed recorder. The certificate is accepted.</p></div>
-<label>Port</label><div><input type="number" name="port" value="{{ cfg.port or 80 }}"></div>
+<label>Brand</label><div><select name="brand">
+<option value="auto" {{ 'selected' if (cfg.brand or 'auto')=='auto' }}>Auto (from host type: {{ h.device_type }})</option>
+<option value="hikvision" {{ 'selected' if cfg.brand=='hikvision' }}>Hikvision</option>
+<option value="dahua" {{ 'selected' if cfg.brand=='dahua' }}>Dahua</option>
+</select>
+<p class="hint">Auto uses the host device type. Pick Hikvision or Dahua when that type is something else.</p></div>
+<label>Scheme</label><div><select name="scheme" id="cam-scheme"><option value="http" {{ 'selected' if cfg.scheme!='https' }}>http</option><option value="https" {{ 'selected' if cfg.scheme=='https' }}>https</option></select>
+<p class="hint">Use https for a self-signed recorder. The certificate is accepted. Choosing https sets the port to 443 when it is still 80.</p></div>
+<label>Port</label><div><input type="number" name="port" id="cam-port" value="{{ cfg.port or (443 if cfg.scheme=='https' else 80) }}"></div>
 <label>Username</label><div><input type="text" name="user" value="{{ cfg.user or '' }}"></div>
 <label>Password</label><div><input type="password" name="password" placeholder="{{ 'saved — leave empty to keep' if cfg.password else 'not set' }}"></div>
-<span></span><div><button>Save</button></div></div></form></div>"""
-    return page(body, h=dict(row), cfg=cfg)
+<span></span><div><button name="do" value="save">Save</button>
+<button name="do" value="save_test" class="sec">Save + Test</button>
+<button name="do" value="test" class="sec">Test</button></div></div></form>
+{% if test %}<div class="card" id="cam-test" style="box-shadow:none;border:1px solid #e2e8f0">
+<h2>{% if test.ok %}Result{% else %}Test failed{% endif %} <span class="muted">{{ test.when or '' }}</span></h2>
+{% if test.ok %}<p>✅ {{ test.device.model or test.brand or 'Recorder' }}{% if test.device.serial %} · serial {{ test.device.serial }}{% endif %}{% if test.device.firmware %} · {{ test.device.firmware }}{% endif %}{% if test.device.name %} · {{ test.device.name }}{% endif %}</p>
+{% else %}<p>❌ <b>{{ test.error or 'no reply' }}</b>{% if test.http_status %} · HTTP {{ test.http_status }}{% endif %}</p>
+{% if test.http_detail %}<p class="hint">{{ test.http_detail }}</p>{% endif %}
+{% if test.hint %}<p>{{ test.hint }}</p>{% endif %}{% endif %}
+{% if test.disks %}<table><tr><th>HDD</th><th>Status</th><th>Capacity</th><th>Free</th><th>Errors</th></tr>
+{% for d in test.disks %}<tr><td>{{ d.name }}</td><td>{{ d.status }}</td><td>{{ d.capacity_mb if d.capacity_mb is not none else '—' }} MB</td><td>{{ d.free_mb if d.free_mb is not none else '—' }} MB</td><td>{{ d.errors or '—' }}</td></tr>{% endfor %}</table>{% endif %}
+{% if test.channels %}<table><tr><th>Channel</th><th>Name</th><th>Online</th><th>Video loss</th><th>Recording</th></tr>
+{% for ch in test.channels %}<tr><td>{{ ch.id }}</td><td>{{ ch.name or '—' }}</td>
+<td>{{ 'offline' if ch.online is sameas false else ('online' if ch.online else '—') }}</td>
+<td>{{ 'yes' if ch.video_loss else ('no' if ch.video_loss is sameas false else '—') }}</td>
+<td>{{ 'yes' if ch.recording else ('no' if ch.recording is sameas false else '—') }}</td></tr>{% endfor %}</table>{% endif %}
+{% if test.calls %}<p class="hint">{% for c in test.calls %}{{ c.path }} → {{ c.status }} · {% endfor %}</p>{% endif %}
+</div>{% endif %}
+</div>
+<script>
+document.getElementById('cam-scheme').addEventListener('change', function(){
+  var port = document.getElementById('cam-port');
+  if (this.value === 'https' && (port.value === '' || port.value === '80')) port.value = '443';
+  if (this.value === 'http' && (port.value === '' || port.value === '443')) port.value = '80';
+});
+</script>"""
+    return page(body, h=host, cfg=cfg, test=test)
 
 
 @app.route("/settings/hosts/<int:hid>/backup", methods=["GET", "POST"])
@@ -3621,11 +3933,15 @@ def host_backup(hid):
         cfg = json.loads(row["mtbak"] or "{}")
     except (TypeError, ValueError):
         cfg = {}
+    outcome = None
     if request.method == "POST":
         cfg["enabled"] = 1 if request.form.get("enabled") else 0
         cfg["user"] = request.form.get("user", "").strip()
-        cfg["api_port"] = int(request.form.get("api_port") or 8728)
-        cfg["ssh_port"] = int(request.form.get("ssh_port") or 22)
+        try:
+            cfg["api_port"] = int(request.form.get("api_port") or 8728)
+            cfg["ssh_port"] = int(request.form.get("ssh_port") or 22)
+        except ValueError:
+            cfg["api_port"], cfg["ssh_port"] = 8728, 22
         cfg["use_ssl"] = 1 if request.form.get("use_ssl") else 0
         cfg["sensitive"] = 1 if request.form.get("sensitive") else 0
         cfg["binary"] = 1 if request.form.get("binary") else 0
@@ -3633,11 +3949,34 @@ def host_backup(hid):
             cfg["password"] = encrypt_secret(request.form.get("password"))
         with _db_lock, db() as c:
             c.execute("UPDATE hosts SET mtbak=? WHERE id=?", (json.dumps(cfg), hid))
-        flash("Backup account saved. One export per week, keeping the last year (52) unless you change MikroTik backups → Keep.")
-        if request.form.get("now"):
-            jobs.run_backup(sys.modules[__name__], dict(row) | {"mtbak": json.dumps(cfg)} if False else {**dict(row), "mtbak": json.dumps(cfg)}, "now")
-        return redirect(url_for("host_backup", hid=hid))
-    body = """<p><a href="{{ url_for('settings') }}#hosts">← Hosts</a></p>
+        host = {**dict(row), "mtbak": json.dumps(cfg)}
+        action = request.form.get("do") or "save"
+        password = decrypt_secret(cfg.get("password") or "")
+        if action == "test":
+            if not cfg.get("user") or not password:
+                outcome = {"ok": False, "error": "Enter the username and password first.",
+                           "hint": "Type the backup user and password, then Test connection. Leave the password blank only when one is already saved."}
+            else:
+                outcome = mtbackup.probe(row["host"], cfg.get("user") or "", password,
+                                         api_port=cfg.get("api_port") or 8728, use_ssl=cfg.get("use_ssl"),
+                                         ssh_port=cfg.get("ssh_port") or 22, timeout=15)
+            flash("Router answered." if outcome.get("ok") else "Connection test failed.")
+        elif action == "now":
+            result = jobs.run_backup(sys.modules[__name__], host, "now")
+            if result:
+                outcome = {"ok": True, "via": result.get("via") or "export", "detail": "Backup saved.",
+                           "error": "", "hint": ""}
+                flash("Backup saved.")
+            else:
+                with db() as c:
+                    err = c.execute("SELECT error FROM backups WHERE host_id=? ORDER BY ts DESC LIMIT 1", (hid,)).fetchone()
+                outcome = {"ok": False, "error": (err["error"] if err else "") or "Backup did not complete.",
+                           "hint": "Check the user, password, and that API or SSH is open."}
+                flash("Backup now did not complete.")
+        else:
+            flash("Backup account saved. One export per week, keeping the last year (52) unless you change MikroTik backups → Keep.")
+            return redirect(url_for("host_backup", hid=hid))
+    body = """<p><a href="{{ url_for('settings') }}#hosts">← Hosts</a> · <a href="{{ url_for('host_page', hid=h.id) }}">{{ h.name }}</a></p>
 <div class="card"><h2>MikroTik backup · {{ h.name }}</h2>
 <p class="section-intro">Weekly text export. One per week, keeps the last year. Use a user with read and ssh (and api). Add sensitive only if you need passwords in the file. Binary backup also needs ftp and policy. Downloads require an admin login.</p>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
@@ -3650,8 +3989,15 @@ def host_backup(hid):
 <label>SSH port</label><div><input type="number" name="ssh_port" value="{{ cfg.ssh_port or 22 }}"></div>
 <label>Include secrets</label><div><input type="checkbox" name="sensitive" value="1" {{ 'checked' if cfg.sensitive }}><p class="hint">Runs /export show-sensitive. Needs the sensitive policy.</p></div>
 <label>Binary .backup</label><div><input type="checkbox" name="binary" value="1" {{ 'checked' if cfg.binary }}></div>
-<span></span><div><button>Save</button> <button name="now" value="1" class="sec">Backup now</button></div></div></form></div>"""
-    return page(body, h=dict(row), cfg=cfg)
+<span></span><div><button name="do" value="save">Save</button>
+<button name="do" value="test" class="sec">Test connection</button>
+<button name="do" value="now" class="sec">Backup now</button></div></div></form>
+{% if outcome %}<div class="card" id="mt-test" style="box-shadow:none;border:1px solid #e2e8f0">
+{% if outcome.ok %}✅ {{ outcome.detail or 'OK' }}{% if outcome.via %} via {{ outcome.via }}{% endif %}
+{% else %}❌ <b>{{ outcome.error }}</b>{% if outcome.hint %}<p>{{ outcome.hint }}</p>{% endif %}{% endif %}
+</div>{% endif %}
+</div>"""
+    return page(body, h=dict(row), cfg=cfg, outcome=outcome)
 
 
 @app.route("/backup/<int:bid>")
@@ -3876,16 +4222,35 @@ def on_sia_frame(line, peer, now=None):
         info["reply"] = siarecv.nak_frame(info.get("sequence"), info.get("receiver"), info.get("line"), account, when=moment)
         return info
     info["ts_flag"] = decision.get("flag") or ""
-    state = info.get("state") or (row["rest_state"] if info.get("heartbeat") and row["state"] == "offline" else row["state"])
+    incoming = info.get("state")
     if info.get("heartbeat") and row["state"] == "offline":
-        state = row["rest_state"] or "online"
+        state = row["rest_state"] if row["rest_state"] not in ("", None, "offline", "alarm") else "online"
+    elif info.get("heartbeat"):
+        state = row["state"] or "online"
+    elif incoming == "restored":
+        state = row["rest_state"] if row["rest_state"] in ("armed", "disarmed", "online") else "online"
+    else:
+        state = incoming or row["state"] or "unknown"
     if info.get("heartbeat") and state in ("unknown", "", None):
         state = "online"
-    rest = state if state and state != "offline" else row["rest_state"]
+    if state == "alarm":
+        rest = row["rest_state"] if row["rest_state"] not in ("", None, "alarm", "offline") else "unknown"
+    elif state in ("armed", "disarmed", "online"):
+        rest = state
+    else:
+        rest = row["rest_state"] or "unknown"
+    fresh_alarm = state == "alarm" and not info.get("heartbeat")
+    clear_ack = fresh_alarm or incoming == "restored"
     text = "" if info.get("heartbeat") else info.get("text") or ""
     with _db_lock, db() as c:
-        c.execute("UPDATE sia_accounts SET last_ts=?, last_text=CASE WHEN ?='' THEN last_text ELSE ? END, state=?, rest_state=?, offline_alerted=0 WHERE account=?",
-                  (now_ts, text, text, state or row["state"], rest or "unknown", account))
+        if clear_ack:
+            c.execute("""UPDATE sia_accounts SET last_ts=?, last_text=CASE WHEN ?='' THEN last_text ELSE ? END,
+                         state=?, rest_state=?, offline_alerted=0, ack_at=0, ack_by='' WHERE account=?""",
+                      (now_ts, text, text, state or row["state"], rest or "unknown", account))
+        else:
+            c.execute("""UPDATE sia_accounts SET last_ts=?, last_text=CASE WHEN ?='' THEN last_text ELSE ? END,
+                         state=?, rest_state=?, offline_alerted=0 WHERE account=?""",
+                      (now_ts, text, text, state or row["state"], rest or "unknown", account))
     if not info.get("heartbeat"):
         host = {"id": None, "name": row["name"], "host": account, "device_type": row["panel"]}
         add_event("alarm", "alarm", info["severity"], None,

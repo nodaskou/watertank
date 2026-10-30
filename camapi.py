@@ -6,7 +6,9 @@ so no camera is required. Passwords are not logged.
 import hashlib
 import os
 import re
+import socket
 import ssl
+import time
 import urllib.error
 import urllib.request
 from xml.etree import ElementTree
@@ -63,12 +65,14 @@ def parse_hik_storage(body):
         status = _xml_text(el, "status") or "unknown"
         cap = _num(_xml_text(el, "capacity"))
         free = _num(_xml_text(el, "freeSpace"))
+        problem = _disk_problem(status, cap, free)
         disks.append({
             "name": _xml_text(el, "hddName") or _xml_text(el, "id") or "disk",
             "status": status,
             "capacity_mb": cap,
             "free_mb": free,
-            "problem": _disk_problem(status, cap, free),
+            "problem": problem,
+            "errors": "yes" if problem else "none",
         })
     return disks
 
@@ -81,6 +85,13 @@ def parse_hik_channels(body):
         online = online_txt in ("true", "1", "yes")
         if online_txt in ("false", "0", "no"):
             online = False
+        loss_txt = (_xml_text(el, "videoLoss") or _xml_text(el, "VideoLoss")).lower()
+        if loss_txt in ("true", "1", "yes"):
+            video_loss = True
+        elif loss_txt in ("false", "0", "no"):
+            video_loss = False
+        else:
+            video_loss = None
         ip = ""
         for child in el.iter():
             if _local(child.tag) == "ipAddress" and child.text:
@@ -90,6 +101,7 @@ def parse_hik_channels(body):
             "id": _xml_text(el, "id") or str(len(out) + 1),
             "name": _xml_text(el, "channelName") or ip or "",
             "online": online if online_txt else None,
+            "video_loss": video_loss,
             "ip": ip,
         })
     return out
@@ -145,6 +157,7 @@ def parse_dahua_storage(body):
             "capacity_mb": None if cap_mb is None else round(cap_mb, 1),
             "free_mb": None if free_mb is None else round(free_mb, 1),
             "problem": problem,
+            "errors": "yes" if problem else "none",
         })
     return disks
 
@@ -202,7 +215,9 @@ def check_hikvision(fetch):
                 disks = parsed
             else:
                 channels = parsed
-        elif status not in (404, 0):
+        elif status == 0:
+            errors.append(body or f"{path}: no connection")
+        elif status not in (404,):
             errors.append(f"{path}: HTTP {status}")
     status, body = fetch("/ISAPI/ContentMgmt/record/tracks")
     if status == 200 and body:
@@ -226,6 +241,8 @@ def check_dahua(fetch):
         ok_any = True
         kv = parse_dahua_kv(body)
         info["model"] = kv.get("type") or kv.get("deviceType") or body.strip().splitlines()[0][:80]
+    elif status == 0:
+        errors.append(body or "deviceType: no connection")
     elif status:
         errors.append(f"deviceType: HTTP {status}")
     status, body = fetch("/cgi-bin/magicBox.cgi?action=getSoftwareVersion")
@@ -237,6 +254,8 @@ def check_dahua(fetch):
     if status == 200 and body:
         ok_any = True
         disks = parse_dahua_storage(body)
+    elif status == 0:
+        errors.append(body or "storage: no connection")
     elif status:
         errors.append(f"storage: HTTP {status}")
     status, body = fetch("/cgi-bin/eventManager.cgi?action=getEventIndexes&code=VideoLoss")
@@ -246,7 +265,7 @@ def check_dahua(fetch):
         ids = lost or set()
         # Also list a channel when the body names it. Offline/loss channels are the alert.
         for cid in sorted(ids, key=lambda x: int(x) if x.isdigit() else 0):
-            channels.append({"id": cid, "name": "", "online": False, "recording": None})
+            channels.append({"id": cid, "name": "", "online": False, "video_loss": True, "recording": None})
     return _result("dahua", ok_any, info, disks, channels, errors)
 
 
@@ -334,25 +353,130 @@ def _basic(user, password):
     return base64.b64encode(f"{user}:{password}".encode()).decode()
 
 
+def _transport_failure(exc):
+    reason = getattr(exc, "reason", exc)
+    text = str(reason or exc)
+    low = text.lower()
+    if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in low or "timeout" in low:
+        kind = "timeout"
+    elif isinstance(reason, ssl.SSLError) or "ssl" in low or "certificate" in low:
+        kind = "ssl"
+    elif isinstance(reason, ConnectionRefusedError) or "refused" in low or getattr(reason, "errno", None) in (111, 61):
+        kind = "refused"
+    else:
+        kind = "connect"
+    return 0, f"{kind}: {text}", ""
+
+
 def _open(fn):
     try:
         result = fn()
     except urllib.error.URLError as e:
-        return 0, "", ""
-    except TimeoutError:
-        return 0, "", ""
-    except OSError:
-        return 0, "", ""
+        return _transport_failure(e)
+    except TimeoutError as e:
+        return _transport_failure(e)
+    except OSError as e:
+        return _transport_failure(e)
     if len(result) == 2:
         return result[0], result[1], ""
     return result
 
 
-def fetch_for(base, user, password, timeout=12):
+def fetch_for(base, user, password, timeout=15):
+    """GET helper. The whole check stops after `timeout` seconds, not after each path."""
     root = base.rstrip("/")
+    deadline = time.monotonic() + timeout
+    calls = []
 
     def fetch(path):
-        status, body = http_get(root + path, user, password, timeout=timeout)
+        left = deadline - time.monotonic()
+        if left < 0.4:
+            detail = "timeout: the 15 second limit was used up"
+            calls.append({"path": path, "status": 0, "detail": detail})
+            return 0, detail
+        status, body = http_get(root + path, user, password, timeout=max(1, min(float(timeout), left)))
+        detail = "" if status == 200 else (body or "")
+        calls.append({"path": path, "status": status, "detail": detail[:300]})
         return status, body
 
+    fetch.calls = calls
     return fetch
+
+
+def hint_for(status, detail, brand):
+    """Plain hint for the NVR screen that matches this failure."""
+    text = (detail or "").lower()
+    if "timeout" in text:
+        return ("The recorder did not answer within about 15 seconds. Check the IP, "
+                "that this machine can reach it, and that HTTP or HTTPS is enabled on the NVR.")
+    if "refused" in text:
+        return ("Nothing is listening on that port. Hikvision: Configuration → Network → "
+                "Advanced Settings, HTTP is often 80 and HTTPS often 443. Dahua: Setup → Network → Port.")
+    if "ssl" in text or "certificate" in text:
+        return "TLS failed. Try HTTP on port 80, or HTTPS on 443. A self-signed certificate is accepted."
+    if status == 401:
+        return ("The user or password was rejected (HTTP 401). Use the same login as the NVR web page. "
+                "Hikvision: the user needs Remote Configuration. A wrong password and a digest-only login both look like this.")
+    if status == 403:
+        if brand == "hikvision":
+            return ("HTTP 403. ISAPI is off or this user may not use it. On the NVR: Configuration → Network → "
+                    "Advanced Settings → Integration Protocol → enable ISAPI, and allow this user.")
+        return "HTTP 403. This user cannot read the recorder. On the Dahua NVR give the account system and storage rights."
+    if status == 404:
+        return ("The recorder answered, but not on this brand's API (HTTP 404). Set Brand to Hikvision or Dahua. "
+                "Auto only follows the host type when that type is already Hikvision or Dahua.")
+    if status == 0:
+        return "Could not open a connection. Check the IP, the port, and that the NVR allows this machine."
+    return "Check the brand, the port, and that the user can read device information on the NVR."
+
+
+def explain_result(result, calls):
+    calls = list(calls or [])
+    result["calls"] = [{"path": c.get("path") or "", "status": c.get("status")} for c in calls]
+    for disk in result.get("disks") or []:
+        disk["errors"] = "yes" if disk.get("problem") else "none"
+    for ch in result.get("channels") or []:
+        ch.setdefault("video_loss", None)
+        ch.setdefault("recording", None)
+    if result.get("ok"):
+        result["http_status"] = 200
+        result.setdefault("hint", "")
+        result.setdefault("http_detail", "")
+        return result
+    bad = [c for c in calls if c.get("status") != 200]
+    chosen = None
+    for c in bad:
+        if c.get("status") in (401, 403, 0):
+            chosen = c
+            break
+    if chosen is None and bad:
+        chosen = bad[0]
+    if bad and all(c.get("status") == 404 for c in bad):
+        status = 404
+    else:
+        status = chosen.get("status") if chosen else 0
+    detail = ((chosen or {}).get("detail") or result.get("error") or "")[:400]
+    result["http_status"] = status
+    result["http_detail"] = detail
+    if not result.get("error"):
+        result["error"] = detail or "no reply"
+    result["hint"] = hint_for(status, (result.get("error") or "") + " " + detail, result.get("brand"))
+    return result
+
+
+def run_check(brand, base, user, password, timeout=15):
+    """One recorder check. `timeout` is the budget for every request together."""
+    if brand not in ("hikvision", "dahua"):
+        return explain_result({
+            "ok": False, "brand": brand or "", "device": {}, "disks": [], "channels": [],
+            "error": "Choose Hikvision or Dahua. Auto uses the host device type.",
+            "hint": "Set Brand to Hikvision or Dahua, or set the host type to one of those.",
+            "http_status": 0, "http_detail": "", "problems": [],
+        }, [])
+    fetch = fetch_for(base, user, password, timeout=timeout)
+    try:
+        result = check_device(brand, fetch)
+    except Exception as e:
+        result = {"ok": False, "brand": brand, "device": {}, "disks": [], "channels": [],
+                  "error": str(e), "problems": []}
+    return explain_result(result, fetch.calls)
