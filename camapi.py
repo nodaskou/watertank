@@ -46,16 +46,58 @@ def parse_hik_device(body):
     }
 
 
-_DISK_BAD = ("unformat", "error", "abnormal", "fail", "offline", "full", "smartfailed", "notexist")
+# Words that mean the disk itself is bad. "notexist" is not here: an empty bay is normal
+# until a disk that used to be there disappears. "sleeping" is a spun-down healthy disk.
+_DISK_BAD = ("unformat", "uninit", "error", "abnormal", "fail", "offline", "full", "smartfailed")
+_DISK_ASLEEP = ("sleep", "sleeping", "hibernate", "standby")
+_DISK_ABSENT = {"", "notexist", "notexists", "absent", "none", "nodisk", "empty", "unknown"}
+
+
+def _disk_status_key(status):
+    return (status or "").lower().replace(" ", "").replace("-", "").replace("_", "")
 
 
 def _disk_problem(status, capacity, free):
-    st = (status or "").lower().replace(" ", "")
+    st = _disk_status_key(status)
+    if st in _DISK_ASLEEP or st.startswith("sleep"):
+        return False
     if any(word in st for word in _DISK_BAD):
         return True
     if capacity and free is not None and capacity > 0 and free / capacity < 0.05:
         return True
     return False
+
+
+def _disk_present(disk):
+    """True when this slot holds a disk, including one that is asleep or failed."""
+    st = _disk_status_key(disk.get("status"))
+    if st in _DISK_ABSENT or st.startswith("notexist"):
+        return False
+    return True
+
+
+def disks_gone(previous, current):
+    """Critical problems for disks that were installed and are now missing or 'not exist'."""
+    cur = {}
+    for disk in current or []:
+        name = (disk.get("name") or "").strip()
+        if name:
+            cur[name] = disk
+    out = []
+    for old in previous or []:
+        name = (old.get("name") or "").strip()
+        if not name or not _disk_present(old):
+            continue
+        now = cur.get(name)
+        if now is None or not _disk_present(now):
+            out.append({
+                "key": f"disk-missing:{name}",
+                "kind": "cam_disk_missing",
+                "severity": "critical",
+                "title": f"Disk {name} missing",
+                "message": f"{name} was present and is now missing or not installed.",
+            })
+    return out
 
 
 def parse_hik_storage(body):

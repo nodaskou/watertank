@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_file, send_from_directory, session, url_for)
 
-VERSION = "2.3"
+VERSION = "3.0.0"
 APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
@@ -121,6 +121,7 @@ DEFAULTS = {
     "snmp_alert_ifdown": 1, "snmp_alert_reboot": 1, "snmp_forward_min": "warning",
     "trap_enabled": 0, "trap_host": "0.0.0.0", "trap_port": 1162, "trap_community": "", "trap_forward_min": "warning",
     "quiet_start": "", "quiet_end": "", "quiet_critical": 1,
+    "disk_repeat_min": 0,
     "maintenance_until": 0,
     "cam_interval": 900,
     "snmp_temp_threshold": 75, "snmp_util_threshold": 80,
@@ -2026,6 +2027,7 @@ header h1 span{overflow-wrap:anywhere}
 .snmpline{font-size:12.5px;color:#334155;margin:2px 0 8px}.lnk{display:inline-block;color:#fff;border-radius:6px;padding:1px 6px;margin:0 4px 3px 0;font-size:11.5px;font-weight:600}
 .lnk small{font-weight:400;opacity:.9}.kv td:first-child{color:#64748b;width:160px}
 code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
+footer.sitefoot{max-width:1240px;margin:0 auto;padding:0 20px 18px;color:#64748b;font-size:12px}
 """
 
 LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2041,6 +2043,7 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 </div></header><main>
 {% with m = get_flashed_messages() %}{% for x in m %}<div class="flash">{{ x }}</div>{% endfor %}{% endwith %}
 {{ body|safe }}</main>
+<footer class="sitefoot">""" + APP_NAME + """ {{ version }}</footer>
 {% if live %}<script>
 const LIVE = {{ live|tojson }};
 const EVERY = {{ ui_refresh|tojson }} * 1000;
@@ -2453,7 +2456,7 @@ def page(body_tpl, refresh=None, charts=False, live=None, **ctx):
     body = render_template_string(body_tpl, s=s, **ctx)
     ui = max(10, min(300, int(s.get("ui_refresh") or 30)))
     return render_template_string(LAYOUT, body=body, s=s, refresh=refresh, charts=charts, live=live, ui_refresh=ui,
-                                  hid=ctx.get("hid"))
+                                  hid=ctx.get("hid"), version=VERSION)
 
 
 def host_view(row, since, tz, full=False):
@@ -2894,13 +2897,15 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <label>Failed pings before alert</label><div><input type="number" name="fail_threshold" min="1" max="20" value="{{ s.fail_threshold }}">
 <p class="hint">Global default for how many missed pings in a row raise a DOWN alarm. Example: <code>3</code>. A host can override this with its own Fails column (0 on the host means “use this number”).</p></div>
 <label>Alarm repeat (minutes)</label><div><input type="number" name="repeat_min" min="0" max="1440" value="{{ s.repeat_min }}">
-<p class="hint">While a host stays down, send the alarm again every this many minutes. Example: <code>30</code>. Use <code>0</code> to never repeat. An empty Repeat field on the host uses this number.</p></div>
+<p class="hint">While a host stays down, send the alarm again every this many minutes. Example: <code>30</code>. Use <code>0</code> to never repeat. An empty Repeat field on the host uses this number. This counter is for pings. A failed disk does not wait for the failed-ping count.</p></div>
+<label>Disk reminder (minutes)</label><div><input type="number" name="disk_repeat_min" min="0" max="10080" value="{{ s.disk_repeat_min }}">
+<p class="hint">How often to remind you that a disk is still failed, unformatted, or missing. <code>0</code> uses the alarm repeat above. If that is also <code>0</code>, the reminder is once a day. Critical disk alerts are still sent during quiet hours when the option below is ticked.</p></div>
 <label>Quiet hours start</label><div><input type="time" name="quiet_start" value="{{ s.quiet_start }}">
 <p class="hint">Local time when non-critical alerts start waiting. Example: <code>22:00</code>. Leave both times empty to turn quiet hours off.</p></div>
 <label>Quiet hours end</label><div><input type="time" name="quiet_end" value="{{ s.quiet_end }}">
 <p class="hint">Local time when queued alerts are sent. Example: <code>07:00</code>. Overnight windows (22:00 to 07:00) are fine. A start that equals the end means off.</p></div>
 <label>Critical alerts during quiet hours</label><div><input type="checkbox" name="quiet_critical" value="1" {{ 'checked' if s.quiet_critical }}>
-<p class="hint">Keep sending critical alarms (host down, panel alarm) during quiet hours. Untick to queue those as well.</p></div>
+<p class="hint">Keep sending critical alarms during quiet hours, including a failed disk and a host that is down. Untick to queue those as well. The failed-ping count does not apply to disks.</p></div>
 <label>Site maintenance until</label><div><input type="datetime-local" name="maintenance_until" value="{{ ts_to_local_input(s.maintenance_until) }}">
 <p class="hint">No alerts for any host until this local time. Clear the field and save to turn it off. A single host can have its own window in the Hosts table.</p></div>
 <label>Events kept in the log</label><div><input type="number" name="event_keep" min="10" max="5000" value="{{ s.event_keep }}">
@@ -3117,7 +3122,7 @@ BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_
 SECTIONS = {
     "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "ui_refresh", "retention_days",
                 "ping_method", "public_url", "dashboard_access"],
-    "alerts": ["fail_threshold", "repeat_min", "quiet_start", "quiet_end", "quiet_critical", "maintenance_until", "event_keep"],
+    "alerts": ["fail_threshold", "repeat_min", "disk_repeat_min", "quiet_start", "quiet_end", "quiet_critical", "maintenance_until", "event_keep"],
     "internet": ["wan_enabled", "wan_targets", "wan_loss_pct", "wan_latency_ms", "wan_count"],
     "backups": ["mt_backup_day", "mt_backup_time", "mt_backup_keep"],
     "telegram": ["telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_photos"],
@@ -3139,7 +3144,7 @@ CHOICES = {"ping_method": {"auto", "icmplib", "system"}, "dashboard_access": {"l
 RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold": (1, 20), "repeat_min": (0, 1440), "ui_refresh": (10, 300), "retention_days": (1, 365),
           "smtp_port": (1, 65535), "rx_port": (1, 65535), "rx_rate_limit": (0, 86400),
           "snmp_interval": (30, 3600), "snmp_timeout": (1, 10), "snmp_cpu_threshold": (0, 100), "trap_port": (1, 65535),
-          "event_keep": (10, 5000), "wan_loss_pct": (1, 100), "wan_latency_ms": (1, 10000), "wan_count": (1, 20),
+          "event_keep": (10, 5000), "disk_repeat_min": (0, 10080), "wan_loss_pct": (1, 100), "wan_latency_ms": (1, 10000), "wan_count": (1, 20),
           "snmp_temp_threshold": (0, 150), "snmp_util_threshold": (0, 100), "ups_runtime_min": (0, 1440), "ups_load_pct": (0, 100),
           "mt_backup_day": (0, 6), "mt_backup_keep": (1, 520)}
 
@@ -3840,11 +3845,11 @@ def _run_camera_test(host, cfg):
     port = int(cfg.get("port") or (443 if scheme == "https" else 80))
     base = f"{scheme}://{host['host']}:{port}"
     result = camapi.run_check(brand, base, cfg.get("user") or "", password, timeout=15)
-    result["ts"] = time.time()
-    with _db_lock, db() as c:
-        c.execute("INSERT OR REPLACE INTO cam_state(host_id, ts, data) VALUES(?,?,?)",
-                  (host["id"], result["ts"], json.dumps(result)))
-    return result
+    now = time.time()
+    with db() as c:
+        prev_row = c.execute("SELECT ts, data FROM cam_state WHERE host_id=?", (host["id"],)).fetchone()
+    # Test shows the result but does not mark the problems as already alerted.
+    return jobs.apply_camera_result(sys.modules[__name__], host, result, False, prev_row, now)
 
 
 @app.route("/settings/hosts/<int:hid>/camera", methods=["GET", "POST"])
@@ -4691,6 +4696,7 @@ def backup_local_download(name):
 def main():
     global DB_PATH, DATA_DIR, SNAP_DIR
     ap = argparse.ArgumentParser(description=APP_NAME + " v" + VERSION)
+    ap.add_argument("--version", action="version", version=APP_NAME + " " + VERSION)
     ap.add_argument("--host", default=os.environ.get("PINGMON_HOST", "127.0.0.1"), help="web bind address (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=int(os.environ.get("PINGMON_PORT", 8080)), help="web port (default 8080)")
     ap.add_argument("--db", default=os.environ.get("PINGMON_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pingmonitor.db")),

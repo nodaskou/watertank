@@ -239,7 +239,8 @@ def build_pdf(data, logo_path=None):
         f"{t['info']}: {counts.get('info', 0)}",
         styles["body"]))
     story.append(Spacer(1, 6 * mm))
-    story.append(Paragraph(t["footer"], styles["footer"]))
+    ver = data.get("version") or ""
+    story.append(Paragraph(t["footer"] + (f"  ·  v{ver}" if ver else ""), styles["footer"]))
 
     def _page(canvas, doc_):
         canvas.saveState()

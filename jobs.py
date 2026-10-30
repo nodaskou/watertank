@@ -299,6 +299,90 @@ def flush_quiet(pm):
               pm.build_payload(s, "quiet_digest", None, None, severity="info", message=text))
 
 
+def disk_repeat_seconds(s):
+    """How often to remind about a disk that is still failed.
+
+    A positive Disk reminder setting wins. Otherwise the global alarm repeat is used.
+    If that is also 0 (never repeat ping alarms), a failed disk is still mentioned once a day.
+    Ping fail-count is not used here.
+    """
+    try:
+        chosen = int(s.get("disk_repeat_min") or 0)
+    except (TypeError, ValueError):
+        chosen = 0
+    if chosen > 0:
+        return chosen * 60
+    try:
+        global_rep = int(s.get("repeat_min") or 0)
+    except (TypeError, ValueError):
+        global_rep = 0
+    if global_rep > 0:
+        return global_rep * 60
+    return 24 * 3600
+
+
+def apply_camera_result(pm, host, result, notify, prev_row, now):
+    """Store a camera check. `notify` is false for a manual Test so it cannot swallow later alerts.
+
+    The notified map is separate from the problem list. A problem with no prior notice is
+    alerted on the first scheduled check. Critical disk problems are repeated on the disk
+    reminder interval. consider_notify sends critical alerts during quiet hours when that
+    option is on (the default).
+    """
+    prev = {}
+    if prev_row and prev_row["data"]:
+        try:
+            prev = json.loads(prev_row["data"])
+        except (TypeError, ValueError):
+            prev = {}
+    problems = list(result.get("problems") or [])
+    have = {p.get("key") for p in problems}
+    for item in camapi.disks_gone(prev.get("disks") or [], result.get("disks") or []):
+        if item["key"] not in have:
+            problems.append(item)
+            have.add(item["key"])
+    result["problems"] = problems
+    notified = {k: float(v) for k, v in (prev.get("notified") or {}).items()}
+    if not notify:
+        result["notified"] = notified
+        result["ts"] = now
+        with pm._db_lock, pm.db() as c:
+            c.execute("INSERT OR REPLACE INTO cam_state(host_id, ts, data) VALUES(?,?,?)",
+                      (host["id"], now, json.dumps(result)))
+        return result
+    s = pm.get_settings()
+    repeat = disk_repeat_seconds(s)
+    for prob in problems:
+        key = prob.get("key")
+        last = notified.get(key)
+        diskish = str(prob.get("kind") or "").startswith("cam_disk")
+        remind = bool(last) and diskish and prob.get("severity") == "critical" and (now - last >= repeat)
+        if last and not remind:
+            continue
+        title = prob["title"] + (" (still)" if remind else "")
+        pm.add_event("cam", prob["kind"], prob["severity"], host, title, prob["message"], {"key": key})
+        pm.consider_notify(s, host, prob["severity"], f"[{s['site_name']}] {title}: {host['name']}",
+                           prob["message"],
+                           pm.build_payload(s, "device_alert", None, host, severity=prob["severity"],
+                                            message=prob["message"]))
+        notified[key] = now
+    for key in list(notified):
+        if key not in have:
+            pm.add_event("cam", "cam_recovered", "info", host, "Camera check recovered",
+                         f"{key} is OK again.", {"key": key})
+            pm.consider_notify(s, host, "info", f"[{s['site_name']}] Camera check recovered: {host['name']}",
+                               f"{key} is OK again.",
+                               pm.build_payload(s, "device_alert", None, host, severity="info",
+                                                message=f"{key} is OK again."))
+            del notified[key]
+    result["notified"] = notified
+    result["ts"] = now
+    with pm._db_lock, pm.db() as c:
+        c.execute("INSERT OR REPLACE INTO cam_state(host_id, ts, data) VALUES(?,?,?)",
+                  (host["id"], now, json.dumps(result)))
+    return result
+
+
 def camera_poll(pm, only_id=None):
     s = pm.get_settings()
     interval = max(60, int(s.get("cam_interval") or 900))
@@ -326,33 +410,10 @@ def camera_poll(pm, only_id=None):
         port = int(cfg.get("port") or (443 if scheme == "https" else 80))
         base = f"{scheme}://{host['host']}:{port}"
         result = camapi.run_check(brand, base, cfg.get("user") or "", password, timeout=15)
-        prev = {}
-        if prev_row and prev_row["data"]:
-            try:
-                prev = json.loads(prev_row["data"])
-            except (TypeError, ValueError):
-                prev = {}
-        seen = {p.get("key") for p in prev.get("problems") or []}
-        if prev_row:
-            for prob in result.get("problems") or []:
-                if prob["key"] in seen:
-                    continue
-                pm.add_event("cam", prob["kind"], prob["severity"], host, prob["title"], prob["message"],
-                             {"key": prob["key"]})
-                pm.consider_notify(s, host, prob["severity"], f"[{s['site_name']}] {prob['title']}: {host['name']}",
-                                   prob["message"],
-                                   pm.build_payload(s, "device_alert", None, host, severity=prob["severity"],
-                                                    message=prob["message"]))
-            gone = seen - {p.get("key") for p in result.get("problems") or []}
-            for key in gone:
-                pm.add_event("cam", "cam_recovered", "info", host, "Camera check recovered",
-                             f"{key} is OK again.", {"key": key})
-        result["ts"] = now
-        with pm._db_lock, pm.db() as c:
-            c.execute("INSERT OR REPLACE INTO cam_state(host_id, ts, data) VALUES(?,?,?)",
-                      (host["id"], now, json.dumps(result)))
+        # A manual Test stores the reading but does not mark problems as already notified.
+        saved = apply_camera_result(pm, host, result, notify=not only_id, prev_row=prev_row, now=now)
         if only_id:
-            return result
+            return saved
     return None
 
 
@@ -598,4 +659,5 @@ def report_context(pm, start, end, lang, site):
         "bandwidth": bands[:40],
         "power": power,
         "alerts": counts,
+        "version": getattr(pm, "VERSION", ""),
     }
