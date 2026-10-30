@@ -162,6 +162,61 @@ def _ts_reason(mode, limit, frame_ts, server_utc, delta):
             f"frame {frame_ts} as UTC, server {server_utc}, {format_delta(delta)})")
 
 
+def clock_warning(delta_s):
+    """Owner-facing line when the panel clock is off by a minute or more."""
+    if delta_s is None:
+        return ""
+    minutes = int(round(abs(int(delta_s)) / 60.0))
+    if minutes < 1:
+        return ""
+    return f"panel clock is {minutes} min off — set NTP on the panel"
+
+
+_PEEK_TS = re.compile(r"_(\d{2}:\d{2}:\d{2},\d{2}-\d{2}-\d{4})")
+_PEEK_PROTO = re.compile(r'"(NULL|SIA-DCS|ADM-CID)"')
+_PEEK_ACCT = re.compile(r"#([A-Fa-f0-9]{3,16})")
+
+
+def peek_frame(line):
+    """Pull protocol, account and clock digits out of a raw frame.
+
+    Used when the library rejects the line before it hands back those fields,
+    so the listen log can still show what arrived. The timestamp digits are
+    labeled UTC, the same way the parser does, and are not shifted for timezone.
+    """
+    text = (line or "").strip("\r\n\x00 ")
+    proto_m = _PEEK_PROTO.search(text)
+    acct_m = _PEEK_ACCT.search(text)
+    ts_m = _PEEK_TS.search(text)
+    stamp = None
+    if ts_m:
+        try:
+            stamp = datetime.strptime(ts_m.group(1), "%H:%M:%S,%m-%d-%Y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            stamp = None
+    return {
+        "protocol": proto_m.group(1) if proto_m else "",
+        "account": acct_m.group(1).upper() if acct_m else "",
+        "stamp": stamp,
+    }
+
+
+# Consecutive frames within this many seconds share one learned skew.
+SKEW_SLACK = 90
+SKEW_NEED = 3
+
+
+def next_skew(prev_s, prev_n, delta):
+    """Track a stable panel skew. Returns (skew_seconds, count, learned)."""
+    if delta is None:
+        return prev_s, int(prev_n or 0), int(prev_n or 0) >= SKEW_NEED and prev_s is not None
+    delta = int(delta)
+    if prev_s is None or abs(delta - int(prev_s)) > SKEW_SLACK:
+        return delta, 1, False
+    count = int(prev_n or 0) + 1
+    return delta, count, count >= SKEW_NEED
+
+
 def normalize(line):
     """Accept the small differences the four brands send.
 

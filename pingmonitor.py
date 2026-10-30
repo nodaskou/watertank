@@ -209,7 +209,8 @@ def _migrate(c):
             key_enc TEXT NOT NULL DEFAULT '', supervise_min INTEGER NOT NULL DEFAULT 10,
             last_ts REAL, last_text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'unknown',
             rest_state TEXT NOT NULL DEFAULT 'unknown', offline_alerted INTEGER NOT NULL DEFAULT 0,
-            ts_mode TEXT NOT NULL DEFAULT '');
+            ts_mode TEXT NOT NULL DEFAULT '',
+            skew_s INTEGER, skew_n INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sia_log(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL DEFAULT '',
             raw TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
@@ -218,6 +219,8 @@ def _migrate(c):
             delta_s INTEGER, flag TEXT NOT NULL DEFAULT '');
     """)
     _add_col(c, "sia_accounts", "ts_mode", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "sia_accounts", "skew_s", "INTEGER")
+    _add_col(c, "sia_accounts", "skew_n", "INTEGER NOT NULL DEFAULT 0")
     _add_col(c, "sia_log", "protocol", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "frame_ts", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "server_utc", "TEXT NOT NULL DEFAULT ''")
@@ -3796,48 +3799,93 @@ def _clock_for(account_mode):
     return mode, max(20, min(window, 86400)), tzinfo()
 
 
-def on_sia_frame(line, peer):
+def _frame_clock(line, info, mode, window, zone, now):
+    """Protocol, account and clock for the log, even when parsing stopped early.
+
+    pysiaalarm's valid_timestamp is not used. Digits are read as UTC and compared
+    with UTC ``now``. A missing library timestamp is taken from the raw text.
+    """
+    peek = siarecv.peek_frame(line)
+    protocol = info.get("protocol") or peek["protocol"] or ""
+    if info.get("heartbeat") or protocol == "NULL":
+        protocol = "NULL"
+    account = (info.get("account") or peek["account"] or "")
+    stamp = info.get("stamp") if info.get("stamp") is not None else peek["stamp"]
+    decision = siarecv.judge_timestamp(stamp, mode, window, zone, now=now)
+    return protocol, account, decision
+
+
+def _remember_clock(peer, line, ok, reason, account, protocol, decision):
+    decision = decision or {}
+    _sia_remember(peer, line, ok, reason, account, protocol,
+                  decision.get("frame_ts") or "", decision.get("server_utc") or "",
+                  decision.get("delta_s"), decision.get("flag") or "")
+
+
+def on_sia_frame(line, peer, now=None):
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
     s = get_settings()
     if not ip_allowed(peer, s.get("rx_allowed_nets")):
         log.warning("SIA from %s ignored (not in allowed networks)", peer)
-        _sia_remember(peer, line, False, "not in allowed networks")
+        mode, window, zone = _clock_for("")
+        protocol, account, decision = _frame_clock(line, {}, mode, window, zone, moment)
+        _remember_clock(peer, line, False, "not in allowed networks", account, protocol, decision)
         return {"ok": False, "error": "not in allowed networks",
                 "reply": siarecv._response("NAK", "0000", "R0", "L0", "000")}
     info = siarecv.parse_line(line, _sia_map())
+    # Do not consult event.valid_timestamp. A NULL line still carries a clock.
+    mode, window, zone = _clock_for("")
+    protocol, account, decision = _frame_clock(line, info, mode, window, zone, moment)
     if not info.get("ok"):
         log.info("SIA reject from %s: %s", peer, info.get("error"))
-        _sia_remember(peer, line, False, info.get("error") or "rejected", info.get("account") or "",
-                      info.get("protocol") or "")
+        _remember_clock(peer, line, False, info.get("error") or "rejected", account, protocol, decision)
         return info
-    account = info.get("account") or ""
-    now = time.time()
+    account = info.get("account") or account
+    now_ts = time.time()
     with db() as c:
         row = c.execute("SELECT * FROM sia_accounts WHERE account=?", (account,)).fetchone()
     if not row:
-        _sia_remember(peer, line, False, "unknown account", account, info.get("protocol") or "")
+        _remember_clock(peer, line, False, "unknown account", account, protocol, decision)
         info["ok"] = False
         info["error"] = "unknown account"
         info["reply"] = siarecv._response("NAK", info.get("sequence"), info.get("receiver"), info.get("line"), account)
         return info
     mode, window, zone = _clock_for(row["ts_mode"] if "ts_mode" in row.keys() else "")
-    decision = siarecv.judge_timestamp(info.get("stamp"), mode, window, zone)
+    protocol, account, decision = _frame_clock(line, info, mode, window, zone, moment)
+    prev_s = row["skew_s"] if "skew_s" in row.keys() else None
+    prev_n = row["skew_n"] if "skew_n" in row.keys() else 0
+    skew_s, skew_n, learned = siarecv.next_skew(prev_s, prev_n, decision.get("delta_s"))
+    # A learned skew lets later events through. NULL heartbeats never wait for that:
+    # a wrong clock must not make the panel look offline.
+    if not decision["accept"] and learned and decision.get("delta_s") is not None:
+        if abs(int(decision["delta_s"]) - int(skew_s)) <= siarecv.SKEW_SLACK:
+            decision = dict(decision, accept=True, reason="", flag=siarecv.clock_warning(decision["delta_s"]))
+    if info.get("heartbeat"):
+        # CRC and account already checked. Never NAK a NULL only because the clock is wrong.
+        warn = "" if decision["accept"] else siarecv.clock_warning(decision.get("delta_s"))
+        decision = dict(decision, accept=True, reason="", flag=warn or decision.get("flag") or "")
+    with _db_lock, db() as c:
+        c.execute("UPDATE sia_accounts SET skew_s=?, skew_n=? WHERE account=?", (skew_s, skew_n, account))
     if not decision["accept"]:
         log.info("SIA timestamp reject from %s account %s: %s", peer, account, decision["reason"])
-        _sia_remember(peer, line, False, decision["reason"], account, info.get("protocol") or "",
-                      decision["frame_ts"], decision["server_utc"], decision["delta_s"], decision["flag"])
+        _remember_clock(peer, line, False, decision["reason"], account, protocol, decision)
         info["ok"] = False
         info["error"] = decision["reason"]
-        info["reply"] = siarecv.nak_frame(info.get("sequence"), info.get("receiver"), info.get("line"), account)
+        info["reply"] = siarecv.nak_frame(info.get("sequence"), info.get("receiver"), info.get("line"), account, when=moment)
         return info
-    info["ts_flag"] = decision["flag"]
+    info["ts_flag"] = decision.get("flag") or ""
     state = info.get("state") or (row["rest_state"] if info.get("heartbeat") and row["state"] == "offline" else row["state"])
     if info.get("heartbeat") and row["state"] == "offline":
-        state = row["rest_state"] or "unknown"
+        state = row["rest_state"] or "online"
+    if info.get("heartbeat") and state in ("unknown", "", None):
+        state = "online"
     rest = state if state and state != "offline" else row["rest_state"]
     text = "" if info.get("heartbeat") else info.get("text") or ""
     with _db_lock, db() as c:
         c.execute("UPDATE sia_accounts SET last_ts=?, last_text=CASE WHEN ?='' THEN last_text ELSE ? END, state=?, rest_state=?, offline_alerted=0 WHERE account=?",
-                  (now, text, text, state or row["state"], rest or "unknown", account))
+                  (now_ts, text, text, state or row["state"], rest or "unknown", account))
     if not info.get("heartbeat"):
         host = {"id": None, "name": row["name"], "host": account, "device_type": row["panel"]}
         add_event("alarm", "alarm", info["severity"], None,
@@ -3853,8 +3901,7 @@ def on_sia_frame(line, peer):
     reason = "heartbeat" if info.get("heartbeat") else (info.get("text") or "accepted")
     if decision["flag"]:
         reason = f"{reason} · {decision['flag']}"
-    _sia_remember(peer, line, True, reason, account, info.get("protocol") or "",
-                  decision["frame_ts"], decision["server_utc"], decision["delta_s"], decision["flag"])
+    _remember_clock(peer, line, True, reason, account, protocol, decision)
     return info
 
 
@@ -4007,6 +4054,9 @@ def alarm_settings():
         log_rows = [dict(r) for r in c.execute("SELECT * FROM sia_log ORDER BY id DESC LIMIT 20")]
     for row in rows:
         row["seen"] = fmt_ts(row["last_ts"]) if row["last_ts"] else "never"
+        skew = row.get("skew_s")
+        row["skew_text"] = siarecv.clock_warning(skew)
+        row["skew_signed"] = siarecv.format_delta(skew) if skew is not None else ""
     log_rows = _sia_log_view(log_rows)
     body = SETTINGS_NAV + """<div class="card"><h2>Alarms (SIA DC-09)</h2>
 <p class="section-intro"><b>Information only.</b> This is not a certified alarm receiving centre (ARC/CMS). Keep Ajax, TrikdisConfig/Protegus, Hik-Connect and the Dahua app as the primary monitoring. TRK, the proprietary Trikdis protocol, is not supported — use SIA DC-09.</p>
@@ -4025,7 +4075,7 @@ def alarm_settings():
 <option value="local" {{ 'selected' if s.sia_ts_mode=='local' }}>Panel uses local time</option>
 <option value="off" {{ 'selected' if s.sia_ts_mode=='off' }}>Off (ignore the clock)</option>
 </select>
-<p class="hint">The digits in the frame are compared with UTC now. Strict is ±20 seconds. Tolerant is the window below (default 10 minutes). Panel uses local time subtracts this site's timezone offset, including daylight saving, and then uses that window. Off accepts any clock. If the gap is within 2 minutes of the site's UTC offset, the frame is accepted anyway and marked “panel sends local time”.</p></div>
+<p class="hint">The digits in the frame are compared with UTC now. Strict is ±20 seconds. Tolerant is the window below (default 10 minutes). Panel uses local time subtracts this site's timezone offset, including daylight saving, and then uses that window. Off ignores the clock. NULL heartbeats are accepted even when the clock is wrong, so a bad clock cannot show the panel offline. If several frames share the same skew, later events are accepted too and the account is marked “panel clock is N min off — set NTP on the panel”. A gap within 2 minutes of the site's UTC offset is marked “panel sends local time”.</p></div>
 <label>Tolerant window (minutes)</label><div><input type="number" name="sia_ts_window_min" min="1" max="1440" value="{{ (s.sia_ts_window or 600) // 60 }}">
 <p class="hint">Used by Tolerant, and after the local-time offset is removed. Example: <code>10</code>.</p></div>
 <span></span><div><button>Save receiver</button></div></div></form>
@@ -4061,9 +4111,11 @@ def alarm_settings():
 <li><b>Hikvision AX PRO / AX Hybrid</b> — Hik-Connect or the panel web page → Communication → Alarm receiving centre. Protocol SIA-DCS or ADM-CID, this IP and port, account, optional encryption, and a heartbeat interval.</li>
 <li><b>Dahua AirShield / ARC</b> — ARC settings → SIA DC-09 or Contact ID over IP. Account, this IP and port, heartbeat. Camera and NVR events stay on the camera API and the e-mail receiver, not here.</li>
 </ul>
-<div class="table-wrap"><table><tr><th>Name</th><th>Account</th><th>Panel</th><th>Clock</th><th>State</th><th>Last heard</th><th></th></tr>
-{% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.ts_mode or 'global' }}</td><td>{{ a.state }}</td><td>{{ a.seen }}</td>
-<td><button form="del{{ a.account }}" class="del">Delete</button></td></tr>{% else %}<tr><td colspan="7" class="muted">No accounts yet.</td></tr>{% endfor %}</table></div>
+<div class="table-wrap"><table><tr><th>Name</th><th>Account</th><th>Panel</th><th>Clock</th><th>Skew</th><th>State</th><th>Last heard</th><th></th></tr>
+{% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.ts_mode or 'global' }}</td>
+<td>{% if a.skew_text %}{{ a.skew_signed }} · {{ a.skew_text }}{% else %}—{% endif %}</td>
+<td>{{ a.state }}</td><td>{{ a.seen }}</td>
+<td><button form="del{{ a.account }}" class="del">Delete</button></td></tr>{% else %}<tr><td colspan="8" class="muted">No accounts yet.</td></tr>{% endfor %}</table></div>
 {% for a in rows %}<form id="del{{ a.account }}" method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="delete" value="{{ a.account }}"></form>{% endfor %}
 <h2>Last raw frames</h2>
 <p class="hint">Accepted and rejected. Frame time is the clock digits in the message, read as UTC. Difference is that time minus server UTC. A NAK for a clock rejection includes the server's UTC time so the panel can sync.</p>
