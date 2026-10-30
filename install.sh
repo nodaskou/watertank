@@ -99,6 +99,7 @@ main() {
   mkdir -p "$DATA_DIR" "$APP_DIR/assets"
   install -m 0644 "$SRC_DIR/pingmonitor.py" "$SRC_DIR/wirelogic.py" "$SRC_DIR/camapi.py" \
     "$SRC_DIR/mtbackup.py" "$SRC_DIR/reportpdf.py" "$SRC_DIR/jobs.py" "$SRC_DIR/siarecv.py" \
+    "$SRC_DIR/configbackup.py" \
     "$SRC_DIR/requirements.txt" "$APP_DIR/"
   if [[ -f "$SRC_DIR/assets/wirewave_logo.jpg" ]]; then
     install -m 0644 "$SRC_DIR/assets/wirewave_logo.jpg" "$APP_DIR/assets/wirewave_logo.jpg"
