@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_file, send_from_directory, session, url_for)
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
@@ -134,6 +134,8 @@ DEFAULTS = {
     "sia_enabled": 0, "sia_host": "0.0.0.0", "sia_port": 12128, "sia_tcp": 1, "sia_udp": 1,
     # strict ±20s, tolerant (sia_ts_window seconds), local (panel clock is site local), off
     "sia_ts_mode": "tolerant", "sia_ts_window": 600,
+    # Periodic SIA tests and NULL heartbeats stay off the log unless this is on.
+    "sia_log_tests": 0,
 }
 INT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, int)}
 SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password"}
@@ -213,7 +215,8 @@ def _migrate(c):
             rest_state TEXT NOT NULL DEFAULT 'unknown', offline_alerted INTEGER NOT NULL DEFAULT 0,
             ts_mode TEXT NOT NULL DEFAULT '',
             skew_s INTEGER, skew_n INTEGER NOT NULL DEFAULT 0,
-            ack_at REAL NOT NULL DEFAULT 0, ack_by TEXT NOT NULL DEFAULT '');
+            ack_at REAL NOT NULL DEFAULT 0, ack_by TEXT NOT NULL DEFAULT '',
+            last_test REAL, last_event_ts REAL);
         CREATE TABLE IF NOT EXISTS sia_log(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL DEFAULT '',
             raw TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
@@ -226,6 +229,10 @@ def _migrate(c):
     _add_col(c, "sia_accounts", "skew_n", "INTEGER NOT NULL DEFAULT 0")
     _add_col(c, "sia_accounts", "ack_at", "REAL NOT NULL DEFAULT 0")
     _add_col(c, "sia_accounts", "ack_by", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "sia_accounts", "last_test", "REAL")
+    _add_col(c, "sia_accounts", "last_event_ts", "REAL")
+    c.execute("""UPDATE sia_accounts SET last_event_ts=last_ts
+                 WHERE last_event_ts IS NULL AND last_text!='' AND last_ts IS NOT NULL""")
     _add_col(c, "sia_log", "protocol", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "frame_ts", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "server_utc", "TEXT NOT NULL DEFAULT ''")
@@ -683,6 +690,72 @@ def notify(subject, text, payload, photo=None, sync=False):
         threading.Thread(target=run, daemon=True).start()
 
 
+def event_mark(source, severity, kind=""):
+    """Emoji in front of a log title. The siren is only a real alarm (BA, FA, PA and the same class)."""
+    if kind == "log_cleared":
+        mark = "🧹"
+    elif source == "alarm" and severity == "critical":
+        mark = "🚨"
+    elif source == "mail":
+        mark = "📧"
+    elif source == "snmp":
+        mark = "📡"
+    elif severity == "critical" or kind == "host_down":
+        mark = "🔴"
+    elif severity == "warning":
+        mark = "⚠️"
+    elif source == "alarm":
+        mark = ""
+    else:
+        mark = "✅"
+    return (mark + " ") if mark else ""
+
+
+def last_cleared_text(tz=None):
+    """When the log was last emptied, from the single 'Log cleared' entry."""
+    tz = tz or tzinfo()
+    try:
+        with db() as c:
+            row = c.execute("SELECT ts FROM events WHERE kind='log_cleared' ORDER BY id DESC LIMIT 1").fetchone()
+    except Exception:
+        return ""
+    if not row or not row["ts"]:
+        return ""
+    return fmt_ts(row["ts"], tz)
+
+
+def clear_event_log(actor, ip):
+    """Delete log history only. Host, disk and alarm state stay as they are.
+
+    Leaves exactly one new entry so the log shows who cleared it and when.
+    """
+    actor = (actor or "admin").strip() or "admin"
+    ip = (ip or "").strip() or "unknown"
+    now = time.time()
+    names = []
+    with _db_lock, db() as c:
+        for row in c.execute("SELECT attachments FROM events"):
+            try:
+                names.extend(json.loads(row["attachments"] or "[]"))
+            except (TypeError, ValueError):
+                pass
+        c.execute("DELETE FROM events")
+        add_event("log", "log_cleared", "info",
+                  {"id": None, "name": actor, "host": ip},
+                  "Log cleared", f"Cleared by {actor} from {ip}",
+                  {"by": actor, "ip": ip}, ts=now, conn=c)
+    if SNAP_DIR:
+        for name in names:
+            safe = os.path.basename(str(name))
+            if not safe or safe in (".", ".."):
+                continue
+            try:
+                os.remove(os.path.join(SNAP_DIR, safe))
+            except OSError:
+                pass
+    return now
+
+
 def add_event(source, kind, severity, host=None, title="", message="", details=None, attachments=None, ts=None, conn=None):
     if conn is None:
         with _db_lock, db() as c:
@@ -837,9 +910,14 @@ def _alarm_rows(tz):
             label, cls = "Unknown", "p"
         brand, color = PANEL_FACE.get(r["panel"], PANEL_FACE["other"])
         skew = r["skew_s"] if "skew_s" in r.keys() else None
+        event_ts = r["last_event_ts"] if "last_event_ts" in r.keys() else None
+        seen_ts = r["last_ts"]
+        test_ts = r["last_test"] if "last_test" in r.keys() else None
         out.append({
             "name": r["name"], "panel": r["panel"], "account": r["account"], "state": state,
-            "last_text": r["last_text"] or "", "last_time": fmt_ts(r["last_ts"], tz) if r["last_ts"] else "",
+            "last_text": r["last_text"] or "", "last_time": fmt_ts(event_ts, tz) if event_ts else "",
+            "seen": fmt_ts(seen_ts, tz) if seen_ts else "",
+            "test_time": fmt_ts(test_ts, tz) if test_ts else "",
             "site": site, "brand": brand, "color": color, "label": label, "cls": cls,
             "flash": state == "alarm" and not acked, "acked": acked,
             "ack_by": (r["ack_by"] if "ack_by" in r.keys() else "") or "",
@@ -889,7 +967,7 @@ def _status_bar(hosts, wan, alarms):
             reasons.append("Alarm: " + (alarm.get("last_text") or alarm.get("name") or "panel")[:48])
             worse("bad")
         elif alarm.get("state") == "offline":
-            reasons.append("Panel offline: " + alarm.get("name", ""))
+            reasons.append("panel communication lost: " + (alarm.get("name") or ""))
             worse("bad")
     return {
         "level": level,
@@ -2069,13 +2147,23 @@ function touchChart(id, assign){
   }
   ch.update('none');
 }
+function eventMark(e){
+  if(e.kind==='log_cleared') return '🧹 ';
+  if(e.source==='alarm' && e.severity==='critical') return '🚨 ';
+  if(e.source==='mail') return '📧 ';
+  if(e.source==='snmp') return '📡 ';
+  if(e.severity==='critical') return '🔴 ';
+  if(e.severity==='warning') return '⚠️ ';
+  if(e.source==='alarm') return '';
+  return '✅ ';
+}
 function paintEvents(rows){
   const body=document.getElementById('events-body'); if(!body) return;
   const sig=JSON.stringify(rows||[]);
   if(body.dataset.sig===sig) return;
   body.dataset.sig=sig;
   if(!rows || !rows.length){ body.innerHTML='<tr><td colspan="5" class="muted">No events yet.</td></tr>'; return; }
-  body.innerHTML=rows.map(e=>'<tr><td style="white-space:nowrap">'+esc(e.time)+'</td><td>'+esc(e.who)+'</td><td><span class="badge sev-'+esc(e.severity)+'">'+esc(e.severity)+'</span> '+(e.source==='alarm'?'🚨 ':(e.source==='mail'?'📧 ':(e.source==='snmp'?'📡 ':'')))+esc(e.title)+'</td><td class="muted">'+esc(e.message)+'</td><td></td></tr>').join('');
+  body.innerHTML=rows.map(e=>'<tr><td style="white-space:nowrap">'+esc(e.time)+'</td><td>'+esc(e.who)+'</td><td><span class="badge sev-'+esc(e.severity)+'">'+esc(e.severity)+'</span> '+eventMark(e)+esc(e.title)+'</td><td class="muted">'+esc(e.message)+'</td><td></td></tr>').join('');
 }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function paintAlarms(rows){
@@ -2091,18 +2179,19 @@ function paintAlarms(rows){
   const bar=document.getElementById('bar');
   if(bar) bar.classList.toggle('alarm', hot);
   if(grid){
-    const sig=JSON.stringify(list.map(a=>({a:a.account,s:a.state,f:a.flash,t:a.last_text,k:a.acked,w:a.skew})));
+    const sig=JSON.stringify(list.map(a=>({a:a.account,s:a.state,f:a.flash,t:a.last_text,k:a.acked,w:a.skew,n:a.seen,u:a.test_time})));
     if(grid.dataset.sig!==sig){
       grid.dataset.sig=sig;
       grid.innerHTML=list.map(a=>{
         const tile=a.flash?'flash':(a.state==='alarm'?'held':'');
         const ack=a.acked?('<p class="hint">Acknowledged '+(a.ack_time||'')+' by '+esc(a.ack_by||'admin')+'</p>'):'';
         const skew=a.skew?('<p class="hint">'+esc(a.skew)+'</p>'):'';
+        const seen=(a.seen||a.test_time)?('<p class="hint">Last seen '+esc(a.seen||'—')+(a.test_time?' · Last test '+esc(a.test_time):'')+'</p>'):'';
         const btn=(a.flash && CAN_ACK)?'<button type="button" data-ack="'+esc(a.account)+'">Acknowledge</button>':'';
         return '<div class="card alarm-tile '+tile+'" id="at-'+esc(a.account)+'"><a class="tile-link" href="/alarms/'+encodeURIComponent(a.account)+'">'
           +'<div class="dev"><div class="dot '+(a.cls||'p')+'">'+esc(a.label||a.state)+'</div><div><h3>'+esc(a.name)+' <span class="muted">'+esc(a.site||'')+'</span></h3>'
           +'<div class="muted"><span class="badge" style="background:'+esc(a.color||'#64748b')+'">'+esc(a.brand||'')+'</span> '+esc(a.account)+'</div></div></div>'
-          +'<p class="muted">'+esc(a.last_text||'No events yet')+(a.last_time?' · '+esc(a.last_time):'')+'</p>'+skew+ack
+          +'<p class="muted">'+esc(a.last_text||'No events yet')+(a.last_time?' · '+esc(a.last_time):'')+'</p>'+seen+skew+ack
           +'</a>'+btn+'</div>';
       }).join('');
     }
@@ -2201,6 +2290,10 @@ function applyLive(data){
   }));
   paintAlarms(data.alarms);
   paintEvents(data.events);
+  if(data.last_cleared!==undefined){
+    const cleared=document.getElementById('last-cleared');
+    if(cleared) cleared.textContent='Last cleared: '+(data.last_cleared||'never');
+  }
   setText('live-at', 'last updated '+(data.now||''));
 }
 async function liveTick(){
@@ -2259,7 +2352,7 @@ function drawSeries(id, series, opts){
 
 STATE_CLS = {"up": "g", "down": "r", "warn": "a"}
 STATE_TXT = {"up": "UP", "down": "DOWN", "warn": "?", "disabled": "OFF"}
-app.jinja_env.globals.update(STATE_CLS=STATE_CLS, STATE_TXT=STATE_TXT)
+app.jinja_env.globals.update(STATE_CLS=STATE_CLS, STATE_TXT=STATE_TXT, event_mark=event_mark)
 
 LOGIN_BODY = """<div class="card" style="max-width:360px;margin:60px auto"><h2>Login</h2>
 <form method="post"><input type="password" name="password" placeholder="Password" autofocus style="width:100%" required>
@@ -2270,10 +2363,16 @@ EVENTS_TABLE = """<table><thead><tr><th>Time</th><th>Source</th><th>Event</th><t
 {% for e in events %}<tr>
 <td style="white-space:nowrap">{{ e.time }}</td>
 <td>{% if e.host_name %}{{ e.host_name }} <span class="muted">{{ e.host_ip }}</span>{% else %}{{ e.d.get('source_label') or e.d.get('source_ip','') }}{% endif %}</td>
-<td><span class="badge sev-{{ e.severity }}">{{ e.severity }}</span> {{ '🚨' if e.source=='alarm' else ('📧' if e.source=='mail' else ('📡' if e.source=='snmp' else ('🔴' if e.kind=='host_down' else '✅'))) }} {{ e.title }}</td>
+<td><span class="badge sev-{{ e.severity }}">{{ e.severity }}</span> {{ event_mark(e.source, e.severity, e.kind) }}{{ e.title }}</td>
 <td class="muted">{{ e.message[:140] }}</td>
 <td>{% for a in e.att %}<a href="{{ url_for('snapshot', name=a) }}" target="_blank"><img class="thumb" src="{{ url_for('snapshot', name=a) }}"></a>{% endfor %}</td></tr>
 {% else %}<tr><td colspan="5" class="muted">No events yet.</td></tr>{% endfor %}</tbody></table>"""
+
+CLEAR_LOG = """<span class="hint" id="last-cleared">Last cleared: {{ last_cleared or 'never' }}</span>
+{% if role()=='admin' %}<form method="post" action="{{ url_for('clear_log') }}" style="margin:8px 0 12px" onsubmit="return confirm('Clear all log entries and events?')">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="next" value="{{ clear_next }}">
+<button class="del" type="submit">Clear log</button>
+</form>{% endif %}"""
 
 INDEX_BODY = CHART_JS + """
 <div class="statusbar {{ bar.level }}{% if bar.alarm_flash %} alarm{% endif %}" id="bar">
@@ -2329,13 +2428,14 @@ INDEX_BODY = CHART_JS + """
 <div><h3>{{ a.name }} <span class="muted">{{ a.site }}</span></h3>
 <div class="muted"><span class="badge" style="background:{{ a.color }}">{{ a.brand }}</span> {{ a.account }}</div></div></div>
 <p class="muted">{{ a.last_text or 'No events yet' }}{% if a.last_time %} · {{ a.last_time }}{% endif %}</p>
+{% if a.seen or a.test_time %}<p class="hint">Last seen {{ a.seen or '—' }}{% if a.test_time %} · Last test {{ a.test_time }}{% endif %}</p>{% endif %}
 {% if a.skew %}<p class="hint">{{ a.skew }}</p>{% endif %}
 {% if a.acked %}<p class="hint">Acknowledged {{ a.ack_time }} by {{ a.ack_by }}</p>{% endif %}
 </a>
 {% if a.flash and role()=='admin' %}<button type="button" data-ack="{{ a.account }}">Acknowledge</button>{% endif %}
 </div>{% endfor %}</div></div>
 <span id="page-csrf" data-csrf="{{ csrf_token() }}" hidden></span>
-<div class="card" style="margin-top:16px"><h2>Recent events (ping + device e-mails)</h2>""" + EVENTS_TABLE + """</div>"""
+<div class="card" style="margin-top:16px"><h2>Recent events</h2>""" + CLEAR_LOG + EVENTS_TABLE + """</div>"""
 
 HOST_BODY = CHART_JS + """{% if role()=='admin' %}<p class="hint"><a href="{{ url_for('host_snmp', hid=h.id) }}">SNMP</a>
 {% if h.device_type in ('hikvision', 'dahua') %} · <a href="{{ url_for('host_camera', hid=h.id) }}">Camera API</a>{% endif %}
@@ -2635,7 +2735,8 @@ def index():
         banner = {"cls": "warn", "text": "LAN device down: " + names}
     return page(INDEX_BODY, charts=True, live="dashboard", groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
                 now=fmt_ts(time.time(), tz), span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000,
-                wan=wan, traffic=_traffic_cards(since), banner=banner, alarms=alarms, bar=_status_bar(hosts, wan, alarms))
+                wan=wan, traffic=_traffic_cards(since), banner=banner, alarms=alarms, bar=_status_bar(hosts, wan, alarms),
+                last_cleared=last_cleared_text(tz), clear_next="dashboard")
 
 
 @app.route("/host/<int:hid>")
@@ -2680,13 +2781,16 @@ def alarm_panel(account):
     one = next((a for a in panel if a["account"] == account), None)
     if not one:
         abort(404)
-    events = event_rows("host_ip=?", (account,), 50, tz)
+    events = event_rows(
+        "source='alarm' AND (json_extract(details,'$.account')=? OR host_ip=? OR host_name LIKE ?)",
+        (account, account, f"%({account})%"), 50, tz)
     body = """<p><a href="{{ url_for('index') }}">← Dashboard</a></p>
 <div class="card alarm-tile {{ 'flash' if a.flash else ('held' if a.state=='alarm' else '') }}">
 <div class="dev"><div class="dot {{ a.cls }}">{{ a.label }}</div>
 <div><h3>{{ a.name }} <span class="muted">{{ a.site }}</span></h3>
 <div class="muted"><span class="badge" style="background:{{ a.color }}">{{ a.brand }}</span> {{ a.account }} · {{ a.label }}</div></div></div>
 <p>{{ a.last_text or 'No events yet' }}{% if a.last_time %} · {{ a.last_time }}{% endif %}</p>
+{% if a.seen or a.test_time %}<p class="hint">Last seen {{ a.seen or '—' }}{% if a.test_time %} · Last test {{ a.test_time }}{% endif %}</p>{% endif %}
 {% if a.skew %}<p class="hint">{{ a.skew }}</p>{% endif %}
 {% if a.acked %}<p class="hint">Acknowledged {{ a.ack_time }} by {{ a.ack_by }}</p>{% endif %}
 {% if a.flash and role()=='admin' %}
@@ -2909,7 +3013,7 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <label>Site maintenance until</label><div><input type="datetime-local" name="maintenance_until" value="{{ ts_to_local_input(s.maintenance_until) }}">
 <p class="hint">No alerts for any host until this local time. Clear the field and save to turn it off. A single host can have its own window in the Hosts table.</p></div>
 <label>Events kept in the log</label><div><input type="number" name="event_keep" min="10" max="5000" value="{{ s.event_keep }}">
-<p class="hint">How many newest events the log page keeps. Example: <code>100</code>. Graphs use ping samples, not this list. The dashboard section “Recent events (ping + device e-mails)” stays.</p></div>
+<p class="hint">How many newest events the log page keeps. Example: <code>100</code>. Graphs use ping samples, not this list. The dashboard section “Recent events” stays.</p></div>
 <span></span><div><button>Save alerts</button></div></div></form></div>
 
 <div class="card" id="internet"><h2>Internet</h2>
@@ -3643,7 +3747,8 @@ def _events_public(rows):
             d = e.get("d") or {}
             who = d.get("source_label") or d.get("source_ip") or e.get("source") or ""
         out.append({"time": e.get("time") or "", "severity": e.get("severity") or "", "title": e.get("title") or "",
-                    "message": (e.get("message") or "")[:140], "who": who, "source": e.get("source") or ""})
+                    "message": (e.get("message") or "")[:140], "who": who, "source": e.get("source") or "",
+                    "kind": e.get("kind") or ""})
     return out
 
 
@@ -3667,7 +3772,7 @@ def api_live():
         keep = max(10, min(5000, int(get_settings().get("event_keep") or 100)))
         filt = request.args.get("source") or ""
         events = event_rows("source=?", (filt,), keep, tz) if filt else event_rows(limit=keep, tz=tz)
-        return jsonify(now=now, events=_events_public(events))
+        return jsonify(now=now, events=_events_public(events), last_cleared=last_cleared_text(tz))
     if kind == "host":
         try:
             hid = int(request.args.get("id") or 0)
@@ -3715,6 +3820,7 @@ def api_live():
     bar = _status_bar(hosts, wan, alarms)
     traffic = _traffic_cards(since)
     return jsonify(now=now, bar=bar, banner=banner, counts=counts, alarms=alarms,
+                   last_cleared=last_cleared_text(tz),
                    events=_events_public(event_rows(limit=25, tz=tz)),
                    hosts=[{"id": h["id"], "state": h["state"], "state_txt": STATE_TXT.get(h["state"], ""),
                            "cls": STATE_CLS.get(h["state"], "p"), "last_ms": h.get("last_ms"),
@@ -3726,8 +3832,9 @@ def api_live():
 
 # ----------------------------------------------------------------------------- main
 LOG_BODY = """<h2>Event log</h2>
-<p class="hint">The newest {{ keep }} alerts. Ping and device e-mail events also stay in the dashboard section “Recent events (ping + device e-mails)”.</p>
+<p class="hint">The newest {{ keep }} alerts. Ping and device e-mail events also stay in the dashboard section “Recent events”.</p>
 <p class="hint"><span id="live-at">last updated just now</span> · <span id="live-err" hidden style="color:#b91c1c">update failed</span></p>
+""" + CLEAR_LOG + """
 <form method="get" class="ranges">
 <select name="source"><option value="">All types</option>{% for src in sources %}<option value="{{ src }}" {{ 'selected' if src==filt }}>{{ src }}</option>{% endfor %}</select>
 <button>Filter</button></form>
@@ -3746,7 +3853,17 @@ def event_log():
         events = event_rows(limit=keep, tz=tz)
     with db() as c:
         sources = [r[0] for r in c.execute("SELECT DISTINCT source FROM events ORDER BY source")]
-    return page(LOG_BODY, live="log", events=events, sources=sources, filt=filt, keep=keep)
+    return page(LOG_BODY, live="log", events=events, sources=sources, filt=filt, keep=keep,
+                last_cleared=last_cleared_text(tz), clear_next="log")
+
+
+@app.route("/log/clear", methods=["POST"])
+@admin_required
+def clear_log():
+    clear_event_log(role() or "admin", client_ip())
+    flash("Log cleared.")
+    dest = request.form.get("next") or ""
+    return redirect(url_for("index") if dest == "dashboard" else url_for("event_log"))
 
 
 @app.route("/report", methods=["GET", "POST"])
@@ -4227,52 +4344,87 @@ def on_sia_frame(line, peer, now=None):
         info["reply"] = siarecv.nak_frame(info.get("sequence"), info.get("receiver"), info.get("line"), account, when=moment)
         return info
     info["ts_flag"] = decision.get("flag") or ""
+    supervision = bool(info.get("supervision")) or siarecv.is_supervision(info.get("code"), info.get("heartbeat"))
+    was_offline = row["state"] == "offline" or bool(row["offline_alerted"])
     incoming = info.get("state")
-    if info.get("heartbeat") and row["state"] == "offline":
-        state = row["rest_state"] if row["rest_state"] not in ("", None, "offline", "alarm") else "online"
-    elif info.get("heartbeat"):
-        state = row["state"] or "online"
+    if supervision:
+        # A test or heartbeat must not clear an alarm, arm the panel, or flash the tile.
+        if row["state"] == "offline":
+            state = row["rest_state"] if row["rest_state"] not in ("", None, "offline", "alarm") else "online"
+        else:
+            state = row["state"] or "online"
+        if state in ("unknown", "", None):
+            state = "online"
+        rest = row["rest_state"] or "unknown"
+        text = ""
     elif incoming == "restored":
         state = row["rest_state"] if row["rest_state"] in ("armed", "disarmed", "online") else "online"
+        rest = state
+        text = info.get("text") or ""
     else:
         state = incoming or row["state"] or "unknown"
-    if info.get("heartbeat") and state in ("unknown", "", None):
-        state = "online"
-    if state == "alarm":
-        rest = row["rest_state"] if row["rest_state"] not in ("", None, "alarm", "offline") else "unknown"
-    elif state in ("armed", "disarmed", "online"):
-        rest = state
-    else:
-        rest = row["rest_state"] or "unknown"
-    fresh_alarm = state == "alarm" and not info.get("heartbeat")
-    clear_ack = fresh_alarm or incoming == "restored"
-    text = "" if info.get("heartbeat") else info.get("text") or ""
+        text = info.get("text") or ""
+        if state == "alarm":
+            rest = row["rest_state"] if row["rest_state"] not in ("", None, "alarm", "offline") else "unknown"
+        elif state in ("armed", "disarmed", "online"):
+            rest = state
+        else:
+            rest = row["rest_state"] or "unknown"
+    fresh_alarm = state == "alarm" and not supervision
+    clear_ack = fresh_alarm or (incoming == "restored" and not supervision)
+    host = _panel_source(row, account, peer)
     with _db_lock, db() as c:
-        if clear_ack:
+        if supervision:
+            c.execute("""UPDATE sia_accounts SET last_ts=?, last_test=?, state=?, offline_alerted=0
+                         WHERE account=?""",
+                      (now_ts, now_ts, state or row["state"], account))
+        elif clear_ack:
             c.execute("""UPDATE sia_accounts SET last_ts=?, last_text=CASE WHEN ?='' THEN last_text ELSE ? END,
+                         last_event_ts=CASE WHEN ?='' THEN last_event_ts ELSE ? END,
                          state=?, rest_state=?, offline_alerted=0, ack_at=0, ack_by='' WHERE account=?""",
-                      (now_ts, text, text, state or row["state"], rest or "unknown", account))
+                      (now_ts, text, text, text, now_ts, state or row["state"], rest or "unknown", account))
         else:
             c.execute("""UPDATE sia_accounts SET last_ts=?, last_text=CASE WHEN ?='' THEN last_text ELSE ? END,
+                         last_event_ts=CASE WHEN ?='' THEN last_event_ts ELSE ? END,
                          state=?, rest_state=?, offline_alerted=0 WHERE account=?""",
-                      (now_ts, text, text, state or row["state"], rest or "unknown", account))
-    if not info.get("heartbeat"):
-        host = {"id": None, "name": row["name"], "host": account, "device_type": row["panel"]}
-        add_event("alarm", "alarm", info["severity"], None,
+                      (now_ts, text, text, text, now_ts, state or row["state"], rest or "unknown", account))
+    if was_offline:
+        msg = f"{row['name']} ({account}) is sending again."
+        add_event("alarm", "sia_restored", "info", host, "communication restored", msg,
+                  {"account": account, "panel": row["panel"], "peer": str(peer or ""), "code": "online", "type": "alarm",
+                   "source_label": host["name"], "source_ip": host["host"]})
+        consider_notify(s, None, "info", f"[{s['site_name']}] communication restored: {row['name']}", msg,
+                        build_payload(s, "device_alert", None, host, severity="info", message=msg))
+    if supervision:
+        if s.get("sia_log_tests"):
+            title = (info.get("text") or "Periodic test")[:80]
+            add_event("alarm", "sia_test", "info", host, title, f"{row['name']} ({account}): {info.get('text') or title}",
+                      {"account": account, "panel": row["panel"], "zone": info.get("zone"), "peer": str(peer or ""),
+                       "code": info.get("code"), "type": "test",
+                       "source_label": host["name"], "source_ip": host["host"]})
+    else:
+        add_event("alarm", "alarm", info["severity"], host,
                   info["text"][:80], f"{row['name']} ({account}): {info['text']}",
-                  {"account": account, "panel": row["panel"], "zone": info.get("zone"), "peer": peer,
-                   "code": info.get("code"), "type": "alarm"})
+                  {"account": account, "panel": row["panel"], "zone": info.get("zone"), "peer": str(peer or ""),
+                   "code": info.get("code"), "type": "alarm",
+                   "source_label": host["name"], "source_ip": host["host"]})
         consider_notify(s, None, info["severity"], f"[{s['site_name']}] {row['name']}: {info['text'][:80]}",
                         f"{row['name']} account {account}\n{info['text']}\nfrom {peer}",
                         build_payload(s, "device_alert", None, host, severity=info["severity"], message=info["text"]))
-    elif row["state"] == "offline":
-        add_event("alarm", "alarm", "info", None, "Panel online", f"{row['name']} sent a heartbeat again.",
-                  {"account": account, "type": "alarm", "code": "online"})
-    reason = "heartbeat" if info.get("heartbeat") else (info.get("text") or "accepted")
+    reason = "heartbeat" if info.get("heartbeat") else ("supervision" if supervision else (info.get("text") or "accepted"))
     if decision["flag"]:
         reason = f"{reason} · {decision['flag']}"
     _remember_clock(peer, line, True, reason, account, protocol, decision)
     return info
+
+
+def _panel_source(row, account, peer):
+    """Source column for an alarm event: 'ww (123456)', plus the panel IP when we have one."""
+    name = (row["name"] or "").strip()
+    account = (account or row["account"] or "").strip()
+    label = f"{name} ({account})" if name else (account or "panel")
+    ip = str(peer or "").strip()
+    return {"id": None, "name": label, "host": ip, "device_type": row["panel"] if "panel" in row.keys() else ""}
 
 
 def sia_supervise():
@@ -4281,16 +4433,19 @@ def sia_supervise():
     with db() as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM sia_accounts")]
     for row in rows:
-        limit = max(1, int(row["supervise_min"] or 10)) * 60
+        minutes = max(1, int(row["supervise_min"] or 10))
+        limit = minutes * 60
         if not row["last_ts"] or now - row["last_ts"] < limit or row["offline_alerted"]:
             continue
         with _db_lock, db() as c:
             c.execute("UPDATE sia_accounts SET state='offline', offline_alerted=1 WHERE account=?", (row["account"],))
-        msg = f"{row['name']} ({row['account']}) sent no heartbeat for {row['supervise_min']} minutes."
-        add_event("alarm", "alarm", "critical", None, "Panel offline", msg,
-                  {"account": row["account"], "type": "alarm", "code": "offline"})
-        consider_notify(s, None, "critical", f"[{s['site_name']}] Panel offline: {row['name']}", msg,
-                        build_payload(s, "device_alert", None, None, severity="critical", message=msg))
+        host = _panel_source(row, row["account"], "")
+        msg = f"{row['name']} ({row['account']}) sent no frame, heartbeat or test for {minutes} minutes."
+        add_event("alarm", "sia_offline", "warning", host, "panel communication lost", msg,
+                  {"account": row["account"], "type": "alarm", "code": "offline",
+                   "source_label": host["name"], "source_ip": host["host"]})
+        consider_notify(s, None, "warning", f"[{s['site_name']}] panel communication lost: {row['name']}", msg,
+                        build_payload(s, "device_alert", None, host, severity="warning", message=msg))
 
 
 def restart_sia():
@@ -4384,7 +4539,8 @@ def alarm_settings():
             minutes = max(1, min(minutes, 24 * 60))
             set_settings(sia_enabled=1 if request.form.get("sia_enabled") else 0, sia_host=host, sia_port=port,
                          sia_tcp=1 if request.form.get("sia_tcp") else 0, sia_udp=1 if request.form.get("sia_udp") else 0,
-                         sia_ts_mode=mode, sia_ts_window=minutes * 60)
+                         sia_ts_mode=mode, sia_ts_window=minutes * 60,
+                         sia_log_tests=1 if request.form.get("sia_log_tests") else 0)
             restart_sia()
             flash(f"Alarm receiver saved. {SIA.status()}")
             return redirect(url_for("alarm_settings"))
@@ -4424,6 +4580,7 @@ def alarm_settings():
         log_rows = [dict(r) for r in c.execute("SELECT * FROM sia_log ORDER BY id DESC LIMIT 20")]
     for row in rows:
         row["seen"] = fmt_ts(row["last_ts"]) if row["last_ts"] else "never"
+        row["test"] = fmt_ts(row.get("last_test")) if row.get("last_test") else "—"
         skew = row.get("skew_s")
         row["skew_text"] = siarecv.clock_warning(skew)
         row["skew_signed"] = siarecv.format_delta(skew) if skew is not None else ""
@@ -4448,6 +4605,8 @@ def alarm_settings():
 <p class="hint">The digits in the frame are compared with UTC now. Strict is ±20 seconds. Tolerant is the window below (default 10 minutes). Panel uses local time subtracts this site's timezone offset, including daylight saving, and then uses that window. Off ignores the clock. NULL heartbeats are accepted even when the clock is wrong, so a bad clock cannot show the panel offline. If several frames share the same skew, later events are accepted too and the account is marked “panel clock is N min off — set NTP on the panel”. A gap within 2 minutes of the site's UTC offset is marked “panel sends local time”.</p></div>
 <label>Tolerant window (minutes)</label><div><input type="number" name="sia_ts_window_min" min="1" max="1440" value="{{ (s.sia_ts_window or 600) // 60 }}">
 <p class="hint">Used by Tolerant, and after the local-time offset is removed. Example: <code>10</code>.</p></div>
+<label>Log periodic test reports</label><div><input type="checkbox" name="sia_log_tests" value="1" {{ 'checked' if s.sia_log_tests }}>
+<p class="hint">Off by default. Automatic tests (SIA RP, RX and TX) and NULL heartbeats only update last seen and last test. Turn this on to write those reports to the log as info. They still do not raise an alert or flash a tile.</p></div>
 <span></span><div><button>Save receiver</button></div></div></form>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="test">
 <p><button class="sec" name="test" value="1">Send test event</button> <span class="hint">Sends one SIA-DCS burglary frame to this machine and shows it in the log, Recent events, and the listen list below.</span></p></form>
@@ -4463,8 +4622,8 @@ def alarm_settings():
 <option value="other">Other SIA DC-09 panel</option></select></div>
 <label>AES key</label><div><input type="password" name="key" autocomplete="new-password" placeholder="empty = no encryption">
 <p class="hint">Optional. 16, 24 or 32 hex characters (AES-128/192/256). Stored encrypted. Leave empty when saving to keep the current key.</p></div>
-<label>Heartbeat timeout (min)</label><div><input type="number" name="supervise_min" value="10" min="1" max="1440">
-<p class="hint">Alarm “panel offline” if no NULL heartbeat arrives in this many minutes. Example: <code>10</code>. Match the panel's ping interval and add a couple of minutes.</p></div>
+<label>Supervision timeout (min)</label><div><input type="number" name="supervise_min" value="10" min="1" max="1440">
+<p class="hint">If no frame, heartbeat or periodic test arrives within this many minutes, log one warning “panel communication lost” and send one alert. The next frame logs one “communication restored”. Quiet hours and maintenance apply the same way as other alerts. Example: <code>10</code>.</p></div>
 <label>Timestamp check</label><div><select name="ts_mode">
 <option value="">Use the global setting ({{ s.sia_ts_mode }})</option>
 <option value="strict">Strict (±20 seconds)</option>
@@ -4481,11 +4640,11 @@ def alarm_settings():
 <li><b>Hikvision AX PRO / AX Hybrid</b> — Hik-Connect or the panel web page → Communication → Alarm receiving centre. Protocol SIA-DCS or ADM-CID, this IP and port, account, optional encryption, and a heartbeat interval.</li>
 <li><b>Dahua AirShield / ARC</b> — ARC settings → SIA DC-09 or Contact ID over IP. Account, this IP and port, heartbeat. Camera and NVR events stay on the camera API and the e-mail receiver, not here.</li>
 </ul>
-<div class="table-wrap"><table><tr><th>Name</th><th>Account</th><th>Panel</th><th>Clock</th><th>Skew</th><th>State</th><th>Last heard</th><th></th></tr>
+<div class="table-wrap"><table><tr><th>Name</th><th>Account</th><th>Panel</th><th>Clock</th><th>Skew</th><th>State</th><th>Last seen</th><th>Last test</th><th></th></tr>
 {% for a in rows %}<tr><td>{{ a.name }}</td><td>{{ a.account }}</td><td>{{ a.panel }}</td><td>{{ a.ts_mode or 'global' }}</td>
 <td>{% if a.skew_text %}{{ a.skew_signed }} · {{ a.skew_text }}{% else %}—{% endif %}</td>
-<td>{{ a.state }}</td><td>{{ a.seen }}</td>
-<td><button form="del{{ a.account }}" class="del">Delete</button></td></tr>{% else %}<tr><td colspan="8" class="muted">No accounts yet.</td></tr>{% endfor %}</table></div>
+<td>{{ a.state }}</td><td>{{ a.seen }}</td><td>{{ a.test }}</td>
+<td><button form="del{{ a.account }}" class="del">Delete</button></td></tr>{% else %}<tr><td colspan="9" class="muted">No accounts yet.</td></tr>{% endfor %}</table></div>
 {% for a in rows %}<form id="del{{ a.account }}" method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="delete" value="{{ a.account }}"></form>{% endfor %}
 <h2>Last raw frames</h2>
 <p class="hint">Accepted and rejected. Frame time is the clock digits in the message, read as UTC. Difference is that time minus server UTC. A NAK for a clock rejection includes the server's UTC time so the panel can sync.</p>

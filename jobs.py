@@ -321,6 +321,17 @@ def disk_repeat_seconds(s):
     return 24 * 3600
 
 
+def _recovery_copy(key):
+    """Log line when a stored camera problem is gone. Disks name the slot."""
+    text = str(key or "")
+    for prefix in ("disk:", "disk-missing:"):
+        if text.startswith(prefix):
+            name = text[len(prefix):] or "disk"
+            line = f"Disk {name} recovered"
+            return line, line
+    return "Camera check recovered", f"{text} is OK again."
+
+
 def apply_camera_result(pm, host, result, notify, prev_row, now):
     """Store a camera check. `notify` is false for a manual Test so it cannot swallow later alerts.
 
@@ -368,12 +379,18 @@ def apply_camera_result(pm, host, result, notify, prev_row, now):
         notified[key] = now
     for key in list(notified):
         if key not in have:
-            pm.add_event("cam", "cam_recovered", "info", host, "Camera check recovered",
-                         f"{key} is OK again.", {"key": key})
-            pm.consider_notify(s, host, "info", f"[{s['site_name']}] Camera check recovered: {host['name']}",
-                               f"{key} is OK again.",
+            if key.startswith("disk:"):
+                slot = key.split(":", 1)[1]
+                if f"disk-missing:{slot}" in have:
+                    # The slot failed and then disappeared. The missing alert replaces it.
+                    del notified[key]
+                    continue
+            title, message = _recovery_copy(key)
+            pm.add_event("cam", "cam_recovered", "info", host, title, message, {"key": key})
+            pm.consider_notify(s, host, "info", f"[{s['site_name']}] {title}: {host['name']}",
+                               message,
                                pm.build_payload(s, "device_alert", None, host, severity="info",
-                                                message=f"{key} is OK again."))
+                                                message=message))
             del notified[key]
     result["notified"] = notified
     result["ts"] = now

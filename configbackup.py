@@ -189,14 +189,14 @@ def apply_document(c, doc, data_dir, known_settings, mode="merge"):
     for acc in doc.get("sia_accounts") or []:
         if not acc.get("account"):
             continue
-        c.execute("""INSERT INTO sia_accounts(account, name, panel, key_enc, supervise_min, last_ts, last_text, state, rest_state, offline_alerted, ts_mode)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        c.execute("""INSERT INTO sia_accounts(account, name, panel, key_enc, supervise_min, last_ts, last_text, state, rest_state, offline_alerted, ts_mode, last_test, last_event_ts)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                      ON CONFLICT(account) DO UPDATE SET name=excluded.name, panel=excluded.panel, key_enc=excluded.key_enc,
                      supervise_min=excluded.supervise_min, ts_mode=excluded.ts_mode""",
                   (acc["account"], acc.get("name") or acc["account"], acc.get("panel") or "other", acc.get("key_enc") or "",
                    int(acc.get("supervise_min") or 10), acc.get("last_ts"), acc.get("last_text") or "",
                    acc.get("state") or "unknown", acc.get("rest_state") or "unknown", int(acc.get("offline_alerted") or 0),
-                   acc.get("ts_mode") or ""))
+                   acc.get("ts_mode") or "", acc.get("last_test"), acc.get("last_event_ts")))
     if doc.get("includes_history") and doc.get("history"):
         _apply_history(c, doc["history"], id_map, data_dir, replace=mode == "replace")
     return info

@@ -26,6 +26,15 @@ DISARM = {"OP", "OA", "OG", "OR"}
 WARNING = {"AT", "YT", "YC", "YX", "XT", "XQ", "YM"}
 # Second letter R is the restore of the matching alarm (BA → BR, FA → FR, TA → TR).
 RESTORE = {code[0] + "R" for code in CRITICAL if len(code) == 2}
+# Periodic test / supervision. Not an alarm: RP automatic test, RX manual test, TX test.
+SUPERVISION = {"RP", "RX", "TX"}
+
+
+def is_supervision(code, heartbeat=False):
+    """NULL heartbeats and periodic test codes are supervision, not events to log."""
+    if heartbeat:
+        return True
+    return (code or "").upper() in SUPERVISION
 
 
 def crc16(msg):
@@ -255,6 +264,8 @@ def _severity(code, message_type):
 def _state_for(code, message_type):
     if message_type == MessageTypes.NULL:
         return None
+    if (code or "").upper() in SUPERVISION:
+        return None
     if code in CRITICAL:
         return "alarm"
     if code in ARM:
@@ -325,6 +336,7 @@ def parse_line(line, accounts):
         "message_type": mtype,
         "protocol": mtype,
         "heartbeat": event.message_type == MessageTypes.NULL,
+        "supervision": is_supervision(event.code, event.message_type == MessageTypes.NULL),
         "severity": _severity(event.code, event.message_type),
         "text": text,
         "zone": zone,

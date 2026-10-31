@@ -1,6 +1,6 @@
 # Wirewave Network Infrastructure Monitor
 
-Version 3.0.0. The feature history is in [CHANGELOG.md](CHANGELOG.md).
+Version 3.0.1. The feature history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick install (Debian)
 
@@ -35,6 +35,8 @@ Alarms use a failed-ping count (global default 3, overridable per host) and a re
 Alarm panels (Ajax, Trikdis, Hikvision AX PRO / AX Hybrid, Dahua AirShield / ARC) can send SIA DC-09 to TCP/UDP port 12128. Open **Settings → Alarms** for the account, the optional AES key, and the click-path on each brand. Trikdis TRK toward Protegus is not accepted. This is technical monitoring, not a certified alarm receiving centre; keep the vendor app as the primary path. NVR and camera events stay on the camera API and the e-mail receiver.
 
 The frame clock is compared as UTC with UTC now. The default check is tolerant (±10 minutes). Strict is the DC-09 ±20 seconds. If the gap is within two minutes of this site's timezone offset, the frame is accepted and marked “panel sends local time”. “Panel uses local time” always subtracts that offset (daylight saving included). Off ignores the clock. NULL heartbeats are accepted whenever the CRC and the account are valid, so a wrong clock cannot make the panel look offline. When several frames share the same skew, later events are accepted and the account shows “panel clock is N min off — set NTP on the panel”. A frame rejected only for the clock is answered with a NAK that carries the receiver's UTC time, so the panel can sync. The same choice can be set on one account. Diagnostics lists every rejection with the protocol, both clocks and the gap, including NULL, and the last raw frames whether they were accepted or not.
+
+Periodic test reports (SIA RP, RX and TX) and NULL heartbeats update last seen and last test. They are not written to the log unless Settings → Alarms → Log periodic test reports is on. If nothing arrives within the account's supervision timeout (default 10 minutes), one warning “panel communication lost” is logged, and the next frame logs one “communication restored”. A disk reported as ok, normal, idle or sleeping is not an alert, including when free space is 0.
 
 ## Update
 
@@ -151,7 +153,7 @@ The web UI has CSRF protection on every form. Login is locked out after repeated
 * Each host shows a green/red/orange card with its brand badge, last ping, 24 h uptime and down-for time, plus a 24 h latency graph with failed pings marked in red.
 * When SNMP is on, the card also shows device uptime, CPU, RAM, temperature/voltage, Wi-Fi clients and link badges with live traffic.
 * Click a host for its detail page: a large latency graph, the SNMP system table, a CPU/RAM chart, the interface table, traffic graphs per interface, and that host's events.
-* **Recent events** lists ping DOWN/UP, device e-mails 📧 and SNMP alerts/traps 📡. Camera snapshot thumbnails appear when an e-mail had one.
+* **Recent events** lists ping DOWN/UP, device e-mails 📧 and SNMP alerts/traps 📡. Camera snapshot thumbnails appear when an e-mail had one. An admin can clear this list from here or from the Log page. That removes the history only, then writes one “Log cleared” line (who, from which address, and when). A down host, a failed disk, or an active alarm stays.
 
 ---
 

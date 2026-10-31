@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.0.1
+
+- A recorder disk whose status is ok, normal, idle or sleeping is not a failure, even when free space is reported as zero. That stops the false “Disk hdda (still)” reminder whose message was “hdda status ok”. A disk that was failed and is healthy again logs one info event, “Disk … recovered”, sends one recovery notice, and then the reminders stop. The next check after this update clears a reminder that was already stuck on a healthy disk. Error, abnormal, unformatted, uninitialized, SMART-failed, and a disk that used to be installed and is now missing, are still alerts. The ping fail-count still does not apply to disks.
+- SIA periodic tests (RP, RX, TX) and NULL heartbeats update last seen and last test on the Alarms page and the dashboard tile. They are not written to the log, not alerted, and do not flash the tile, unless Settings → Alarms → Log periodic test reports is on (it defaults to off). If a panel sends nothing for its supervision timeout (default 10 minutes), one warning “panel communication lost” is logged and alerted. The next frame logs one “communication restored”. Quiet hours and maintenance apply as they do for other alerts.
+- Alarm events name the panel in the Source column, for example ww (123456), or the panel IP. The siren is only for a real alarm. Info events do not use it.
+- The dashboard section is titled Recent events.
+- An admin can clear the log from the Log page or from Recent events on the dashboard. The button asks “Clear all log entries and events?” and then leaves one entry, “Log cleared”, with who did it, from which address, and when. Host down, a failed disk, and an active alarm are left as they are.
+
 ## 3.0.0
 
 The settings pages, alarm panels, and recorder checks work as one monitor.

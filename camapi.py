@@ -49,7 +49,13 @@ def parse_hik_device(body):
 # Words that mean the disk itself is bad. "notexist" is not here: an empty bay is normal
 # until a disk that used to be there disappears. "sleeping" is a spun-down healthy disk.
 _DISK_BAD = ("unformat", "uninit", "error", "abnormal", "fail", "offline", "full", "smartfailed")
-_DISK_ASLEEP = ("sleep", "sleeping", "hibernate", "standby")
+_DISK_ASLEEP = {"sleep", "sleeping", "hibernate", "standby"}
+# Exact status words a recorder uses for a disk that is fine. These win over a low
+# free-space figure: Hikvision often reports freeSpace 0 while status is "ok".
+_DISK_HEALTHY = {
+    "ok", "normal", "idle", "good", "healthy", "success", "running", "formatted",
+    "active", "ready", "online",
+}
 _DISK_ABSENT = {"", "notexist", "notexists", "absent", "none", "nodisk", "empty", "unknown"}
 
 
@@ -57,12 +63,21 @@ def _disk_status_key(status):
     return (status or "").lower().replace(" ", "").replace("-", "").replace("_", "")
 
 
-def _disk_problem(status, capacity, free):
+def _disk_healthy(status):
     st = _disk_status_key(status)
-    if st in _DISK_ASLEEP or st.startswith("sleep"):
+    if not st:
+        return False
+    return st in _DISK_HEALTHY or st in _DISK_ASLEEP or st.startswith("sleep")
+
+
+def _disk_problem(status, capacity, free):
+    """True only for a failed disk. A healthy or sleeping status is never a problem."""
+    st = _disk_status_key(status)
+    if _disk_healthy(status):
         return False
     if any(word in st for word in _DISK_BAD):
         return True
+    # Low free space counts only when the recorder did not call the disk healthy.
     if capacity and free is not None and capacity > 0 and free / capacity < 0.05:
         return True
     return False
@@ -190,9 +205,11 @@ def parse_dahua_storage(body):
         free = (cap - used) if cap is not None and used is not None else _num(kv.get(p + "FreeBytes"))
         cap_mb = cap / 1048576 if cap and cap > 100000 else cap
         free_mb = free / 1048576 if free and free > 100000 else free
-        problem = err in ("true", "1", "yes") or _disk_problem(status, cap_mb, free_mb)
-        if status and not problem and status.lower() in ("success", "ok", "normal", "running"):
+        # A healthy status wins over IsError and over a full disk reported as free space 0.
+        if _disk_healthy(status):
             problem = False
+        else:
+            problem = err in ("true", "1", "yes") or _disk_problem(status, cap_mb, free_mb)
         disks.append({
             "name": kv.get(p + "Name") or kv.get(p + "Path") or f"disk{i}",
             "status": status or ("error" if problem else "ok"),
