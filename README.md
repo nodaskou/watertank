@@ -1,6 +1,6 @@
 # Wirewave Network Infrastructure Monitor
 
-Version 3.0.1. The feature history is in [CHANGELOG.md](CHANGELOG.md).
+Version 3.0.2. The feature history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick install (Debian)
 
@@ -121,7 +121,7 @@ No secrets are written into the files. Every password and token lives in the SQL
 |---|---|
 | **Hosts** | Name, IP/hostname, group (e.g. Cameras, Wi-Fi, Network), **device type** (sets the brand badge and helps parse e-mails), on/off. The **SNMP** column opens the per-host SNMP page. |
 | **General** | Site/client name (it prefixes every alert), timezone, ping interval/timeout, failed pings before an alert, history days, public URL (used for links in alerts), dashboard access (login or public read-only), optional viewer password. |
-| **Telegram** | Bot token, chat ID, camera snapshots on/off. Has a **Save + send test** button. |
+| **Telegram** | Bot token, chat ID, camera snapshots on/off. **Detect chat ID** lists recent chats. **Send test message** saves the form and sends one message. |
 | **Outgoing e-mail (SMTP)** | Server, port, security (STARTTLS 587 / SSL 465 / none 25), user, password, from, to (comma separated). Has a **Save + send test e-mail** button. |
 | **Incoming e-mail receiver** | Lets devices send alarm e-mails to the monitor (see §4). |
 | **SNMP polling + traps** | Global SNMP options and the trap receiver (see §5). |
@@ -134,9 +134,9 @@ The web UI has CSRF protection on every form. Login is locked out after repeated
 ### Telegram setup
 
 1. In Telegram, open **@BotFather** -> `/newbot` -> copy the token.
-2. Open your new bot and press **Start**. For a group, add the bot to the group and send a message there.
-3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy `"chat":{"id": ...}`. Group IDs are negative.
-4. Paste both values into Settings -> Telegram, then click **Save + send test**.
+2. Paste the token into Settings -> Telegram. Open your new bot and press **Start** (or add the bot to a group and send a message there).
+3. Click **Detect chat ID**. Pick the chat. A person has a positive id. A group, supergroup or channel has a negative id. If Telegram reports a webhook, getUpdates cannot run until you click **Remove webhook** (only do that if no other service uses this bot).
+4. Click **Send test message**. That saves the token and chat ID and sends one message. Turn Enabled on when it arrives.
 
 ### Outgoing e-mail examples
 
@@ -409,7 +409,7 @@ For Grok Bot, use one webhook URL with the `site` field telling the clients apar
 |---|---|
 | Service won't start, exit code 2 | No admin password yet: run the `--set-password` command from §1 |
 | Every host DOWN | `journalctl -u pingmonitor` -> look for the ping method. Set Ping method = system |
-| No Telegram | Press **Start** in the bot chat; check the chat ID (groups are negative); look for `telegram alert failed` in the log |
+| No Telegram | Press **Start** in the bot chat, then **Detect chat ID** (group ids are negative). If a webhook is set, getUpdates will not run until you click **Remove webhook**. A 401 means the token is wrong. The log line is `Telegram send failed` and does not include the token. |
 | Camera e-mails not arriving | Device IP in "allowed networks"? Security none vs STARTTLS? Port 2525 open in the thin client firewall? Log: `journalctl -u pingmonitor \| grep -i smtp` |
 | SNMP "no SNMP response (timeout)" | SNMP enabled on the device? Right community/port? Is the device's SNMP allowed-address the thin client? `snmpwalk` test |
 | SNMP "authentication failed / wrong digest" | SNMPv3 user / auth password / auth protocol mismatch |

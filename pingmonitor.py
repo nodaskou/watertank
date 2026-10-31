@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_file, send_from_directory, session, url_for)
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
@@ -570,28 +570,201 @@ def _http_post(url, data, headers, timeout=15):
         return r.status, r.read(2000)
 
 
+class TelegramError(Exception):
+    """Message safe to show an admin. It never includes the bot token."""
+
+
+class TelegramWebhookActive(TelegramError):
+    """getUpdates cannot run while this bot has a webhook."""
+
+
+_TG_TOKEN_RE = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
+_TG_EMPTY = "Send /start to your bot from Telegram, then click again."
+_TG_EMPTY_EL = "Στείλτε /start στο bot από το Telegram και πατήστε ξανά."
+
+
+def _telegram_token_ok(token):
+    return bool(_TG_TOKEN_RE.fullmatch(token or ""))
+
+
+def telegram_call(token, method, params=None, urlopen=None):
+    """POST one Telegram Bot API method. The token is not written to the log."""
+    token = (token or "").strip()
+    if not _telegram_token_ok(token):
+        raise TelegramError("Paste the bot token from @BotFather. It looks like 123456789:AAH…")
+    if method not in ("getUpdates", "getWebhookInfo", "deleteWebhook", "sendMessage"):
+        raise TelegramError("Unknown Telegram request.")
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params or {}).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    opener = urlopen or urllib.request.urlopen
+    try:
+        with opener(req, timeout=20) as resp:
+            raw = resp.read(1_000_000)
+    except urllib.error.HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read(4000)
+        except Exception:
+            raw = b""
+        log.info("Telegram %s failed: HTTP %s", method, e.code)
+        if e.code == 401:
+            raise TelegramError("Telegram rejected the bot token (401). Copy it again from @BotFather.") from None
+        if e.code == 409 or _telegram_conflict(raw):
+            raise TelegramWebhookActive("A webhook is active on this bot, so getUpdates cannot read messages.") from None
+        raise TelegramError(f"Telegram returned HTTP {e.code}. Try again in a moment.") from None
+    except urllib.error.URLError:
+        log.info("Telegram %s failed: network", method)
+        raise TelegramError("Could not reach Telegram. Check this machine's internet connection.") from None
+    except TelegramError:
+        raise
+    except Exception:
+        log.info("Telegram %s failed", method)
+        raise TelegramError("Could not reach Telegram. Try again in a moment.") from None
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except (TypeError, ValueError):
+        raise TelegramError("Telegram sent a reply this page could not read.") from None
+    if not payload.get("ok"):
+        code = payload.get("error_code")
+        log.info("Telegram %s failed: code %s", method, code)
+        if code == 401:
+            raise TelegramError("Telegram rejected the bot token (401). Copy it again from @BotFather.")
+        if code == 409 or _telegram_conflict(raw):
+            raise TelegramWebhookActive("A webhook is active on this bot, so getUpdates cannot read messages.")
+        raise TelegramError("Telegram could not complete the request. Try again in a moment.")
+    return payload
+
+
+def _telegram_conflict(raw):
+    text = raw.decode("utf-8", "replace").lower() if isinstance(raw, (bytes, bytearray)) else str(raw).lower()
+    return "webhook" in text and ("conflict" in text or "getupdates" in text)
+
+
+def _chat_label(chat):
+    kind = chat.get("type") or ""
+    if kind == "private":
+        first = (chat.get("first_name") or "").strip()
+        user = (chat.get("username") or "").strip()
+        if first and user:
+            return f"{first} (@{user})"
+        if user:
+            return f"@{user}"
+        if first:
+            return first
+        return "Private chat"
+    return (chat.get("title") or "").strip() or {"group": "Group", "supergroup": "Supergroup", "channel": "Channel"}.get(kind, "Chat")
+
+
+def _update_chat(update):
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        block = update.get(key)
+        if isinstance(block, dict) and isinstance(block.get("chat"), dict):
+            return block["chat"], int(block.get("date") or update.get("update_id") or 0)
+    for key in ("my_chat_member", "chat_member"):
+        block = update.get(key)
+        if isinstance(block, dict) and isinstance(block.get("chat"), dict):
+            return block["chat"], int(block.get("date") or update.get("update_id") or 0)
+    return None, 0
+
+
+def chats_from_updates(updates):
+    """Newest distinct chats. Private chats use first name and @username; groups use the title."""
+    found = {}
+    for update in updates or []:
+        if not isinstance(update, dict):
+            continue
+        chat, when = _update_chat(update)
+        if not chat or chat.get("id") is None:
+            continue
+        try:
+            cid = int(chat["id"])
+        except (TypeError, ValueError):
+            continue
+        stamp = (int(when or 0), int(update.get("update_id") or 0))
+        prev = found.get(cid)
+        if prev and prev["stamp"] >= stamp:
+            continue
+        kind = chat.get("type") or ""
+        found[cid] = {
+            "id": cid,
+            "label": _chat_label(chat)[:80],
+            "kind": kind if kind in ("private", "group", "supergroup", "channel") else "chat",
+            "stamp": stamp,
+        }
+    rows = sorted(found.values(), key=lambda row: row["stamp"], reverse=True)
+    for row in rows:
+        row.pop("stamp", None)
+    return rows
+
+
+def _telegram_form_token():
+    typed = (request.form.get("telegram_token") or "").strip()
+    if typed:
+        return typed
+    return get_settings().get("telegram_token") or ""
+
+
+def discover_telegram_chats(token, urlopen=None):
+    """Return {webhook, chats}. A set webhook is reported without calling getUpdates."""
+    info = telegram_call(token, "getWebhookInfo", urlopen=urlopen)
+    hook = ((info.get("result") or {}).get("url") or "").strip()
+    if hook:
+        return {"webhook": True, "chats": []}
+    data = telegram_call(token, "getUpdates", {
+        "timeout": "0",
+        "limit": "100",
+        "allowed_updates": json.dumps(["message", "edited_message", "channel_post", "my_chat_member"]),
+    }, urlopen=urlopen)
+    return {"webhook": False, "chats": chats_from_updates(data.get("result") or [])}
+
+
+def _telegram_http_error(exc):
+    """Replace a library error so the bot token in the URL is not shown or logged."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            exc.read(2000)
+        except Exception:
+            pass
+        if exc.code == 401:
+            return RuntimeError("Telegram rejected the bot token (401). Copy it again from @BotFather.")
+        if exc.code == 400:
+            return RuntimeError("Telegram refused the message. Check the chat ID and that you pressed Start in the bot.")
+        return RuntimeError(f"Telegram returned HTTP {exc.code}.")
+    if isinstance(exc, urllib.error.URLError):
+        return RuntimeError("Could not reach Telegram. Check this machine's internet connection.")
+    return exc
+
+
 def send_telegram(s, text, photo_path=None):
     if MOCK_TELEGRAM:
         log.info("[MOCK TELEGRAM] chat=%s photo=%s text=%s", s["telegram_chat_id"],
                  os.path.basename(photo_path) if photo_path else None, text.replace("\n", " / "))
         return
     if not s["telegram_token"] or not s["telegram_chat_id"]:
-        raise RuntimeError("Telegram bot token / chat id not set")
+        raise RuntimeError("Telegram bot token and chat ID are not set yet.")
     base = f"https://api.telegram.org/bot{s['telegram_token']}"
-    if photo_path and os.path.exists(photo_path):
-        boundary = uuid.uuid4().hex
-        with open(photo_path, "rb") as f:
-            img = f.read()
-        parts = []
-        for k, v in (("chat_id", s["telegram_chat_id"]), ("caption", text[:1024])):
-            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
-        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="snapshot.jpg"\r\n'
-                     f'Content-Type: image/jpeg\r\n\r\n'.encode() + img + b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode())
-        _http_post(base + "/sendPhoto", b"".join(parts), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    else:
-        data = urllib.parse.urlencode({"chat_id": s["telegram_chat_id"], "text": text[:4000]}).encode()
-        _http_post(base + "/sendMessage", data, {"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        if photo_path and os.path.exists(photo_path):
+            boundary = uuid.uuid4().hex
+            with open(photo_path, "rb") as f:
+                img = f.read()
+            parts = []
+            for k, v in (("chat_id", s["telegram_chat_id"]), ("caption", text[:1024])):
+                parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="snapshot.jpg"\r\n'
+                         f'Content-Type: image/jpeg\r\n\r\n'.encode() + img + b"\r\n")
+            parts.append(f"--{boundary}--\r\n".encode())
+            _http_post(base + "/sendPhoto", b"".join(parts), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        else:
+            data = urllib.parse.urlencode({"chat_id": s["telegram_chat_id"], "text": text[:4000]}).encode()
+            _http_post(base + "/sendMessage", data, {"Content-Type": "application/x-www-form-urlencoded"})
+    except Exception as e:
+        cleaned = _telegram_http_error(e)
+        if cleaned is not e:
+            log.info("Telegram send failed: %s", cleaned)
+            raise cleaned from None
+        raise
 
 
 def send_email(s, subject, text):
@@ -3092,11 +3265,22 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <p class="hint">Turn Telegram alerts on or off. Turn it on after the token and chat ID are saved and a test message arrives.</p></div>
 <label>Bot token</label><div>""" + _secret_input("telegram_token") + """
 <p class="hint">From @BotFather, command <code>/newbot</code>. Example: <code>123456789:AAH...</code>. Leave this blank when saving to keep the token already stored. Use it when you create the bot.</p></div>
-<label>Chat ID</label><div><input type="text" name="telegram_chat_id" value="{{ s.telegram_chat_id }}" placeholder="123456789 or -100...">
-<p class="hint">Where the messages go. Example: <code>123456789</code> for a person, or <code>-1001234567890</code> for a group. Open the bot, press Start, then read the id from getUpdates.</p></div>
+<label>Chat ID</label><div><input type="text" id="telegram_chat_id" name="telegram_chat_id" value="{{ s.telegram_chat_id }}" placeholder="123456789 or -100...">
+<p class="hint">Where the messages go. A person is a positive number, for example <code>123456789</code>. A group, supergroup or channel is negative, for example <code>-1001234567890</code>. Send any message to the bot (or add the bot to a group and write there), then click Detect chat ID and pick a row. The button uses the token typed above, or the saved token when that box is blank. The token is not written to the log.</p>
+<p><button class="sec" formaction="{{ url_for('telegram_detect') }}" formmethod="post">Detect chat ID</button></p>
+{% if tg_webhook %}<p class="hint">A webhook is active on this bot, so getUpdates cannot read messages while that webhook stays. Remove it only if no other service needs this bot. Then send a message and click Detect chat ID again.</p>
+<p><button class="sec" formaction="{{ url_for('telegram_remove_webhook') }}" formmethod="post" onclick="return confirm('Remove the webhook on this bot? Another service using it will stop receiving updates.')">Remove webhook</button></p>{% endif %}
+{% if tg_chats %}<div class="table-wrap"><table><tr><th>Chat</th><th>Kind</th><th>Chat ID</th><th></th></tr>
+{% for c in tg_chats %}<tr><td>{{ c.label|e }}</td><td>{{ c.kind }}</td><td><code>{{ c.id }}</code></td>
+<td><button type="button" class="sec" data-chat="{{ c.id }}" onclick="var i=document.getElementById('telegram_chat_id'); if(i) i.value=this.getAttribute('data-chat');">Use this chat</button></td></tr>{% endfor %}
+</table></div>
+<p class="hint">Newest first. Each chat is listed once. Use this chat fills the Chat ID field; Save stores it.</p>{% endif %}
+{% if tg_empty %}<p class="hint">{{ tg_empty_en }}</p><p class="hint">{{ tg_empty_el }}</p>{% endif %}
+</div>
 <label>Send camera snapshots</label><div><input type="checkbox" name="telegram_photos" value="1" {{ 'checked' if s.telegram_photos }}>
 <p class="hint">Attach the picture from a camera alarm e-mail. Leave it on for cameras. Turn it off if the chat should stay text only.</p></div>
-<span></span><div><button>Save</button> <button formaction="{{ url_for('test_channel', ch='telegram') }}" class="sec">Save + send test</button></div></div></form></div>
+<span></span><div><button>Save</button> <button formaction="{{ url_for('test_channel', ch='telegram') }}" class="sec">Send test message</button>
+<p class="hint">Send test message saves the token and chat ID, then sends one message to that chat. Press Start in a private chat first, or let the bot post in the group. Turn Enabled on when the test arrives.</p></div></div></form></div>
 
 <div class="card" id="email"><h2>Outgoing e-mail (alerts to you, via SMTP)</h2>
 <p class="section-intro">Mail this monitor sends to you. It is not the mail cameras send in (that is the next section).</p>
@@ -3323,9 +3507,12 @@ def settings():
         tzs = ["Europe/Athens"]
     graph_rows = _graph_rows(hosts)
     mt_hosts, mt_files = _mikrotik_rows()
+    lookup = session.get("tg_lookup") or {}
     return page(SETTINGS_BODY, hosts=hosts, tzs=tzs, rx_status=RECEIVER.status(), trap_status=SNMP.trap_status,
                 snmp_ok=SNMP.available, graph_rows=graph_rows, mt_hosts=mt_hosts, mt_files=mt_files,
-                ping_name=_ping_impl["name"] or "not started")
+                ping_name=_ping_impl["name"] or "not started",
+                tg_chats=lookup.get("chats") or [], tg_webhook=bool(lookup.get("webhook")),
+                tg_empty=bool(lookup.get("empty")), tg_empty_en=_TG_EMPTY, tg_empty_el=_TG_EMPTY_EL)
 
 
 def _graph_rows(hosts):
@@ -3427,6 +3614,48 @@ def test_channel(ch):
     except Exception as e:
         flash(f"❌ Test {ch} failed: {e}")
     return redirect(url_for("settings") + "#" + section)
+
+
+@app.route("/settings/telegram/detect", methods=["POST"])
+@admin_required
+def telegram_detect():
+    token = _telegram_form_token()
+    try:
+        found = discover_telegram_chats(token)
+    except TelegramWebhookActive:
+        session["tg_lookup"] = {"webhook": True, "chats": [], "empty": False}
+        flash("A webhook is active on this bot, so getUpdates cannot read messages. Remove the webhook only if no other service needs this bot.")
+        return redirect(url_for("settings") + "#telegram")
+    except TelegramError as e:
+        session["tg_lookup"] = {"webhook": False, "chats": [], "empty": False}
+        flash(str(e))
+        return redirect(url_for("settings") + "#telegram")
+    chats = found["chats"]
+    if found["webhook"]:
+        session["tg_lookup"] = {"webhook": True, "chats": [], "empty": False}
+        flash("A webhook is active on this bot, so getUpdates cannot read messages. Remove the webhook only if no other service needs this bot.")
+    elif not chats:
+        session["tg_lookup"] = {"webhook": False, "chats": [], "empty": True}
+        flash(_TG_EMPTY + " " + _TG_EMPTY_EL)
+    else:
+        session["tg_lookup"] = {"webhook": False, "chats": chats, "empty": False}
+        flash("Found " + str(len(chats)) + " chat" + ("s" if len(chats) != 1 else "") + ". Click Use this chat, then Save.")
+    return redirect(url_for("settings") + "#telegram")
+
+
+@app.route("/settings/telegram/webhook", methods=["POST"])
+@admin_required
+def telegram_remove_webhook():
+    """deleteWebhook runs only when the admin clicks Remove webhook."""
+    token = _telegram_form_token()
+    try:
+        telegram_call(token, "deleteWebhook", {"drop_pending_updates": "false"})
+    except TelegramError as e:
+        flash(str(e))
+        return redirect(url_for("settings") + "#telegram")
+    session["tg_lookup"] = {"webhook": False, "chats": [], "empty": False}
+    flash("Webhook removed. Send a message to the bot, then click Detect chat ID again.")
+    return redirect(url_for("settings") + "#telegram")
 
 
 def _host_form():

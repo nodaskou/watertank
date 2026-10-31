@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.0.2
+
+- Settings → Telegram has Detect chat ID. It uses the token typed in the form, or the saved token, and asks Telegram for recent chats (private chats by first name and @username, groups and channels by title, including negative ids). Click a row to fill Chat ID. If a webhook is set, getUpdates is not used until you click Remove webhook. An unknown token shows a plain 401 message, and the token is not written to the log. Send test message saves the chat ID and sends one message. If no chat is found, the page says to send /start and click again, in English and Greek.
+
 ## 3.0.1
 
 - A recorder disk whose status is ok, normal, idle or sleeping is not a failure, even when free space is reported as zero. That stops the false “Disk hdda (still)” reminder whose message was “hdda status ok”. A disk that was failed and is healthy again logs one info event, “Disk … recovered”, sends one recovery notice, and then the reminders stop. The next check after this update clears a reminder that was already stuck on a healthy disk. Error, abnormal, unformatted, uninitialized, SMART-failed, and a disk that used to be installed and is now missing, are still alerts. The ping fail-count still does not apply to disks.

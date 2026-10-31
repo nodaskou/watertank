@@ -291,7 +291,7 @@ class Release301(unittest.TestCase):
         self.assertNotIn("ping + device e-mails", src)
         self.assertIn("Clear all log entries and events?", src)
         self.assertIn(">Clear log<", src)
-        self.assertEqual(pm.VERSION, "3.0.1")
+        self.assertEqual(pm.VERSION, "3.0.2")
 
     def test_clear_log_keeps_active_state(self):
         self.account(state="alarm", last_ts=time.time())
