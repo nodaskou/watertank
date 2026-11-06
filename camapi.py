@@ -221,6 +221,22 @@ def parse_dahua_storage(body):
     return disks
 
 
+def parse_dahua_record_state(body):
+    """Explicit record flags only. A body without them means unknown, not idle."""
+    kv = parse_dahua_kv(body)
+    out = {}
+    for key, value in kv.items():
+        m = re.match(r"(?:record|states|state)\[(\d+)\](?:\.State)?$", key, re.I)
+        if not m:
+            continue
+        val = value.strip().lower()
+        if val in ("1", "true", "yes", "recording"):
+            out[str(int(m.group(1)) + 1)] = True
+        elif val in ("0", "false", "no", "stop", "stopped"):
+            out[str(int(m.group(1)) + 1)] = False
+    return out
+
+
 def parse_dahua_videoloss(body):
     """eventManager getEventIndexes: channels[0]=1 means channel 1 has video loss."""
     lost = []
@@ -244,10 +260,79 @@ def _hik_problems(disks, channels):
         if ch.get("online") is False:
             found.append((f"ch:{ch['id']}", "cam_camera_offline", "critical", f"Camera {ch['id']} offline",
                           f"Channel {ch['id']} {ch.get('name') or ''} is offline".strip()))
-        if ch.get("recording") is False and ch.get("online") is not False:
-            found.append((f"rec:{ch['id']}", "cam_not_recording", "warning", f"Camera {ch['id']} not recording",
-                          f"Channel {ch['id']} is not recording"))
     return found
+
+
+def parse_hik_working(body):
+    """Live record flag from working status. Channels without a record tag stay unknown."""
+    root = ElementTree.fromstring(body)
+    out = {}
+    for el in _children(root, "ChanStatus") + _children(root, "ChannelStatus"):
+        cid = _xml_text(el, "chanNo") or _xml_text(el, "channel") or _xml_text(el, "id")
+        if not cid:
+            continue
+        rec = (_xml_text(el, "record") or _xml_text(el, "recStatus") or _xml_text(el, "recording")).lower()
+        if rec in ("1", "true", "yes"):
+            out[str(cid)] = True
+        elif rec in ("0", "false", "no"):
+            out[str(cid)] = False
+    return out
+
+
+def _in_record_window(expect, now_local):
+    """expect: channels set, start HH:MM, end HH:MM, days string of weekday numbers 0-6."""
+    days = str(expect.get("days") or "0123456")
+    if str(now_local.weekday()) not in days:
+        return False
+    start = str(expect.get("start") or "00:00")
+    end = str(expect.get("end") or "23:59")
+    try:
+        sh, sm = [int(x) for x in start.split(":", 1)]
+        eh, em = [int(x) for x in end.split(":", 1)]
+    except (TypeError, ValueError):
+        return True
+    minute = now_local.hour * 60 + now_local.minute
+    begin, stop = sh * 60 + sm, eh * 60 + em
+    if begin == stop:
+        return True
+    if begin < stop:
+        return begin <= minute < stop
+    return minute >= begin or minute < stop
+
+
+def recording_assessment(channels, expect, now_local):
+    """Recording problems only for expected channels with an explicit false flag.
+
+    An empty expected list means motion-only (or unset): never a recording failure.
+    Online false is a camera-offline problem elsewhere, not a recording failure.
+    A missing flag stays unknown and is not healthy and not failed.
+    """
+    wanted = {str(x).strip() for x in (expect or {}).get("channels") or [] if str(x).strip()}
+    if not wanted:
+        return [], "No channels are marked as expected to record, so motion-only recording is not flagged."
+    if now_local is not None and not _in_record_window(expect, now_local):
+        return [], "Outside the expected recording hours. A quiet channel is not a failure."
+    problems = []
+    unknown = False
+    for ch in channels or []:
+        cid = str(ch.get("id"))
+        if cid not in wanted:
+            continue
+        if ch.get("online") is False:
+            continue
+        if ch.get("online") is not True or ch.get("recording") is None:
+            unknown = True
+            continue
+        if ch.get("recording") is False:
+            problems.append({
+                "key": f"rec:{cid}", "kind": "cam_not_recording", "severity": "warning",
+                "title": f"Camera {cid} not recording",
+                "message": f"Channel {cid} is online and expected to record, and the recorder says it is not.",
+            })
+    note = ""
+    if unknown:
+        note = "Recording status is unknown for at least one expected channel. That is not counted as healthy or failed."
+    return problems, note
 
 
 def check_hikvision(fetch):
@@ -282,13 +367,35 @@ def check_hikvision(fetch):
     if status == 200 and body:
         ok_any = True
         try:
-            rec = {t["id"]: t["recording"] for t in parse_hik_recording(body)}
+            rec = {}
+            for track in parse_hik_recording(body):
+                tid = str(track["id"])
+                rec[tid] = track["recording"]
+                if tid.isdigit() and int(tid) >= 100:
+                    rec.setdefault(str(int(tid) // 100), track["recording"])
             for ch in channels:
-                if ch["id"] in rec:
-                    ch["recording"] = rec[ch["id"]]
+                if ch["id"] in rec and rec[ch["id"]] is not None:
+                    ch["schedule_enabled"] = rec[ch["id"]]
         except ElementTree.ParseError:
             pass
-    return _result("hikvision", ok_any, info, disks, channels, errors)
+    status, body = fetch("/ISAPI/System/workingstatus")
+    recording_note = ""
+    if status == 200 and body:
+        try:
+            live = parse_hik_working(body)
+        except ElementTree.ParseError:
+            live = {}
+        if not live:
+            recording_note = "Working status did not include a per-channel record flag. Recording is unknown."
+        for ch in channels:
+            if str(ch["id"]) in live:
+                ch["recording"] = live[str(ch["id"])]
+    elif status in (0, 404):
+        recording_note = "Live recording status is not available from this recorder. Recording is unknown, not healthy or failed."
+    result = _result("hikvision", ok_any, info, disks, channels, errors)
+    if recording_note:
+        result["recording_note"] = recording_note
+    return result
 
 
 def check_dahua(fetch):
@@ -325,7 +432,25 @@ def check_dahua(fetch):
         # Also list a channel when the body names it. Offline/loss channels are the alert.
         for cid in sorted(ids, key=lambda x: int(x) if x.isdigit() else 0):
             channels.append({"id": cid, "name": "", "online": False, "video_loss": True, "recording": None})
-    return _result("dahua", ok_any, info, disks, channels, errors)
+    status, body = fetch("/cgi-bin/recordManager.cgi?action=getState")
+    recording_note = "Live recording status is not available from this recorder. Recording is unknown, not healthy or failed."
+    if status == 200 and body is not None:
+        live = parse_dahua_record_state(body)
+        if live:
+            recording_note = ""
+            known = {str(ch["id"]): ch for ch in channels}
+            for cid, flag in live.items():
+                ch = known.get(cid)
+                if ch is None:
+                    ch = {"id": cid, "name": "", "online": None, "video_loss": None, "recording": flag}
+                    channels.append(ch)
+                    known[cid] = ch
+                else:
+                    ch["recording"] = flag
+    result = _result("dahua", ok_any, info, disks, channels, errors)
+    if recording_note:
+        result["recording_note"] = recording_note
+    return result
 
 
 def _result(brand, ok, info, disks, channels, errors):
