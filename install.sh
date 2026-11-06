@@ -99,7 +99,7 @@ main() {
   mkdir -p "$DATA_DIR" "$APP_DIR/assets"
   install -m 0644 "$SRC_DIR/pingmonitor.py" "$SRC_DIR/wirelogic.py" "$SRC_DIR/camapi.py" \
     "$SRC_DIR/mtbackup.py" "$SRC_DIR/reportpdf.py" "$SRC_DIR/jobs.py" "$SRC_DIR/siarecv.py" \
-    "$SRC_DIR/configbackup.py" \
+    "$SRC_DIR/configbackup.py" "$SRC_DIR/healthmon.py" "$SRC_DIR/iotmon.py" "$SRC_DIR/watchdog.py" \
     "$SRC_DIR/requirements.txt" "$APP_DIR/"
   if [[ -f "$SRC_DIR/assets/wirewave_logo.jpg" ]]; then
     install -m 0644 "$SRC_DIR/assets/wirewave_logo.jpg" "$APP_DIR/assets/wirewave_logo.jpg"
@@ -146,9 +146,12 @@ main() {
   fi
 
   echo "==> systemd service (enable and start on boot)"
+  install -m 0644 "$SRC_DIR/pingmonitor-watchdog.service" /etc/systemd/system/pingmonitor-watchdog.service
+  install -m 0644 "$SRC_DIR/pingmonitor-watchdog.timer" /etc/systemd/system/pingmonitor-watchdog.timer
   systemctl daemon-reload
   systemctl enable --now pingmonitor.service
   systemctl restart pingmonitor.service
+  systemctl enable --now pingmonitor-watchdog.timer || echo "    watchdog timer was not enabled"
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     echo "==> ufw is active - opening monitor ports"
