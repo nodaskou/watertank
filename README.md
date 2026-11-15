@@ -1,6 +1,6 @@
 # Wirewave Network Infrastructure Monitor
 
-Version 3.0.2. The feature history is in [CHANGELOG.md](CHANGELOG.md).
+Version 3.1.0. The feature history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick install (Debian)
 
@@ -137,6 +137,30 @@ The web UI has CSRF protection on every form. Login is locked out after repeated
 2. Paste the token into Settings -> Telegram. Open your new bot and press **Start** (or add the bot to a group and send a message there).
 3. Click **Detect chat ID**. Pick the chat. A person has a positive id. A group, supergroup or channel has a negative id. If Telegram reports a webhook, getUpdates cannot run until you click **Remove webhook** (only do that if no other service uses this bot).
 4. Click **Send test message**. That saves the token and chat ID and sends one message. Turn Enabled on when it arrives.
+
+### Upstream devices
+
+On a host row, **Upstream** is the router or switch that device needs. If the upstream host is down, you get that one outage (quiet hours, maintenance and repeat still apply) and the children’s outage messages are held. Their cards stay down and the ping history is kept. The card says alerts are held. When the upstream host recovers, each child that is still down and was not yet notified gets one alert. Choosing a parent that loops back is rejected.
+
+### Monitor health and a powered-off PC
+
+Settings → Alerts has the app-disk percents, backup grace, watchdog seconds and an optional external heartbeat URL. The disk check is the filesystem that stores this app, not an NVR disk. The daily config copy and weekly MikroTik exports raise one warning when they are late, and one recovery when they succeed again.
+
+`pingmonitor-watchdog.timer` runs `watchdog.py` every minute as `pingmon`. It can tell you the monitor service stopped or its heartbeat went stale **while this computer is still running**, using the saved Telegram and e-mail settings. It cannot send if this computer is powered off or has no network. For that, put a URL you already have (Healthchecks, Uptime Kuma, or similar) in **External heartbeat URL**. This program calls that URL each cycle. It does not create the external service. If you leave the URL empty, a total outage of this machine is invisible.
+
+### Switches (Shelly and Sonoff)
+
+Open **Switch** on a Shelly or Sonoff host. The check is read-only: it does not turn a relay on or off, flash firmware, or sign in to a cloud account.
+
+| Path | What is supported | What is not |
+|---|---|---|
+| Shelly Gen1 `GET /status` | [Gen1 HTTP API](https://shelly-api-docs.shelly.cloud/gen1/). Relays, inputs, meters and temperature when those keys exist. | Control URLs such as `relay/0?turn=on` are never called. |
+| Shelly Gen2+ `GET /rpc/Shelly.GetStatus` | [Switch component](https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch). `switch:N`, `input:N`, power and temperature when present. | `Switch.Set` is never called. |
+| Sonoff DIY `POST /zeroconf/info` | [DIY mode](https://help.sonoff.tech/docs/DIY-MODE-API-PROTOCOL) on BASICR3, RFR3, MINI, MINIR2, MINIR3, D1, SPM-Main, B02-BL-A60, B05-BL-A19, B05-BL-A60. Firmware 3.7.6+ needs the device id ([BASICR3/RFR3/MINI](https://help.sonoff.tech/docs/BASICR3-RFR3-MINIR2-API)). | Stock eWeLink firmware is not this API. Other Sonoff models are not listed as supported. `/zeroconf/switch` is never called. |
+| Tasmota HTTP `Status 0` / `Status 8` | A device you already flashed with [Tasmota](https://tasmota.github.io/docs/JSON-Status-Responses/). | Not stock Sonoff. Power commands are never sent. |
+| Tasmota MQTT | Your existing broker, topic `tele/<topic>/LWT` plus status. Online comes from the last will and a fresh status. Staleness is configurable. | This app does not install a broker. A broker connection alone is not “device online”. `paho-mqtt` is optional; without it the result is unknown, not offline. |
+
+A timeout is offline after the host’s fail count. HTTP 401 is “sign-in failed” and the device is not called offline. A relay that reports off is online. Tests in `tests/test_310.py` use mocked payloads, not a real switch.
 
 ### Outgoing e-mail examples
 

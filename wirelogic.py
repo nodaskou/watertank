@@ -192,6 +192,99 @@ UPS_STD_OIDS = {
     "output_voltage": "1.3.6.1.2.1.33.1.4.4.1.2.1",
     "load_pct": "1.3.6.1.2.1.33.1.4.4.1.5.1",
 }
+def dependency_cycle(host_id, parent_id, parent_of):
+    """True when parent_id points host_id at itself or at one of its own descendants."""
+    if not parent_id:
+        return False
+    if int(parent_id) == int(host_id):
+        return True
+    seen = {int(host_id)}
+    cur = int(parent_id)
+    while cur:
+        if cur in seen:
+            return True
+        seen.add(cur)
+        nxt = parent_of.get(cur)
+        if nxt in (None, "", 0, "0"):
+            return False
+        cur = int(nxt)
+    return False
+
+
+def upstream_down(host_id, parent_of, down_ids):
+    """Nearest ancestor id that is down, or None. Stops if the chain loops."""
+    seen = {int(host_id)}
+    cur = parent_of.get(int(host_id))
+    if cur in (None, "", 0, "0"):
+        return None
+    cur = int(cur)
+    down = {int(x) for x in down_ids}
+    while cur and cur not in seen:
+        if cur in down:
+            return cur
+        seen.add(cur)
+        nxt = parent_of.get(cur)
+        if nxt in (None, "", 0, "0"):
+            return None
+        cur = int(nxt)
+    return None
+
+
+def plan_ping(state, consec_fail, alerted_down, last_alert, dep_held, down_since,
+              ok, now, threshold, repeat_min, ancestor_down):
+    """Decide one ping transition.
+
+    A down ancestor suppresses the outage notification and later repeats.
+    When the ancestor recovers, a child that was never notified gets one alert.
+    A child that was already notified does not get a catch-up flood: its repeat
+    timer restarts. Quiet hours and maintenance are applied by the caller.
+    """
+    state = state or "pending"
+    consec_fail = int(consec_fail or 0)
+    alerted_down = 1 if alerted_down else 0
+    dep_held = 1 if dep_held else 0
+    last_alert = float(last_alert or 0)
+    threshold = max(1, int(threshold or 1))
+    repeat_min = int(repeat_min or 0)
+    if ok:
+        action = None
+        if state == "down" and alerted_down:
+            action = "recovered"
+        elif state == "down":
+            action = "recovered_quiet"
+        return {"state": "up", "consec_fail": 0, "alerted_down": 0, "last_alert": 0,
+                "dep_held": 0, "down_since": None, "action": action}
+    fails = consec_fail + 1
+    if state != "down" and fails < threshold:
+        return {"state": "warn", "consec_fail": fails, "alerted_down": 0, "last_alert": 0,
+                "dep_held": 0, "down_since": None, "action": None}
+    fresh = state != "down"
+    since = now if fresh or not down_since else down_since
+    if ancestor_down:
+        if fresh:
+            action = "held"
+        elif not dep_held:
+            action = "held_pause"
+        else:
+            action = None
+        return {"state": "down", "consec_fail": fails, "alerted_down": alerted_down,
+                "last_alert": last_alert, "dep_held": 1, "down_since": since, "action": action}
+    if dep_held and not alerted_down:
+        return {"state": "down", "consec_fail": fails, "alerted_down": 0, "last_alert": now,
+                "dep_held": 0, "down_since": since, "action": "release"}
+    if dep_held and alerted_down:
+        return {"state": "down", "consec_fail": fails, "alerted_down": 1, "last_alert": now,
+                "dep_held": 0, "down_since": since, "action": None}
+    if fresh:
+        return {"state": "down", "consec_fail": fails, "alerted_down": 0, "last_alert": 0,
+                "dep_held": 0, "down_since": since, "action": "down"}
+    if alerted_down and repeat_min > 0 and last_alert and now - last_alert >= repeat_min * 60:
+        return {"state": "down", "consec_fail": fails, "alerted_down": 1, "last_alert": now,
+                "dep_held": 0, "down_since": since, "action": "repeat"}
+    return {"state": "down", "consec_fail": fails, "alerted_down": alerted_down, "last_alert": last_alert,
+            "dep_held": 0, "down_since": since, "action": None}
+
+
 UPS_APC_OIDS = {
     "replace": "1.3.6.1.4.1.318.1.1.1.2.2.4.0",
     "charge_pct": "1.3.6.1.4.1.318.1.1.1.2.2.1.0",

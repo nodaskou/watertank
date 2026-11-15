@@ -8,6 +8,8 @@ import time
 from datetime import datetime
 
 import camapi
+import healthmon
+import iotmon
 import mtbackup
 import reportpdf
 import wirelogic
@@ -352,6 +354,17 @@ def apply_camera_result(pm, host, result, notify, prev_row, now):
         if item["key"] not in have:
             problems.append(item)
             have.add(item["key"])
+    problems = [p for p in problems if not str(p.get("key") or "").startswith("rec:")]
+    expect = _record_expect(host)
+    try:
+        now_local = datetime.fromtimestamp(now, pm.tzinfo())
+    except Exception:
+        now_local = datetime.fromtimestamp(now)
+    extra, note = camapi.recording_assessment(result.get("channels") or [], expect, now_local)
+    problems.extend(extra)
+    if note:
+        result["recording_note"] = note
+    have = {p.get("key") for p in problems}
     result["problems"] = problems
     notified = {k: float(v) for k, v in (prev.get("notified") or {}).items()}
     if not notify:
@@ -400,6 +413,22 @@ def apply_camera_result(pm, host, result, notify, prev_row, now):
     return result
 
 
+def _record_expect(host):
+    try:
+        cfg = json.loads((host or {}).get("cam") or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    raw = str(cfg.get("record_channels") or "").replace(";", ",")
+    return {
+        "channels": [part.strip() for part in raw.split(",") if part.strip()],
+        "start": cfg.get("record_start") or "00:00",
+        "end": cfg.get("record_end") or "23:59",
+        "days": cfg.get("record_days") or "0123456",
+    }
+
+
 def camera_poll(pm, only_id=None):
     s = pm.get_settings()
     interval = max(60, int(s.get("cam_interval") or 900))
@@ -432,6 +461,264 @@ def camera_poll(pm, only_id=None):
         if only_id:
             return saved
     return None
+
+
+def _save_health(pm, key, status, alerted, detail, now):
+    with pm._db_lock, pm.db() as c:
+        c.execute("""INSERT INTO health_state(key, status, since_ts, alerted, detail) VALUES(?,?,?,?,?)
+                     ON CONFLICT(key) DO UPDATE SET status=excluded.status, since_ts=excluded.since_ts,
+                     alerted=excluded.alerted, detail=excluded.detail""",
+                  (key, status, now, 1 if alerted else 0, detail[:400]))
+
+
+def _health_step(pm, s, key, status, severity, title, message, now, host=None):
+    """One warning or one recovery per key. unknown does not invent either."""
+    if status == "unknown":
+        return
+    with pm.db() as c:
+        row = c.execute("SELECT status, alerted FROM health_state WHERE key=?", (key,)).fetchone()
+    prev = row["status"] if row else ""
+    alerted = int(row["alerted"]) if row else 0
+    bad = status in ("warning", "critical", "stale", "hung", "stopped")
+    if status in ("ok", "off"):
+        if bad is False and prev in ("warning", "critical", "stale", "hung", "stopped") and alerted and status == "ok":
+            pm.add_event("health", "health_recovered", "info", host, title + " recovered", message)
+            pm.consider_notify(s, host, "info", f"[{s['site_name']}] {title} recovered", message,
+                               pm.build_payload(s, "device_alert", None, host, severity="info", message=message))
+        _save_health(pm, key, status, 0, message, now)
+        return
+    if not bad:
+        _save_health(pm, key, status, 0, message, now)
+        return
+    if prev == status and alerted:
+        return
+    pm.add_event("health", "health_" + status, severity, host, title, message)
+    pm.consider_notify(s, host, severity, f"[{s['site_name']}] {title}", message,
+                       pm.build_payload(s, "device_alert", None, host, severity=severity, message=message))
+    # The log line is the dedup marker. A suppressed notify must not be rewritten every cycle.
+    _save_health(pm, key, status, 1, message, now)
+
+
+def health_poll(pm, now=None):
+    """App-disk space and backup freshness. Recorder disks are a different check."""
+    s = pm.get_settings()
+    now = now or time.time()
+    try:
+        usage = os.statvfs(pm.DATA_DIR or ".")
+        free = usage.f_bavail * usage.f_frsize
+        total = usage.f_blocks * usage.f_frsize
+    except OSError:
+        free = total = None
+    level = healthmon.disk_level(free, total, s.get("health_disk_warn_pct"), s.get("health_disk_crit_pct"))
+    pct = ""
+    if total and free is not None:
+        pct = f" {100.0 * free / total:.0f}% free"
+    _health_step(pm, s, "app_disk", level, "critical" if level == "critical" else "warning",
+                 "App storage low", f"The monitor data disk is low.{pct}", now)
+    grace = int(s.get("health_backup_grace_h") or 0) * 3600
+    newest = None
+    try:
+        files = __import__("configbackup").list_local(pm.DATA_DIR)
+        if files:
+            newest = max(f["mtime"] for f in files)
+    except Exception:
+        newest = None
+    cfg_status = healthmon.backup_status(newest, now, 24 * 3600, grace, enabled=bool(s.get("secret_key")))
+    _health_step(pm, s, "config_backup", cfg_status, "warning", "App config backup stale",
+                 "The daily encrypted config copy is older than a day plus the grace period.", now)
+    with pm.db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT id, name, host, device_type, mtbak FROM hosts")]
+    for host in hosts:
+        try:
+            cfg = json.loads(host.get("mtbak") or "{}")
+        except (TypeError, ValueError):
+            cfg = {}
+        enabled = host.get("device_type") == "mikrotik" and bool(cfg.get("enabled"))
+        last = None
+        if enabled:
+            with pm.db() as c:
+                row = c.execute("SELECT MAX(ts) AS ts FROM backups WHERE host_id=? AND ok=1", (host["id"],)).fetchone()
+            last = row["ts"] if row else None
+        status = healthmon.backup_status(last, now, 7 * 86400, grace, enabled=enabled)
+        _health_step(pm, s, f"mt:{host['id']}", status, "warning", f"MikroTik backup stale: {host['name']}",
+                     f"{host['name']} has no successful export within a week plus the grace period.", now, host)
+
+
+def _iot_cfg(host):
+    try:
+        cfg = json.loads(host.get("iot") or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _iot_fetch(base, user, password):
+    def fetch(path, body=None):
+        url = base.rstrip("/") + path
+        method = "POST" if body is not None else "GET"
+        return iotmon.http_fetch(method, url, user, password, body)
+    return fetch
+
+
+def apply_iot_result(pm, host, result, prev, now, blocked):
+    s = pm.get_settings()
+    prev = prev or {}
+    plan = iotmon.plan_iot(prev.get("reach"), prev.get("fails"), prev.get("alerted"), prev.get("last_alert"),
+                           prev.get("held"), result.get("observation") or "unknown", now,
+                           pm.fail_limit(host, s), pm.repeat_minutes(host, s), blocked)
+    action = plan.get("action")
+    label = f"{host['name']} ({host['host']})"
+    if action in ("down", "release"):
+        msg = f"{label} is not answering its status API ({result.get('detail') or plan.get('diag')})."
+        pm.add_event("iot", "iot_offline", "critical", host, "Switch offline", msg, {"diag": plan.get("diag")})
+        how = pm.consider_notify(s, host, "critical", f"[{s['site_name']}] Switch offline: {host['name']}", msg,
+                                 pm.build_payload(s, "device_alert", None, host, severity="critical", message=msg))
+        plan["alerted"] = 1 if how in ("sent", "queued") else 0
+        plan["last_alert"] = now if plan["alerted"] else 0
+    elif action == "repeat":
+        msg = f"{label} is still not answering its status API."
+        pm.add_event("iot", "iot_offline_repeat", "critical", host, "Switch still offline", msg)
+        pm.consider_notify(s, host, "critical", f"[{s['site_name']}] Switch still offline: {host['name']}", msg,
+                           pm.build_payload(s, "device_alert", None, host, severity="critical", message=msg))
+    elif action == "held":
+        msg = f"{label} is not answering. Alerts are held because an upstream device is down. The switch is still shown offline."
+        pm.add_event("iot", "iot_held", "info", host, "Switch offline (alerts held)", msg)
+    elif action == "recovered":
+        msg = f"{label} is answering its status API again."
+        pm.add_event("iot", "iot_online", "info", host, "Switch online", msg)
+        pm.consider_notify(s, host, "info", f"[{s['site_name']}] Switch online: {host['name']}", msg,
+                           pm.build_payload(s, "device_alert", None, host, severity="info", message=msg))
+    notified = dict(prev.get("notified") or {})
+    if result.get("observation") == "auth" and "auth" not in notified and not blocked:
+        msg = f"{label} answered, but the username or password was rejected. The switch is not marked offline."
+        pm.add_event("iot", "iot_auth", "warning", host, "Switch sign-in failed", msg)
+        pm.consider_notify(s, host, "warning", f"[{s['site_name']}] Switch sign-in failed: {host['name']}", msg,
+                           pm.build_payload(s, "device_alert", None, host, severity="warning", message=msg))
+        notified["auth"] = now
+    if result.get("observation") == "online":
+        notified.pop("auth", None)
+    if result.get("observation") == "online":
+        for hit in iotmon.threshold_hits(result.get("parsed"), (prev.get("limits") or {}).get("temp_max"),
+                                         (prev.get("limits") or {}).get("power_max")):
+            if hit["key"] in notified:
+                continue
+            if blocked:
+                continue
+            pm.add_event("iot", "iot_" + hit["key"], hit["severity"], host, hit["title"], hit["message"])
+            pm.consider_notify(s, host, hit["severity"], f"[{s['site_name']}] {hit['title']}: {host['name']}",
+                               hit["message"], pm.build_payload(s, "device_alert", None, host,
+                                                                severity=hit["severity"], message=hit["message"]))
+            notified[hit["key"]] = now
+        active = {h["key"] for h in iotmon.threshold_hits(result.get("parsed"), (prev.get("limits") or {}).get("temp_max"),
+                                                          (prev.get("limits") or {}).get("power_max"))}
+        for key in list(notified):
+            if key in ("temp", "power") and key not in active:
+                pm.add_event("iot", "iot_recovered", "info", host, "Switch reading normal", f"{key} is back within the limit.")
+                del notified[key]
+    stored = {
+        "reach": plan["reach"], "fails": plan["fails"], "alerted": plan["alerted"],
+        "last_alert": plan["last_alert"], "held": plan["held"], "diag": result.get("detail") or plan.get("diag"),
+        "observation": result.get("observation"), "parsed": result.get("parsed"),
+        "mode": result.get("mode"), "brand": result.get("brand"), "calls": result.get("calls") or [],
+        "notified": notified, "limits": prev.get("limits") or {}, "ts": now,
+        "last_seen": now if result.get("observation") == "online" else prev.get("last_seen"),
+    }
+    with pm._db_lock, pm.db() as c:
+        c.execute("INSERT OR REPLACE INTO iot_state(host_id, ts, data) VALUES(?,?,?)",
+                  (host["id"], now, json.dumps(stored)))
+    return stored
+
+
+def iot_poll(pm, only_id=None, now=None):
+    s = pm.get_settings()
+    interval = max(30, int(s.get("iot_interval") or 60))
+    now = now or time.time()
+    with pm.db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT * FROM hosts WHERE enabled=1")]
+    by_state = {h["id"]: h.get("state") for h in hosts}
+    parent_of = {h["id"]: h.get("parent_id") or None for h in hosts}
+    down_ids = {i for i, st in by_state.items() if st == "down"}
+    for host in hosts:
+        if only_id and host["id"] != only_id:
+            continue
+        if host.get("device_type") not in ("shelly", "sonoff"):
+            continue
+        cfg = _iot_cfg(host)
+        if not cfg.get("enabled") and not only_id:
+            continue
+        with pm.db() as c:
+            prev_row = c.execute("SELECT data FROM iot_state WHERE host_id=?", (host["id"],)).fetchone()
+        prev = {}
+        if prev_row and prev_row["data"]:
+            try:
+                prev = json.loads(prev_row["data"])
+            except (TypeError, ValueError):
+                prev = {}
+        if not only_id and prev.get("ts") and now - float(prev.get("ts") or 0) < interval:
+            continue
+        mode = cfg.get("mode") or ("auto" if host["device_type"] == "shelly" else "diy")
+        user = cfg.get("user") or ""
+        password = pm.decrypt_secret(cfg.get("password") or "")
+        cfg["mqtt_password"] = pm.decrypt_secret(cfg.get("mqtt_password") or "")
+        port = int(cfg.get("port") or (8081 if mode == "diy" else 80))
+        base = f"http://{host['host']}:{port}"
+        limits = {"temp_max": cfg.get("temp_max") or 0, "power_max": cfg.get("power_max") or 0}
+        prev["limits"] = limits
+        if mode == "mqtt":
+            result = iotmon.mqtt_library_missing()
+            try:
+                import paho.mqtt.client as mqtt  # noqa: F401
+            except ImportError:
+                result = iotmon.mqtt_library_missing()
+            else:
+                result = _mqtt_read(cfg, host, now)
+        elif host["device_type"] == "shelly":
+            result = iotmon.check_shelly(_iot_fetch(base, user, password), cfg.get("generation") or "auto")
+        elif mode == "tasmota":
+            result = iotmon.check_tasmota(_iot_fetch(base, user, password))
+        else:
+            result = iotmon.check_sonoff_diy(
+                lambda path, body=None: iotmon.http_fetch("POST", base.rstrip("/") + path, user, password, body),
+                cfg.get("device_id") or "")
+        ancestor = wirelogic.upstream_down(host["id"], parent_of, down_ids)
+        blocked = bool(ancestor) or host.get("state") == "down"
+        saved = apply_iot_result(pm, host, result, prev, now, blocked)
+        if only_id:
+            return saved
+    return None
+
+
+def _mqtt_read(cfg, host, now):
+    import paho.mqtt.client as mqtt
+    topic = (cfg.get("mqtt_topic") or "").strip().strip("/")
+    if not topic or not cfg.get("mqtt_host"):
+        return {"brand": "sonoff", "mode": "mqtt", "observation": "unknown", "parsed": None,
+                "detail": "Set the broker address and the device topic. Connecting to a broker is not the same as the switch being online.",
+                "calls": [], "ok": False}
+    records = []
+
+    def on_message(_c, _u, msg):
+        records.append({"topic": msg.topic, "payload": msg.payload.decode("utf-8", "replace"), "ts": time.time()})
+
+    client = mqtt.Client()
+    if cfg.get("mqtt_user"):
+        client.username_pw_set(cfg.get("mqtt_user"), cfg.get("mqtt_password") or "")
+    try:
+        client.connect(cfg.get("mqtt_host"), int(cfg.get("mqtt_port") or 1883), 10)
+        client.on_message = on_message
+        client.subscribe(f"tele/{topic}/#")
+        client.subscribe(f"stat/{topic}/#")
+        client.loop_start()
+        time.sleep(2)
+        client.loop_stop()
+        client.disconnect()
+    except Exception:
+        return {"brand": "sonoff", "mode": "mqtt", "observation": "unknown", "parsed": None,
+                "detail": "Could not read the broker. The switch is not marked offline just because the broker did not answer.",
+                "calls": ["mqtt"], "ok": False}
+    viewed = iotmon.evaluate_mqtt(records, now, cfg.get("stale_sec") or 180)
+    return {"brand": "sonoff", "mode": "mqtt", "observation": viewed["reach"], "parsed": viewed.get("parsed"),
+            "detail": viewed.get("diag") or "", "calls": ["mqtt"], "ok": viewed["reach"] == "online"}
 
 
 def backup_due(s, last_ts, now=None):

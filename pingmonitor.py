@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_file, send_from_directory, session, url_for)
 
-VERSION = "3.0.2"
+VERSION = "3.1.0"
 APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
@@ -88,6 +88,8 @@ DEVICE_TYPES = {
     "server":    ("PC / server / NVR software", "PC", "#475569"),
     "printer":   ("Printer", "PRN", "#a16207"),
     "ups":       ("UPS", "UPS", "#b45309"),
+    "shelly":    ("Shelly switch", "SH", "#1d4ed8"),
+    "sonoff":    ("Sonoff / Tasmota switch", "SO", "#ea580c"),
 }
 
 # ----------------------------------------------------------------------------- settings
@@ -136,6 +138,10 @@ DEFAULTS = {
     "sia_ts_mode": "tolerant", "sia_ts_window": 600,
     # Periodic SIA tests and NULL heartbeats stay off the log unless this is on.
     "sia_log_tests": 0,
+    "health_disk_warn_pct": 15, "health_disk_crit_pct": 5,
+    "health_backup_grace_h": 12, "health_watchdog_sec": 180,
+    "health_heartbeat_url": "",
+    "iot_interval": 60,
 }
 INT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, int)}
 SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password"}
@@ -238,6 +244,15 @@ def _migrate(c):
     _add_col(c, "sia_log", "server_utc", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "sia_log", "delta_s", "INTEGER")
     _add_col(c, "sia_log", "flag", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "hosts", "parent_id", "INTEGER")
+    _add_col(c, "hosts", "dep_held", "INTEGER NOT NULL DEFAULT 0")
+    _add_col(c, "hosts", "iot", "TEXT NOT NULL DEFAULT ''")
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS health_state(
+            key TEXT PRIMARY KEY, status TEXT NOT NULL, since_ts REAL,
+            alerted INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS iot_state(host_id INTEGER PRIMARY KEY, ts REAL, data TEXT);
+    """)
 
 
 def init_db():
@@ -966,55 +981,76 @@ def monitor_cycle(pool):
     results = list(pool.map(lambda h: (h, *pinger["fn"](h["host"], timeout)), due))
     site = s["site_name"]
     with _db_lock, db() as c:
+        loaded = []
         for h, ok, ms in results:
             fresh = c.execute("SELECT * FROM hosts WHERE id=? AND enabled=1", (h["id"],)).fetchone()
-            if not fresh:
-                continue
-            h = dict(fresh)
+            if fresh:
+                loaded.append((dict(fresh), bool(ok), ms))
+        state_of = {h["id"]: h.get("state") for h in hosts}
+        names = {h["id"]: h.get("name") for h in hosts}
+        parent_of = {h["id"]: h.get("parent_id") or None for h in hosts}
+        for h, ok, _ms in loaded:
             threshold = fail_limit(h, s)
+            fails = 0 if ok else int(h.get("consec_fail") or 0) + 1
+            if ok:
+                state_of[h["id"]] = "up"
+            elif h.get("state") == "down" or fails >= threshold:
+                state_of[h["id"]] = "down"
+            else:
+                state_of[h["id"]] = "warn"
+        down_ids = {i for i, st in state_of.items() if st == "down"}
+        for h, ok, ms in loaded:
             c.execute("INSERT INTO results(host_id, ts, ok, ms, n, nok, g) VALUES(?,?,?,?,1,?,0)",
                       (h["id"], now, int(ok), ms, 1 if ok else 0))
+            ancestor = wirelogic.upstream_down(h["id"], parent_of, down_ids)
+            ancestor_name = names.get(ancestor) or "upstream"
+            plan = wirelogic.plan_ping(
+                h.get("state"), h.get("consec_fail"), h.get("alerted_down"), h.get("last_alert"),
+                h.get("dep_held"), h.get("down_since"), ok, now, fail_limit(h, s),
+                repeat_minutes(h, s), bool(ancestor))
             label = f"{h['name']} ({h['host']})"
-            if ok:
-                if h["state"] == "down" and h.get("alerted_down"):
-                    downtime = now - (h["down_since"] or now)
-                    msg = f"{label} is back UP ({ms} ms) after {fmt_dur(downtime)} down."
-                    eid = add_event("ping", "host_recovered", "info", h, "Recovered", msg, {"downtime_seconds": int(downtime)}, ts=now, conn=c)
-                    text = f"✅ RECOVERED [{site}]\n{label} is back UP ({ms} ms)\nDowntime: {fmt_dur(downtime)}\n{fmt_ts(now)}"
-                    consider_notify(s, h, "info", f"[{site}] RECOVERED: {h['name']}", text,
-                                    build_payload(s, "host_recovered", eid, h, "up", h["down_since"], downtime, 0, ms, "info", msg, ts=now))
-                c.execute("UPDATE hosts SET state='up', consec_fail=0, last_ms=?, last_check=?, last_seen=?, down_since=NULL, alerted_down=0, last_alert=0 WHERE id=?",
-                          (ms, now, now, h["id"]))
-            else:
-                fails = h["consec_fail"] + 1
-                state, down_since = h["state"], h["down_since"]
-                alerted = h.get("alerted_down") or 0
-                last_alert = h.get("last_alert") or 0
-                if fails >= threshold and state != "down":
-                    state, down_since = "down", now
-                    msg = f"{label} is not responding ({fails} failed pings in a row). Last seen: {fmt_ts(h['last_seen'])}."
-                    eid = add_event("ping", "host_down", "critical", h, "Down", msg, {"consecutive_failures": fails}, ts=now, conn=c)
-                    text = (f"🔴 DOWN [{site}]\n{label} is not responding ({fails} failed pings in a row)\n"
-                            f"Last seen: {fmt_ts(h['last_seen'])}\n{fmt_ts(now)}")
-                    how = consider_notify(s, h, "critical", f"[{site}] DOWN: {h['name']}", text,
-                                          build_payload(s, "host_down", eid, h, "down", now, 0, fails, None, "critical", msg, ts=now))
-                    alerted = 1 if how in ("sent", "queued") else 0
-                    last_alert = now if alerted else 0
-                elif state == "down":
-                    every = repeat_minutes(h, s)
-                    if alerted and every > 0 and last_alert and now - last_alert >= every * 60:
-                        msg = f"{label} is still DOWN ({fmt_dur(now - (down_since or now))})."
-                        eid = add_event("ping", "host_down_repeat", "critical", h, "Still down", msg,
-                                        {"consecutive_failures": fails}, ts=now, conn=c)
-                        text = f"🔴 STILL DOWN [{site}]\n{msg}\n{fmt_ts(now)}"
-                        consider_notify(s, h, "critical", f"[{site}] STILL DOWN: {h['name']}", text,
-                                        build_payload(s, "host_down", eid, h, "down", down_since, now - (down_since or now),
-                                                      fails, None, "critical", msg, ts=now))
-                        last_alert = now
-                elif state != "down":
-                    state = "warn"
-                c.execute("UPDATE hosts SET state=?, consec_fail=?, last_check=?, last_ms=NULL, down_since=?, alerted_down=?, last_alert=? WHERE id=?",
-                          (state, fails, now, down_since, alerted, last_alert, h["id"]))
+            alerted = plan["alerted_down"]
+            last_alert = plan["last_alert"]
+            action = plan["action"]
+            if action == "recovered":
+                downtime = now - (h["down_since"] or now)
+                msg = f"{label} is back UP ({ms} ms) after {fmt_dur(downtime)} down."
+                eid = add_event("ping", "host_recovered", "info", h, "Recovered", msg, {"downtime_seconds": int(downtime)}, ts=now, conn=c)
+                text = f"✅ RECOVERED [{site}]\n{label} is back UP ({ms} ms)\nDowntime: {fmt_dur(downtime)}\n{fmt_ts(now)}"
+                consider_notify(s, h, "info", f"[{site}] RECOVERED: {h['name']}", text,
+                                build_payload(s, "host_recovered", eid, h, "up", h["down_since"], downtime, 0, ms, "info", msg, ts=now))
+            elif action == "recovered_quiet":
+                add_event("ping", "host_recovered", "info", h, "Recovered",
+                          f"{label} is back UP. No outage alert was sent because an upstream device was down.",
+                          {}, ts=now, conn=c)
+            elif action in ("down", "release"):
+                why = f"{label} is not responding ({plan['consec_fail']} failed pings in a row). Last seen: {fmt_ts(h['last_seen'])}."
+                if action == "release":
+                    why = f"{label} is still down after {ancestor_name} recovered."
+                eid = add_event("ping", "host_down", "critical", h, "Down", why, {"consecutive_failures": plan["consec_fail"]}, ts=now, conn=c)
+                text = f"🔴 DOWN [{site}]\n{why}\n{fmt_ts(now)}"
+                how = consider_notify(s, h, "critical", f"[{site}] DOWN: {h['name']}", text,
+                                      build_payload(s, "host_down", eid, h, "down", plan["down_since"], 0,
+                                                    plan["consec_fail"], None, "critical", why, ts=now))
+                alerted = 1 if how in ("sent", "queued") else 0
+                last_alert = now if alerted else plan["last_alert"]
+            elif action == "repeat":
+                msg = f"{label} is still DOWN ({fmt_dur(now - (plan['down_since'] or now))})."
+                eid = add_event("ping", "host_down_repeat", "critical", h, "Still down", msg,
+                                {"consecutive_failures": plan["consec_fail"]}, ts=now, conn=c)
+                text = f"🔴 STILL DOWN [{site}]\n{msg}\n{fmt_ts(now)}"
+                consider_notify(s, h, "critical", f"[{site}] STILL DOWN: {h['name']}", text,
+                                build_payload(s, "host_down", eid, h, "down", plan["down_since"],
+                                              now - (plan["down_since"] or now), plan["consec_fail"], None, "critical", msg, ts=now))
+            elif action in ("held", "held_pause"):
+                add_event("ping", "host_down_held", "info", h, "Down (alerts held)",
+                          f"{label} is down. Alerts are held because upstream {ancestor_name} is down. The card stays down.",
+                          {"upstream": ancestor_name}, ts=now, conn=c)
+            seen = now if ok else h.get("last_seen")
+            c.execute("""UPDATE hosts SET state=?, consec_fail=?, last_ms=?, last_check=?, last_seen=?,
+                         down_since=?, alerted_down=?, last_alert=?, dep_held=? WHERE id=?""",
+                      (plan["state"], plan["consec_fail"], ms if ok else None, now, seen,
+                       plan["down_since"], alerted, last_alert, plan["dep_held"], h["id"]))
 
 
 def refresh_public_ip():
@@ -1165,6 +1201,39 @@ def prune():
     log.info("History rollup finished (raw 2 days, 5 min to 7 days, hourly after that)")
 
 
+def _health_lines():
+    try:
+        with db() as c:
+            rows = c.execute("SELECT status, detail FROM health_state ORDER BY key").fetchall()
+    except Exception:
+        return []
+    return [{"status": r["status"], "detail": r["detail"]} for r in rows
+            if r["status"] not in ("ok", "off", "unknown", "")]
+
+
+def _write_heartbeat():
+    if not DATA_DIR:
+        return
+    path = os.path.join(DATA_DIR, "heartbeat")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(int(time.time())))
+    except OSError:
+        log.info("heartbeat file was not written")
+
+
+def _ping_external_heartbeat(s):
+    """Optional push URL the operator already has. This does not create that service."""
+    url = (s.get("health_heartbeat_url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return
+    try:
+        req = urllib.request.Request(url, method="GET")
+        urllib.request.urlopen(req, timeout=5).read(200)
+    except Exception:
+        log.info("external heartbeat ping failed")
+
+
 def monitor_loop(stop):
     last_prune = 0
     me = sys.modules[__name__]
@@ -1178,6 +1247,8 @@ def monitor_loop(stop):
                     jobs.flush_quiet(me)
                     jobs.camera_poll(me)
                     jobs.backup_scheduled(me)
+                    jobs.iot_poll(me)
+                    jobs.health_poll(me)
                 except Exception:
                     log.exception("extra monitor jobs failed")
                 if start - last_prune > 900:
@@ -1185,7 +1256,9 @@ def monitor_loop(stop):
                     last_prune = start
             except Exception:
                 log.exception("monitor cycle failed")
+            _write_heartbeat()
             s = get_settings()
+            _ping_external_heartbeat(s)
             interval = max(5, int(s["ping_interval"]))
             try:
                 with db() as c:
@@ -2569,6 +2642,9 @@ INDEX_BODY = CHART_JS + """
 <div class="chartbox"><canvas id="dg{{ g.key }}"></canvas></div>
 <script>drawSeries('dg{{ g.key }}',[{label:'In',color:{{ g.color_in|tojson }},fill:'rgba(22,163,74,.12)',data:{{ g.inn|tojson }}},{label:'Out',color:{{ g.color_out|tojson }},data:{{ g.out|tojson }}}],{bps:true});</script>
 </div>{% endfor %}</div>{% endif %}
+{% if health %}<div class="card"><h2>Monitor health</h2>
+{% for item in health %}<p><b>{{ item.status }}</b> · {{ item.detail }}</p>{% endfor %}
+<p class="hint">These are this app’s disk and backup checks. A powered-off PC cannot send them. Use the external heartbeat URL for that.</p></div>{% endif %}
 <div class="summary">
  <div class="pill g" id="pill-up">UP {{ c.up }}</div><div class="pill r" id="pill-down">DOWN {{ c.down }}</div>
  {% if c.warn %}<div class="pill a">UNSTABLE {{ c.warn }}</div>{% endif %}
@@ -2589,6 +2665,8 @@ INDEX_BODY = CHART_JS + """
  {% if h.sn.extra.temp %} · <b>{{ h.sn.extra.temp }}°C</b>{% endif %}{% if h.sn.extra.voltage %} · <b>{{ h.sn.extra.voltage }} V</b>{% endif %}{% if h.sn.extra.wireless_clients is defined %} · <b>{{ h.sn.extra.wireless_clients }}</b> Wi-Fi clients{% endif %}
  <div style="margin-top:4px">{% for i in h.sn.watched %}<span class="lnk {{ 'g' if i.oper=='up' else 'r' }}" title="{{ i.alias }} {{ i.oper }}">{{ i.name }} {{ '▲' if i.oper=='up' else '▼' }}{% if i.in_bps is not none %} <small>{{ fmt_bps(i.in_bps) }}↓ {{ fmt_bps(i.out_bps) }}↑</small>{% endif %}</span>{% endfor %}</div>{% endif %}</div>{% endif %}
  {% if h.cam_line %}<div class="snmpline">🎥 {% if h.cam and not h.cam.ok %}<span style="color:#dc2626">{{ h.cam_line }}</span>{% else %}{{ h.cam_line }}{% endif %}</div>{% endif %}
+ {% if h.iot_line %}<div class="snmpline">{% if 'OFFLINE' in h.iot_line %}<b style="color:#dc2626">{{ h.iot_line }}</b>{% else %}{{ h.iot_line }}{% endif %}</div>{% endif %}
+ {% if h.dep_note %}<div class="snmpline">{{ h.dep_note }}</div>{% endif %}
  <div class="chartbox"><canvas id="c{{ h.id }}"></canvas></div><script>drawChart('c{{ h.id }}', {{ h.points|tojson }});</script>
 </div>{% endfor %}</div>{% else %}<div class="card">No hosts yet. {% if role()=='admin' %}<a href="{{ url_for('settings') }}#hosts">Add hosts in Settings</a>.{% endif %}</div>{% endfor %}
 <div id="alarm-section" {% if not alarms %}hidden{% endif %}>
@@ -2612,6 +2690,7 @@ INDEX_BODY = CHART_JS + """
 
 HOST_BODY = CHART_JS + """{% if role()=='admin' %}<p class="hint"><a href="{{ url_for('host_snmp', hid=h.id) }}">SNMP</a>
 {% if h.device_type in ('hikvision', 'dahua') %} · <a href="{{ url_for('host_camera', hid=h.id) }}">Camera API</a>{% endif %}
+{% if h.device_type in ('shelly', 'sonoff') %} · <a href="{{ url_for('host_iot', hid=h.id) }}">Switch</a>{% endif %}
 {% if h.device_type=='mikrotik' %} · <a href="{{ url_for('host_backup', hid=h.id) }}">MikroTik backup</a>{% endif %}</p>{% endif %}
 <p class="ranges">{% for key, label in spans %}<a href="?span={{ key }}" class="{{ 'on' if span==key else '' }}">{{ label }}</a>{% endfor %}</p>
 <p class="hint"><span id="live-at">last updated {{ now }}</span> · <span id="live-err" hidden style="color:#b91c1c">update failed</span></p>
@@ -2772,6 +2851,38 @@ def host_view(row, since, tz, full=False):
                              + (f" · {off} offline" if off else ""))
         else:
             h["cam_line"] = h["cam"].get("error") or "camera API failed"
+    h["iot_line"] = ""
+    h["dep_note"] = ""
+    with db() as c:
+        iot = c.execute("SELECT data FROM iot_state WHERE host_id=?", (h["id"],)).fetchone()
+        parent = None
+        if h.get("parent_id"):
+            parent = c.execute("SELECT id, name, state FROM hosts WHERE id=?", (h["parent_id"],)).fetchone()
+    if iot and iot["data"]:
+        try:
+            blob = json.loads(iot["data"])
+        except (TypeError, ValueError):
+            blob = {}
+        reach = blob.get("reach") or "unknown"
+        seen = fmt_ts(blob.get("last_seen"), tz) if blob.get("last_seen") else "never"
+        parts = []
+        for ch in (blob.get("parsed") or {}).get("channels") or []:
+            if ch.get("on") is True:
+                parts.append(f"{ch.get('kind') or 'ch'} {ch.get('index')} on")
+            elif ch.get("on") is False:
+                parts.append(f"{ch.get('kind') or 'ch'} {ch.get('index')} off")
+        parsed = blob.get("parsed") or {}
+        if parsed.get("temp_c") is not None:
+            parts.append(f"{parsed['temp_c']}°C")
+        watts = [p.get("watts") for p in (parsed.get("power") or []) if p.get("watts") is not None]
+        if watts:
+            parts.append(f"{max(watts):g} W")
+        word = {"online": "online", "offline": "OFFLINE", "auth": "sign-in failed", "api_error": "API error"}.get(reach, "unknown")
+        h["iot_line"] = f"{word} · last seen {seen}" + (" · " + " · ".join(parts) if parts else "")
+        if reach == "auth":
+            h["iot_line"] = "reachable, sign-in failed · not offline · " + h["iot_line"]
+    if h.get("state") == "down" and h.get("dep_held") and parent:
+        h["dep_note"] = f"Alerts held: upstream {parent['name']} is down. This device is still down."
     if not h["enabled"]:
         h["state"] = "disabled"
     return h
@@ -2906,7 +3017,9 @@ def index():
     elif any(h.get("lan_down") for h in hosts):
         names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
         banner = {"cls": "warn", "text": "LAN device down: " + names}
+    health = _health_lines()
     return page(INDEX_BODY, charts=True, live="dashboard", groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
+                health=health,
                 now=fmt_ts(time.time(), tz), span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000,
                 wan=wan, traffic=_traffic_cards(since), banner=banner, alarms=alarms, bar=_status_bar(hosts, wan, alarms),
                 last_cleared=last_cleared_text(tz), clear_next="dashboard")
@@ -3141,13 +3254,16 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <li><b>Maintenance until</b> — no alerts for this host until that time, and the card shows MAINT. Example: tonight 22:00 while you replace a switch. Clear the field to turn it off.</li>
 <li><b>Camera API</b> — shown for a Hikvision or Dahua host. Username and password for the recorder's own HTTP API, with a Test button.</li>
 <li><b>Backup</b> — MikroTik export account. Use a user that can read the config, not the full admin if you can avoid it.</li>
+<li><b>Upstream</b> — optional parent, usually the switch or router this device needs. If that parent is down, its own outage is sent once and the children’s outage messages are held. The children still show down and keep ping history. A loop (A depends on B depends on A) is rejected.</li>
+<li><b>Switch</b> — Shelly or Sonoff/Tasmota status page. Read-only: relays are not switched from here.</li>
 </ul>
-<div class="table-wrap"><table><tr><th>Name</th><th>IP / hostname</th><th>Group</th><th>Type</th><th>On</th><th>Fails</th><th>Ping s</th><th>Repeat</th><th>Maintenance until</th><th></th></tr>
+<div class="table-wrap"><table><tr><th>Name</th><th>IP / hostname</th><th>Group</th><th>Type</th><th>Upstream</th><th>On</th><th>Fails</th><th>Ping s</th><th>Repeat</th><th>Maintenance until</th><th></th></tr>
 {% for h in hosts %}<tr>
 <td><input type="text" form="hf{{ h.id }}" name="name" value="{{ h.name }}" required maxlength="60" style="width:150px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="host" value="{{ h.host }}" required maxlength="253" style="width:140px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="grp" value="{{ h.grp }}" maxlength="60" style="width:120px"></td>
 <td><select form="hf{{ h.id }}" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}" {{ 'selected' if k==h.device_type }}>{{ v[0] }}</option>{% endfor %}</select></td>
+<td><select form="hf{{ h.id }}" name="parent_id"><option value="">—</option>{% for o in hosts %}{% if o.id != h.id %}<option value="{{ o.id }}" {{ 'selected' if o.id==h.parent_id }}>{{ o.name }}</option>{% endif %}{% endfor %}</select></td>
 <td><input type="checkbox" form="hf{{ h.id }}" name="enabled" value="1" {{ 'checked' if h.enabled }}></td>
 <td><input type="number" form="hf{{ h.id }}" name="fail_n" min="0" max="20" value="{{ h.fail_n or 0 }}" style="width:58px" title="0 = use the global fail count"></td>
 <td><input type="number" form="hf{{ h.id }}" name="ping_every" min="0" max="3600" value="{{ h.ping_every or '' }}" style="width:64px" placeholder="global" title="0 or empty = global ping interval"></td>
@@ -3155,7 +3271,8 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <td><input type="datetime-local" form="hf{{ h.id }}" name="maint_local" value="{{ h.maint_local }}"></td>
 <td style="white-space:nowrap"><a href="{{ url_for('host_snmp', hid=h.id) }}">SNMP</a>
  {% if h.device_type in ('hikvision', 'dahua') %}· <a href="{{ url_for('host_camera', hid=h.id) }}"><b>Camera API</b></a>{% endif %}
- {% if h.device_type == 'mikrotik' %}· <a href="{{ url_for('host_backup', hid=h.id) }}">Backup</a>{% endif %}<br>
+ {% if h.device_type == 'mikrotik' %}· <a href="{{ url_for('host_backup', hid=h.id) }}">Backup</a>{% endif %}
+ {% if h.device_type in ('shelly', 'sonoff') %}· <a href="{{ url_for('host_iot', hid=h.id) }}"><b>Switch</b></a>{% endif %}<br>
 <form id="hf{{ h.id }}" method="post" action="{{ url_for('host_save', hid=h.id) }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>Save</button></form>
 <form method="post" action="{{ url_for('host_delete', hid=h.id) }}" style="display:inline" onsubmit="return confirm('Delete {{ h.name }} and its history?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del">Delete</button></form></td></tr>
 {% endfor %}
@@ -3164,6 +3281,7 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <td><input type="text" form="hadd" name="host" placeholder="192.168.1.10" required maxlength="253" style="width:140px"></td>
 <td><input type="text" form="hadd" name="grp" placeholder="e.g. Cameras" maxlength="60" style="width:120px"></td>
 <td><select form="hadd" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}">{{ v[0] }}</option>{% endfor %}</select></td>
+<td><select form="hadd" name="parent_id"><option value="">—</option>{% for o in hosts %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}</select></td>
 <td><input type="checkbox" form="hadd" name="enabled" value="1" checked></td><td></td><td></td><td></td><td></td>
 <td><form id="hadd" method="post" action="{{ url_for('host_add') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>+ Add</button></form></td></tr></table></div></div>
 
@@ -3185,6 +3303,18 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <p class="hint">Keep sending critical alarms during quiet hours, including a failed disk and a host that is down. Untick to queue those as well. The failed-ping count does not apply to disks.</p></div>
 <label>Site maintenance until</label><div><input type="datetime-local" name="maintenance_until" value="{{ ts_to_local_input(s.maintenance_until) }}">
 <p class="hint">No alerts for any host until this local time. Clear the field and save to turn it off. A single host can have its own window in the Hosts table.</p></div>
+<label>App disk warning (%)</label><div><input type="number" name="health_disk_warn_pct" min="0" max="100" value="{{ s.health_disk_warn_pct }}">
+<p class="hint">Warn when free space on the disk that holds this app’s data is at or below this percent. Example: <code>15</code>. <code>0</code> turns the warning off. This is not a camera disk.</p></div>
+<label>App disk critical (%)</label><div><input type="number" name="health_disk_crit_pct" min="0" max="100" value="{{ s.health_disk_crit_pct }}">
+<p class="hint">Critical when free space is at or below this percent. Example: <code>5</code>. <code>0</code> turns it off. One alert when it crosses, one recovery when it rises.</p></div>
+<label>Backup grace (hours)</label><div><input type="number" name="health_backup_grace_h" min="0" max="168" value="{{ s.health_backup_grace_h }}">
+<p class="hint">How long after the daily config copy, or the weekly MikroTik export, may be late before one warning. Example: <code>12</code>. A missing API is not called a failure.</p></div>
+<label>Watchdog (seconds)</label><div><input type="number" name="health_watchdog_sec" min="30" max="3600" value="{{ s.health_watchdog_sec }}">
+<p class="hint">A separate systemd timer treats the monitor as hung when its heartbeat is older than this. Example: <code>180</code>. It can only send while this PC is on. A powered-off site cannot report itself.</p></div>
+<label>External heartbeat URL</label><div><input type="url" name="health_heartbeat_url" value="{{ s.health_heartbeat_url }}" placeholder="https://hc-ping.com/your-uuid">
+<p class="hint">Optional URL you already have (Healthchecks, Uptime Kuma, or similar). This app calls it each cycle. It does not create that service. If this PC loses power or the network, only that outside check can notice.</p></div>
+<label>Switch poll (seconds)</label><div><input type="number" name="iot_interval" min="30" max="3600" value="{{ s.iot_interval }}">
+<p class="hint">How often Shelly and Sonoff status is read. Example: <code>60</code>. Relay off is not offline. The host Fails and Repeat columns still apply to a real timeout.</p></div>
 <label>Events kept in the log</label><div><input type="number" name="event_keep" min="10" max="5000" value="{{ s.event_keep }}">
 <p class="hint">How many newest events the log page keeps. Example: <code>100</code>. Graphs use ping samples, not this list. The dashboard section “Recent events” stays.</p></div>
 <span></span><div><button>Save alerts</button></div></div></form></div>
@@ -3410,7 +3540,8 @@ BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_
 SECTIONS = {
     "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "ui_refresh", "retention_days",
                 "ping_method", "public_url", "dashboard_access"],
-    "alerts": ["fail_threshold", "repeat_min", "disk_repeat_min", "quiet_start", "quiet_end", "quiet_critical", "maintenance_until", "event_keep"],
+    "alerts": ["fail_threshold", "repeat_min", "disk_repeat_min", "quiet_start", "quiet_end", "quiet_critical", "maintenance_until", "event_keep",
+               "health_disk_warn_pct", "health_disk_crit_pct", "health_backup_grace_h", "health_watchdog_sec", "health_heartbeat_url", "iot_interval"],
     "internet": ["wan_enabled", "wan_targets", "wan_loss_pct", "wan_latency_ms", "wan_count"],
     "backups": ["mt_backup_day", "mt_backup_time", "mt_backup_keep"],
     "telegram": ["telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_photos"],
@@ -3434,7 +3565,10 @@ RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold"
           "snmp_interval": (30, 3600), "snmp_timeout": (1, 10), "snmp_cpu_threshold": (0, 100), "trap_port": (1, 65535),
           "event_keep": (10, 5000), "disk_repeat_min": (0, 10080), "wan_loss_pct": (1, 100), "wan_latency_ms": (1, 10000), "wan_count": (1, 20),
           "snmp_temp_threshold": (0, 150), "snmp_util_threshold": (0, 100), "ups_runtime_min": (0, 1440), "ups_load_pct": (0, 100),
-          "mt_backup_day": (0, 6), "mt_backup_keep": (1, 520)}
+          "mt_backup_day": (0, 6), "mt_backup_keep": (1, 520),
+          "health_disk_warn_pct": (0, 100), "health_disk_crit_pct": (0, 100),
+          "health_backup_grace_h": (0, 168), "health_watchdog_sec": (30, 3600),
+          "iot_interval": (30, 3600)}
 
 
 def _apply_section(section):
@@ -3689,20 +3823,49 @@ def _host_form():
         raise ValueError("ping interval must be a number of seconds")
     if ping_every and not 10 <= ping_every <= 3600:
         raise ValueError("host ping interval must be 10-3600 seconds, or empty to use the global interval")
-    return name, host, grp, dt, 1 if request.form.get("enabled") else 0, fail_n, maint, repeat_min, ping_every
+    raw_parent = (request.form.get("parent_id") or "").strip()
+    parent_id = None
+    if raw_parent:
+        try:
+            parent_id = int(raw_parent)
+        except ValueError:
+            raise ValueError("upstream device is not valid")
+    return name, host, grp, dt, 1 if request.form.get("enabled") else 0, fail_n, maint, repeat_min, ping_every, parent_id
+
+
+def _assign_parent(c, hid, parent_id):
+    if not parent_id:
+        c.execute("UPDATE hosts SET parent_id=NULL WHERE id=?", (hid,))
+        return
+    if parent_id == hid:
+        raise ValueError("A device cannot be its own upstream.")
+    if not c.execute("SELECT id FROM hosts WHERE id=?", (parent_id,)).fetchone():
+        raise ValueError("That upstream device was not found.")
+    parent_of = {r["id"]: r["parent_id"] for r in c.execute("SELECT id, parent_id FROM hosts")}
+    parent_of[hid] = parent_id
+    if wirelogic.dependency_cycle(hid, parent_id, parent_of):
+        raise ValueError("That upstream choice loops (a device would depend on itself through others).")
+    c.execute("UPDATE hosts SET parent_id=? WHERE id=?", (parent_id, hid))
 
 
 @app.route("/settings/hosts/add", methods=["POST"])
 @admin_required
 def host_add():
     try:
-        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id = _host_form()
     except ValueError as e:
         flash(f"Not added: {e}")
         return redirect(url_for("settings") + "#hosts")
     with _db_lock, db() as c:
         c.execute("INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, fail_n, maint_until, repeat_min, ping_every) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (name, host, grp, dt, en, time.time(), "pending" if en else "disabled", fail_n, maint, repeat_min, ping_every))
+        hid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        try:
+            _assign_parent(c, hid, parent_id)
+        except ValueError as e:
+            c.execute("DELETE FROM hosts WHERE id=?", (hid,))
+            flash(f"Not added: {e}")
+            return redirect(url_for("settings") + "#hosts")
     flash(f"Added {name} ({host}).")
     return redirect(url_for("settings") + "#hosts")
 
@@ -3711,7 +3874,7 @@ def host_add():
 @admin_required
 def host_save(hid):
     try:
-        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id = _host_form()
     except ValueError as e:
         flash(f"Not saved: {e}")
         return redirect(url_for("settings") + "#hosts")
@@ -3723,6 +3886,11 @@ def host_save(hid):
         if old["host"] != host:
             c.execute("DELETE FROM snmp_state WHERE host_id=?", (hid,))
             SNMP.counters.pop(hid, None)
+        try:
+            _assign_parent(c, hid, parent_id)
+        except ValueError as e:
+            flash(f"Not saved: {e}")
+            return redirect(url_for("settings") + "#hosts")
         c.execute("UPDATE hosts SET name=?, host=?, grp=?, device_type=?, enabled=?, fail_n=?, maint_until=?, repeat_min=?, ping_every=? WHERE id=?",
                   (name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, hid))
         if reset:  # new address or re-enabled: start fresh, no stale alerts
@@ -3739,6 +3907,8 @@ def host_delete(hid):
         c.execute("DELETE FROM results WHERE host_id=?", (hid,))
         c.execute("DELETE FROM snmp_state WHERE host_id=?", (hid,))
         c.execute("DELETE FROM snmp_samples WHERE host_id=?", (hid,))
+        c.execute("UPDATE hosts SET parent_id=NULL WHERE parent_id=?", (hid,))
+        c.execute("DELETE FROM iot_state WHERE host_id=?", (hid,))
         c.execute("DELETE FROM hosts WHERE id=?", (hid,))
     flash("Host deleted.")
     return redirect(url_for("settings") + "#hosts")
@@ -4176,6 +4346,17 @@ def _apply_cam_form(cfg):
     cfg["user"] = request.form.get("user", "").strip()
     if request.form.get("password"):
         cfg["password"] = encrypt_secret(request.form.get("password"))
+    cfg["record_channels"] = ",".join(part.strip() for part in (request.form.get("record_channels") or "").replace(";", ",").split(",") if part.strip())
+    start = (request.form.get("record_start") or "00:00").strip()
+    end = (request.form.get("record_end") or "23:59").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start):
+        start = "00:00"
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", end):
+        end = "23:59"
+    cfg["record_start"] = start
+    cfg["record_end"] = end
+    days = "".join(ch for ch in (request.form.get("record_days") or "0123456") if ch in "0123456")
+    cfg["record_days"] = days or "0123456"
     return cfg
 
 
@@ -4196,6 +4377,102 @@ def _run_camera_test(host, cfg):
         prev_row = c.execute("SELECT ts, data FROM cam_state WHERE host_id=?", (host["id"],)).fetchone()
     # Test shows the result but does not mark the problems as already alerted.
     return jobs.apply_camera_result(sys.modules[__name__], host, result, False, prev_row, now)
+
+
+@app.route("/settings/hosts/<int:hid>/switch", methods=["GET", "POST"])
+@admin_required
+def host_iot(hid):
+    with db() as c:
+        row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
+        stored = c.execute("SELECT data FROM iot_state WHERE host_id=?", (hid,)).fetchone()
+    if not row:
+        abort(404)
+    host = dict(row)
+    try:
+        cfg = json.loads(host.get("iot") or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    test = None
+    if request.method == "POST":
+        cfg["enabled"] = 1 if request.form.get("enabled") else 0
+        mode = request.form.get("mode") or ""
+        if mode not in ("auto", "gen1", "gen2", "diy", "tasmota", "mqtt"):
+            mode = "auto" if host.get("device_type") == "shelly" else "diy"
+        cfg["mode"] = mode
+        cfg["generation"] = request.form.get("generation") if request.form.get("generation") in ("auto", "gen1", "gen2") else "auto"
+        try:
+            cfg["port"] = int(request.form.get("port") or 0)
+        except ValueError:
+            cfg["port"] = 0
+        cfg["user"] = (request.form.get("user") or "").strip()
+        if request.form.get("password"):
+            cfg["password"] = encrypt_secret(request.form.get("password"))
+        cfg["device_id"] = (request.form.get("device_id") or "").strip()[:64]
+        for key, default in (("temp_max", 0), ("power_max", 0), ("stale_sec", 180), ("mqtt_port", 1883)):
+            try:
+                cfg[key] = float(request.form.get(key) or default) if key in ("temp_max", "power_max") else int(request.form.get(key) or default)
+            except ValueError:
+                cfg[key] = default
+        cfg["mqtt_host"] = (request.form.get("mqtt_host") or "").strip()
+        cfg["mqtt_user"] = (request.form.get("mqtt_user") or "").strip()
+        cfg["mqtt_topic"] = (request.form.get("mqtt_topic") or "").strip().strip("/")
+        if request.form.get("mqtt_password"):
+            cfg["mqtt_password"] = encrypt_secret(request.form.get("mqtt_password"))
+        with _db_lock, db() as c:
+            c.execute("UPDATE hosts SET iot=? WHERE id=?", (json.dumps(cfg), hid))
+        host["iot"] = json.dumps(cfg)
+        if (request.form.get("do") or "") in ("test", "save_test"):
+            test = jobs.iot_poll(sys.modules[__name__], only_id=hid)
+            flash("Switch test finished.")
+        else:
+            flash("Switch settings saved. Nothing is switched on or off from here.")
+            return redirect(url_for("host_iot", hid=hid))
+    if test is None and stored and stored["data"]:
+        try:
+            test = json.loads(stored["data"])
+        except (TypeError, ValueError):
+            test = None
+    body = """<p><a href="{{ url_for('settings') }}#hosts">← Hosts</a></p>
+<div class="card"><h2>Switch · {{ h.name }}</h2>
+<p class="section-intro">Read-only status for a Shelly, or a Sonoff that is in documented DIY mode or running Tasmota. Relay off is not offline. This page never toggles a relay, flashes firmware, or signs in to eWeLink.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Enabled</label><div><input type="checkbox" name="enabled" value="1" {{ 'checked' if cfg.enabled }}></div>
+<label>Mode</label><div><select name="mode">
+{% for k, label in [('auto','Shelly auto'),('gen1','Shelly Gen1 /status'),('gen2','Shelly Gen2+ GetStatus'),('diy','Sonoff DIY /zeroconf/info'),('tasmota','Tasmota HTTP Status'),('mqtt','Tasmota MQTT (existing broker)')] %}
+<option value="{{ k }}" {{ 'selected' if cfg.mode==k }}>{{ label }}</option>{% endfor %}</select>
+<p class="hint">Shelly auto tries Gen1 then Gen2. Sonoff stock eWeLink firmware has no generic local status API; use DIY mode on a supported model, or Tasmota if you already installed it. MQTT does not install a broker.</p></div>
+<label>Port</label><div><input type="number" name="port" value="{{ cfg.port or '' }}" placeholder="80, or 8081 for DIY">
+<p class="hint">Shelly and Tasmota are usually <code>80</code>. Sonoff DIY is <code>8081</code>.</p></div>
+<label>Username</label><div><input type="text" name="user" value="{{ cfg.user or '' }}"></div>
+<label>Password</label><div><input type="password" name="password" placeholder="{{ 'saved — leave empty to keep' if cfg.password else 'only if the device asks' }}"></div>
+<label>DIY device id</label><div><input type="text" name="device_id" value="{{ cfg.device_id or '' }}" placeholder="needed on DIY firmware 3.7.6+">
+<p class="hint">Sonoff DIY firmware 3.7.6 and newer reject an empty device id. Older DIY firmware accepts a blank id.</p></div>
+<label>Temperature limit (°C)</label><div><input type="number" step="0.1" name="temp_max" value="{{ cfg.temp_max or 0 }}">
+<p class="hint"><code>0</code> means no temperature alarm. A device with no temperature sensor is not treated as 0°C.</p></div>
+<label>Power limit (W)</label><div><input type="number" step="0.1" name="power_max" value="{{ cfg.power_max or 0 }}">
+<p class="hint"><code>0</code> means no power alarm. Missing power is omitted, not a failure.</p></div>
+<label>MQTT broker</label><div><input type="text" name="mqtt_host" value="{{ cfg.mqtt_host or '' }}" placeholder="192.168.1.10">
+<p class="hint">Only for MQTT mode. Use a broker that is already running. The switch is online only from its last-will and a fresh status, not because the broker accepted this connection.</p></div>
+<label>MQTT port / user</label><div><input type="number" name="mqtt_port" value="{{ cfg.mqtt_port or 1883 }}" style="width:100px"> <input type="text" name="mqtt_user" value="{{ cfg.mqtt_user or '' }}" placeholder="user"></div>
+<label>MQTT password / topic</label><div><input type="password" name="mqtt_password" placeholder="{{ 'saved' if cfg.mqtt_password else 'optional' }}"> <input type="text" name="mqtt_topic" value="{{ cfg.mqtt_topic or '' }}" placeholder="sonoff-basic"></div>
+<label>MQTT stale (seconds)</label><div><input type="number" name="stale_sec" value="{{ cfg.stale_sec or 180 }}">
+<p class="hint">If the last will says Online but no status arrives within this many seconds, the switch is stale and counts as offline. No message yet stays unknown.</p></div>
+<span></span><div><button name="do" value="save">Save</button>
+<button name="do" value="save_test" class="sec">Save + Test</button>
+<button name="do" value="test" class="sec">Test</button></div></div></form>
+{% if test %}<div class="card" style="box-shadow:none;border:1px solid #e2e8f0"><h2>Last reading</h2>
+<p><b>{{ test.reach or test.observation or 'unknown' }}</b> · {{ test.diag or test.detail or '' }}</p>
+<p class="hint">Calls: {{ test.calls|join(', ') }}</p>
+{% if test.parsed %}{% for ch in test.parsed.channels %}<p>{{ ch.kind }} {{ ch.index }}: {{ 'on' if ch.on else 'off' }}</p>{% endfor %}
+<p class="hint">Last seen {{ test.last_seen or '—' }}. A relay that is off is still online when the device answered.</p>{% endif %}
+</div>{% endif %}
+</div>"""
+    if test and test.get("last_seen"):
+        test["last_seen"] = fmt_ts(test.get("last_seen"))
+    return page(body, h=host, cfg=cfg, test=test)
 
 
 @app.route("/settings/hosts/<int:hid>/camera", methods=["GET", "POST"])
@@ -4244,6 +4521,12 @@ def host_camera(hid):
 <label>Port</label><div><input type="number" name="port" id="cam-port" value="{{ cfg.port or (443 if cfg.scheme=='https' else 80) }}"></div>
 <label>Username</label><div><input type="text" name="user" value="{{ cfg.user or '' }}"></div>
 <label>Password</label><div><input type="password" name="password" placeholder="{{ 'saved — leave empty to keep' if cfg.password else 'not set' }}"></div>
+<label>Channels expected to record</label><div><input type="text" name="record_channels" value="{{ cfg.record_channels or '' }}" placeholder="1,2">
+<p class="hint">Channel numbers that should be recording, comma separated. Example: <code>1,2</code>. Leave empty for motion-only or when you do not want a recording alarm. A channel that is offline is an offline alarm, not a recording alarm. If the recorder does not report recording, the result stays unknown.</p></div>
+<label>Recording hours</label><div><input type="time" name="record_start" value="{{ cfg.record_start or '00:00' }}"> to <input type="time" name="record_end" value="{{ cfg.record_end or '23:59' }}">
+<p class="hint">Local hours when those channels should be recording. Example: <code>08:00</code> to <code>18:00</code>. Equal times mean all day. Outside the window a quiet channel is not a failure.</p></div>
+<label>Recording days</label><div><input type="text" name="record_days" value="{{ cfg.record_days or '0123456' }}" placeholder="0123456">
+<p class="hint">Weekdays as digits, Monday 0 through Sunday 6. Example: <code>01234</code> for weekdays. Default <code>0123456</code> is every day.</p></div>
 <span></span><div><button name="do" value="save">Save</button>
 <button name="do" value="save_test" class="sec">Save + Test</button>
 <button name="do" value="test" class="sec">Test</button></div></div></form>
@@ -4259,7 +4542,8 @@ def host_camera(hid):
 {% for ch in test.channels %}<tr><td>{{ ch.id }}</td><td>{{ ch.name or '—' }}</td>
 <td>{{ 'offline' if ch.online is sameas false else ('online' if ch.online else '—') }}</td>
 <td>{{ 'yes' if ch.video_loss else ('no' if ch.video_loss is sameas false else '—') }}</td>
-<td>{{ 'yes' if ch.recording else ('no' if ch.recording is sameas false else '—') }}</td></tr>{% endfor %}</table>{% endif %}
+<td>{{ 'yes' if ch.recording else ('no' if ch.recording is sameas false else 'unknown') }}</td></tr>{% endfor %}</table>{% endif %}
+{% if test.recording_note %}<p class="hint">{{ test.recording_note }}</p>{% endif %}
 {% if test.calls %}<p class="hint">{% for c in test.calls %}{{ c.path }} → {{ c.status }} · {% endfor %}</p>{% endif %}
 </div>{% endif %}
 </div>

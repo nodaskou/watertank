@@ -1,0 +1,15 @@
+[Unit]
+Description=Wirewave monitor watchdog (process stopped or hung)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pingmon
+Group=pingmon
+WorkingDirectory=/opt/pingmonitor
+ExecStart=/opt/pingmonitor/venv/bin/python /opt/pingmonitor/watchdog.py --db /opt/pingmonitor/data/pingmonitor.db
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pingmonitor/data
+PrivateTmp=true

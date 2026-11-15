@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.1.0
+
+- A host can name an upstream device. The choice cannot loop. When that upstream device is down, its outage is sent once under the usual quiet hours, maintenance and repeat rules, and the children’s outage notifications are held. The children still show down and keep ping history. The card says alerts are held. When the upstream device recovers, a child that is still down and was never notified gets one alert; repeats are not dumped in a burst.
+- The monitor warns once when the disk that holds its own data is low (separate from a recorder disk), and once when the daily config copy or a weekly MikroTik export is late. A separate systemd timer notices a stopped or hung monitor process while this PC is still on. It uses the saved Telegram and e-mail settings. A powered-off host cannot report itself; set an external heartbeat URL you already run if you need that. This app does not create that service.
+- Camera recording alarms apply only to channels you list, and only during the hours you set, and only when the recorder explicitly says recording is off while the channel is online. A missing recording API stays unknown. Offline, not recording, and disk failure stay separate.
+- Shelly Gen1 and Gen2+ local status, Sonoff DIY mode on the documented models, and Tasmota HTTP or MQTT against a broker you already run, are read-only. Relay off is not offline. Sign-in and API errors are not offline. Missing power or temperature is omitted. Multi-channel relays and inputs are shown when the payload includes them.
+
 ## 3.0.2
 
 - Settings → Telegram has Detect chat ID. It uses the token typed in the form, or the saved token, and asks Telegram for recent chats (private chats by first name and @username, groups and channels by title, including negative ids). Click a row to fill Chat ID. If a webhook is set, getUpdates is not used until you click Remove webhook. An unknown token shows a plain 401 message, and the token is not written to the log. Send test message saves the chat ID and sends one message. If no chat is found, the page says to send /start and click again, in English and Greek.

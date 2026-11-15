@@ -165,11 +165,18 @@ def apply_document(c, doc, data_dir, known_settings, mode="merge"):
             names = [k for k in fields]
             c.execute(f"INSERT INTO hosts({','.join(names)}) VALUES({','.join('?' * len(names))})", [fields[k] for k in names])
             id_map[src.get("id")] = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    if "parent_id" in cols:
+        for src in doc["hosts"]:
+            new_id = id_map.get(src.get("id"))
+            old_parent = src.get("parent_id")
+            mapped = id_map.get(old_parent) if old_parent else None
+            if new_id:
+                c.execute("UPDATE hosts SET parent_id=? WHERE id=?", (mapped, new_id))
     if mode == "replace":
         for key, row in existing.items():
             if key not in seen:
                 hid = row["id"]
-                for table in ("results", "snmp_state", "snmp_samples", "cam_state", "backups", "dash_ifaces"):
+                for table in ("results", "snmp_state", "snmp_samples", "cam_state", "backups", "dash_ifaces", "iot_state"):
                     c.execute(f"DELETE FROM {table} WHERE host_id=?", (hid,))
                 c.execute("DELETE FROM events WHERE host_id=?", (hid,))
                 c.execute("DELETE FROM hosts WHERE id=?", (hid,))
