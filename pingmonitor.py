@@ -23,6 +23,7 @@ import jobs
 import mtbackup
 import reportpdf
 import siarecv
+import siteops
 import wirelogic
 import hashlib
 import hmac
@@ -63,7 +64,7 @@ except ImportError:  # pragma: no cover
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_file, send_from_directory, session, url_for)
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
@@ -142,9 +143,19 @@ DEFAULTS = {
     "health_backup_grace_h": 12, "health_watchdog_sec": 180,
     "health_heartbeat_url": "",
     "iot_interval": 60,
+    "ui_lang": "en",
+    "latency_ms": 200, "loss_pct": 20, "quality_window_min": 15,
+    "speed_ms": 0, "cert_warn_days": "30,14,7",
+    "nut_host": "", "nut_port": 3493, "nut_name": "ups",
+    "starlink_host": "",
+    "unifi_url": "", "unifi_user": "", "unifi_password": "", "unifi_site": "default",
+    "omada_url": "", "omada_user": "", "omada_password": "", "omada_site": "",
+    "tg_commands": 0, "tg_cmd_offset": 0,
+    "report_monthly": 0, "report_monthly_day": 1,
 }
 INT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, int)}
-SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password"}
+SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password",
+               "unifi_password", "omada_password"}
 SEVERITY_RANK = {"info": 1, "warning": 2, "critical": 3, "none": 99}
 
 _db_lock = threading.RLock()
@@ -247,6 +258,14 @@ def _migrate(c):
     _add_col(c, "hosts", "parent_id", "INTEGER")
     _add_col(c, "hosts", "dep_held", "INTEGER NOT NULL DEFAULT 0")
     _add_col(c, "hosts", "iot", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "hosts", "category", "TEXT NOT NULL DEFAULT ''")
+    c.execute("UPDATE hosts SET category='' WHERE category IS NULL")
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS cert_watch(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'tls',
+            port INTEGER NOT NULL DEFAULT 443, last_days INTEGER, last_mark TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS extra_state(key TEXT PRIMARY KEY, ts REAL, data TEXT);
+    """)
     c.executescript("""
         CREATE TABLE IF NOT EXISTS health_state(
             key TEXT PRIMARY KEY, status TEXT NOT NULL, since_ts REAL,
@@ -1201,6 +1220,19 @@ def prune():
     log.info("History rollup finished (raw 2 days, 5 min to 7 days, hourly after that)")
 
 
+def _fill_categories(hosts):
+    for h in hosts:
+        if h.get("category"):
+            continue
+        h["category"] = siteops.guess_category(h.get("device_type"), h.get("name"))
+        try:
+            with _db_lock, db() as c:
+                c.execute("UPDATE hosts SET category=? WHERE id=? AND (category IS NULL OR category='')",
+                          (h["category"], h["id"]))
+        except Exception:
+            log.debug("category fill", exc_info=True)
+
+
 def _health_lines():
     try:
         with db() as c:
@@ -1256,6 +1288,10 @@ def monitor_loop(stop):
                     last_prune = start
             except Exception:
                 log.exception("monitor cycle failed")
+            try:
+                ops_cycle()
+            except Exception:
+                log.exception("optional checks failed")
             _write_heartbeat()
             s = get_settings()
             _ping_external_heartbeat(s)
@@ -2348,6 +2384,16 @@ header h1 span{overflow-wrap:anywhere}
 @media (prefers-reduced-motion: reduce){
  .alarm-tile.flash,.statusbar.alarm,.alarm-pill.flash{animation:none;background:#b91c1c;color:#fff}
 }
+.shell{display:flex;align-items:stretch}.side{width:196px;flex:none;background:#0b2a55;color:#e2e8f0;padding:12px}
+.side a{display:block;color:#e2e8f0;text-decoration:none;padding:8px 10px;border-radius:8px;margin:2px 0}
+.side a:hover{background:#1d4ed8}.side form{margin-top:10px}
+.catgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin:0 0 16px}
+.cat{display:block;color:#fff;text-decoration:none;border-radius:12px;padding:12px}
+.cat b{font-size:22px}.bar{height:8px;background:rgba(255,255,255,.35);border-radius:6px;margin-top:8px}
+.bar span{display:block;height:8px;background:#fff;border-radius:6px}
+.sumgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:0 0 16px}
+.sum{background:#fff;border-radius:12px;padding:12px}
+@media (max-width:760px){.shell{display:block}.side{width:auto;display:flex;flex-wrap:wrap;gap:4px}.side a{display:inline-block}.sumgrid{grid-template-columns:1fr 1fr}}
 .snmpline{font-size:12.5px;color:#334155;margin:2px 0 8px}.lnk{display:inline-block;color:#fff;border-radius:6px;padding:1px 6px;margin:0 4px 3px 0;font-size:11.5px;font-weight:600}
 .lnk small{font-weight:400;opacity:.9}.kv td:first-child{color:#64748b;width:160px}
 code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
@@ -2360,13 +2406,22 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 <title>{{ s.site_name }} - """ + APP_NAME + """</title><style>""" + CSS + """</style>
 {% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body{% if hid is defined and hid %} data-live-id="{{ hid }}"{% endif %}>
 <header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>""" + APP_NAME + """ <small>· {{ s.site_name }}</small></span></h1><div>
-<a href="{{ url_for('index') }}">Dashboard</a>
-{% if role() %}<a href="{{ url_for('event_log') }}">Log</a>{% endif %}
-{% if role() == 'admin' %}<a href="{{ url_for('report_page') }}">Report</a><a href="{{ url_for('settings') }}">Settings</a>{% endif %}
-{% if role() %}<a href="{{ url_for('logout') }}">Logout ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">Login</a>{% endif %}
-</div></header><main>
+<a href="{{ url_for('index') }}">{{ tr.dashboard }}</a>
+{% if role() %}<a href="{{ url_for('event_log') }}">{{ tr.log }}</a>{% endif %}
+{% if role() == 'admin' %}<a href="{{ url_for('report_page') }}">{{ tr.report }}</a><a href="{{ url_for('settings') }}">{{ tr.settings }}</a>{% endif %}
+{% if role() %}<a href="{{ url_for('logout') }}">{{ tr.logout }} ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">{{ tr.login }}</a>{% endif %}
+</div></header><div class="shell"><aside class="side">
+<a href="{{ url_for('index') }}">{{ tr.dashboard }}</a>
+<a href="{{ url_for('network_map') }}">{{ tr.map }}</a>
+<a href="{{ url_for('device_list') }}">{{ tr.devices }}</a>
+<a href="{{ url_for('users_page') }}">{{ tr.users }}</a>
+<a href="{{ url_for('vendors_page') }}">{{ tr.vendors }}</a>
+{% if role() == 'admin' %}<a href="{{ url_for('settings') }}">{{ tr.settings }}</a>{% endif %}
+<form method="post" action="{{ url_for('set_lang') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<button class="sec" name="lang" value="{{ 'en' if lang=='el' else 'el' }}">{{ tr.lang }}</button></form>
+</aside><main>
 {% with m = get_flashed_messages() %}{% for x in m %}<div class="flash">{{ x }}</div>{% endfor %}{% endwith %}
-{{ body|safe }}</main>
+{{ body|safe }}</main></div>
 <footer class="sitefoot">""" + APP_NAME + """ {{ version }}</footer>
 {% if live %}<script>
 const LIVE = {{ live|tojson }};
@@ -2621,6 +2676,17 @@ CLEAR_LOG = """<span class="hint" id="last-cleared">Last cleared: {{ last_cleare
 </form>{% endif %}"""
 
 INDEX_BODY = CHART_JS + """
+<div class="sumgrid">
+<div class="sum"><div class="muted">{{ tr.total }}</div><b>{{ summary.total }}</b></div>
+<div class="sum"><div class="muted">{{ tr.online }}</div><b>{{ summary.online }}</b></div>
+<div class="sum"><div class="muted">{{ tr.offline }}</div><b>{{ summary.offline }}</b></div>
+<div class="sum"><div class="muted">{{ tr.availability }}</div><b>{{ summary.availability }}%</b></div>
+</div>
+<div class="catgrid">{% for c in cats %}{% if c.total %}
+<a class="cat" style="background:{{ c.color }}" href="{{ url_for('device_list', category=c.id) }}">
+<div>{{ c.el if lang=='el' else c.en }}</div><b>{{ c.total }}</b>
+<div>{{ c.online }} {{ tr.online }} · {{ c.offline }} {{ tr.offline }}</div>
+<div class="bar"><span style="width:{{ c.pct }}%"></span></div></a>{% endif %}{% endfor %}</div>
 <div class="statusbar {{ bar.level }}{% if bar.alarm_flash %} alarm{% endif %}" id="bar">
  <span class="why" id="bar-why">{{ bar.reason }}</span>
  <span id="bar-alarms">{% for a in alarms %}{% if a.flash %}<span class="alarm-pill flash">{{ a.name }} · ALARM</span>{% endif %}{% endfor %}</span>
@@ -2803,12 +2869,19 @@ def snmp_view(h, tz, full=False, since=None):
     return d
 
 
+def _lang():
+    chosen = session.get("ui_lang")
+    if chosen in ("en", "el"):
+        return chosen
+    return get_settings().get("ui_lang") or "en"
+
+
 def page(body_tpl, refresh=None, charts=False, live=None, **ctx):
     s = get_settings()
-    body = render_template_string(body_tpl, s=s, **ctx)
+    body = render_template_string(body_tpl, s=s, tr=siteops.strings(_lang()), lang=_lang(), **ctx)
     ui = max(10, min(300, int(s.get("ui_refresh") or 30)))
     return render_template_string(LAYOUT, body=body, s=s, refresh=refresh, charts=charts, live=live, ui_refresh=ui,
-                                  hid=ctx.get("hid"), version=VERSION)
+                                  hid=ctx.get("hid"), version=VERSION, tr=siteops.strings(_lang()), lang=_lang())
 
 
 def host_view(row, since, tz, full=False):
@@ -3018,8 +3091,9 @@ def index():
         names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
         banner = {"cls": "warn", "text": "LAN device down: " + names}
     health = _health_lines()
+    _fill_categories(hosts)
     return page(INDEX_BODY, charts=True, live="dashboard", groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
-                health=health,
+                health=health, cats=siteops.category_counts(hosts), summary=siteops.summary_counts(hosts),
                 now=fmt_ts(time.time(), tz), span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000,
                 wan=wan, traffic=_traffic_cards(since), banner=banner, alarms=alarms, bar=_status_bar(hosts, wan, alarms),
                 last_cleared=last_cleared_text(tz), clear_next="dashboard")
@@ -3162,6 +3236,7 @@ SETTINGS_NAV = """
 <option value="{{ url_for('settings') }}#graphs">Dashboard graphs</option>
 <option value="{{ url_for('settings') }}#backups">MikroTik backups</option>
 <option value="{{ url_for('settings') }}#telegram">Telegram</option>
+<option value="{{ url_for('settings') }}#controllers">Controllers</option>
 <option value="{{ url_for('settings') }}#email">Outgoing e-mail</option>
 <option value="{{ url_for('settings') }}#receiver">Incoming e-mail (devices)</option>
 <option value="{{ url_for('settings') }}#snmp">SNMP + traps</option>
@@ -3180,6 +3255,7 @@ SETTINGS_NAV = """
 <a href="{{ url_for('settings') }}#graphs">Dashboard graphs</a>
 <a href="{{ url_for('settings') }}#backups">MikroTik backups</a>
 <a href="{{ url_for('settings') }}#telegram">Telegram</a>
+<a href="{{ url_for('settings') }}#controllers">Controllers</a>
 <a href="{{ url_for('settings') }}#email">Outgoing e-mail</a>
 <a href="{{ url_for('settings') }}#receiver">Incoming e-mail (devices)</a>
 <a href="{{ url_for('settings') }}#snmp">SNMP + traps</a>
@@ -3216,6 +3292,8 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <div class="form-grid">
 <label>Site / client name</label><div><input type="text" name="site_name" value="{{ s.site_name }}" required maxlength="80">
 <p class="hint">Put at the start of every alert so you can tell sites apart. Example: <code>Hotel Nikiana</code>. Set one name per installation.</p></div>
+<label>Language</label><div><select name="ui_lang"><option value="en" {{ 'selected' if s.ui_lang!='el' }}>English</option><option value="el" {{ 'selected' if s.ui_lang=='el' }}>Ελληνικά</option></select>
+<p class="hint">Default language for the sidebar. The sidebar button switches only this browser. English and Greek reports stay separate documents.</p></div>
 <label>Timezone</label><div><input type="text" name="timezone" value="{{ s.timezone }}" list="tzs"><datalist id="tzs">{% for z in tzs %}<option>{{ z }}</option>{% endfor %}</datalist>
 <p class="hint">Clock used for the dashboard, events and alert times. Example: <code>Europe/Athens</code>. Pick the zone where the devices are. The installer does not change this; set the PC clock with <code>timedatectl</code> as well.</p></div>
 <label>Ping interval (seconds)</label><div><input type="number" name="ping_interval" min="10" max="3600" value="{{ s.ping_interval }}">
@@ -3246,6 +3324,7 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <li><b>IP / hostname</b> — address that is pinged. Example: <code>192.168.1.50</code> or <code>nvr.lan</code>. Use the address of the device on this LAN.</li>
 <li><b>Group / location</b> — groups the cards on the dashboard. Example: <code>Cameras</code>, <code>Wi-Fi</code>, <code>Network</code>. Leave it blank on a very small site.</li>
 <li><b>Device type</b> — badge colour, and a hint when an alarm e-mail is parsed. Example: Hikvision camera / NVR. Pick the closest brand.</li>
+<li><b>Category</b> — dashboard tile. Example: Cameras. Leave it on Auto to guess from the type and the name. You can change it.</li>
 <li><b>On</b> — untick to stop pinging without deleting history. Use it while a device is powered off for maintenance.</li>
 <li><b>SNMP</b> — opens that host's SNMP page (community or v3 user, which ports to graph). Use it when the device answers SNMP.</li>
 <li><b>Fails</b> — missed pings before this host's alarm. Example: <code>3</code>. <code>0</code> uses the global “Failed pings before alert” (default 3).</li>
@@ -3262,7 +3341,8 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <td><input type="text" form="hf{{ h.id }}" name="name" value="{{ h.name }}" required maxlength="60" style="width:150px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="host" value="{{ h.host }}" required maxlength="253" style="width:140px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="grp" value="{{ h.grp }}" maxlength="60" style="width:120px"></td>
-<td><select form="hf{{ h.id }}" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}" {{ 'selected' if k==h.device_type }}>{{ v[0] }}</option>{% endfor %}</select></td>
+<td><select form="hf{{ h.id }}" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}" {{ 'selected' if k==h.device_type }}>{{ v[0] }}</option>{% endfor %}</select>
+<select form="hf{{ h.id }}" name="category"><option value="">Auto</option>{% for cid, en, el, color in categories %}<option value="{{ cid }}" {{ 'selected' if cid==h.category }}>{{ el if lang=='el' else en }}</option>{% endfor %}</select></td>
 <td><select form="hf{{ h.id }}" name="parent_id"><option value="">—</option>{% for o in hosts %}{% if o.id != h.id %}<option value="{{ o.id }}" {{ 'selected' if o.id==h.parent_id }}>{{ o.name }}</option>{% endif %}{% endfor %}</select></td>
 <td><input type="checkbox" form="hf{{ h.id }}" name="enabled" value="1" {{ 'checked' if h.enabled }}></td>
 <td><input type="number" form="hf{{ h.id }}" name="fail_n" min="0" max="20" value="{{ h.fail_n or 0 }}" style="width:58px" title="0 = use the global fail count"></td>
@@ -3386,6 +3466,43 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <td>{% if b.ok and b.path %}<a href="{{ url_for('backup_download', bid=b.id) }}">Download</a>{% endif %}{% if b.ok and b.bin_path %} · <a href="{{ url_for('backup_download', bid=b.id, kind='bin') }}">Binary</a>{% endif %}</td></tr>
 {% else %}<tr><td colspan="4" class="muted">No exports yet.</td></tr>{% endfor %}
 </table></div></div>
+
+<div class="card" id="controllers"><h2>Controllers and checks</h2>
+<p class="section-intro">Optional read-only checks. A blank password keeps the saved one. Nothing here turns a relay on or off. /help in English and Greek is on the bot when commands are enabled.</p>
+<form method="post" action="{{ url_for('save_section', section='controllers') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Language default</label><div><p class="hint">The site default is under General. The sidebar button switches this browser.</p></div>
+<label>Sustained latency (ms)</label><div><input type="number" name="latency_ms" value="{{ s.latency_ms }}">
+<p class="hint">Alert when the average ping over the window stays at or above this, and the host is not fully down. Example: <code>200</code>.</p></div>
+<label>Sustained loss (%)</label><div><input type="number" name="loss_pct" value="{{ s.loss_pct }}">
+<p class="hint">Alert when loss over the window stays at or above this, while some pings still succeed. Example: <code>20</code>.</p></div>
+<label>Quality window (minutes)</label><div><input type="number" name="quality_window_min" value="{{ s.quality_window_min }}"></div>
+<label>Slow speed (Mbps)</label><div><input type="number" name="speed_ms" value="{{ s.speed_ms }}">
+<p class="hint"><code>0</code> turns the speed alert off. A speed test runs only when a <code>speedtest</code> command is installed. If it is missing, the check is skipped.</p></div>
+<label>Certificate warn days</label><div><input type="text" name="cert_warn_days" value="{{ s.cert_warn_days }}">
+<p class="hint">Comma-separated days before a certificate or domain expires. Example: <code>30,14,7</code>. Each threshold alerts once. <code>0</code> means the day it expires.</p></div>
+<label>NUT host</label><div><input type="text" name="nut_host" value="{{ s.nut_host }}" placeholder="127.0.0.1">
+<p class="hint">Optional upsd address. Empty skips NUT. Port <input type="number" name="nut_port" value="{{ s.nut_port }}" style="width:90px"> name <input type="text" name="nut_name" value="{{ s.nut_name }}" style="width:100px">. Read-only, TCP 3493. SNMP UPS readings still work without this.</p></div>
+<label>Starlink dish</label><div><input type="text" name="starlink_host" value="{{ s.starlink_host }}" placeholder="192.168.100.1">
+<p class="hint">Optional. Reads the local dish HTTP status when the dish serves it. Empty skips the check. If the dish only speaks gRPC and this request fails, the status stays unavailable. No cloud account.</p></div>
+<label>UniFi controller</label><div><input type="url" name="unifi_url" value="{{ s.unifi_url }}" placeholder="https://unifi.local:8443">
+<input type="text" name="unifi_user" value="{{ s.unifi_user }}" placeholder="local user">
+<input type="password" name="unifi_password" placeholder="{{ 'saved' if s.unifi_password else 'password' }}">
+<input type="text" name="unifi_site" value="{{ s.unifi_site }}" placeholder="default">
+<p class="hint">Local UniFi Network account, read-only. The password is not shown again.</p></div>
+<label>Omada controller</label><div><input type="url" name="omada_url" value="{{ s.omada_url }}" placeholder="https://omada.local:8043">
+<input type="text" name="omada_user" value="{{ s.omada_user }}">
+<input type="password" name="omada_password" placeholder="{{ 'saved' if s.omada_password else 'password' }}">
+<input type="text" name="omada_site" value="{{ s.omada_site }}" placeholder="site id">
+<p class="hint">Local Omada OpenAPI/login, read-only. The password is not shown again.</p></div>
+<label>Telegram commands</label><div><input type="checkbox" name="tg_commands" value="1" {{ 'checked' if s.tg_commands }}>
+<p class="hint">/status /site /down /ups /help from the saved chat only. Turn this on after Detect chat ID. If the bot has a webhook, commands wait. Detect chat ID still uses getUpdates when this is off.</p></div>
+<label>Monthly PDF to Telegram</label><div><input type="checkbox" name="report_monthly" value="1" {{ 'checked' if s.report_monthly }}>
+day <input type="number" name="report_monthly_day" min="1" max="28" value="{{ s.report_monthly_day }}">
+<p class="hint">On that day, send last month's report twice: one English PDF and one Greek PDF. The download page can do the same at any time.</p></div>
+<span></span><div><button>Save controllers</button></div></div></form>
+<p><a href="{{ url_for('cert_page') }}">Certificate and domain list</a></p>
+</div>
 
 <div class="card" id="telegram"><h2>Telegram</h2>
 <p class="section-intro">Sends a Telegram message when a host goes down or comes back, and for device or SNMP alerts that are set to be forwarded.</p>
@@ -3536,12 +3653,18 @@ Status: <b>{{ rx_status }}</b></p>
 <span></span><div><button>Change password</button></div></div></form></div>
 """
 BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_enabled", "rx_enabled", "rx_require_auth",
+               "tg_commands", "report_monthly",
                "snmp_enabled", "snmp_alert_ifdown", "snmp_alert_reboot", "trap_enabled", "quiet_critical", "wan_enabled"}
 SECTIONS = {
     "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "ui_refresh", "retention_days",
-                "ping_method", "public_url", "dashboard_access"],
+                "ping_method", "public_url", "dashboard_access", "ui_lang"],
     "alerts": ["fail_threshold", "repeat_min", "disk_repeat_min", "quiet_start", "quiet_end", "quiet_critical", "maintenance_until", "event_keep",
                "health_disk_warn_pct", "health_disk_crit_pct", "health_backup_grace_h", "health_watchdog_sec", "health_heartbeat_url", "iot_interval"],
+    "controllers": ["latency_ms", "loss_pct", "quality_window_min", "speed_ms", "cert_warn_days",
+                    "nut_host", "nut_port", "nut_name", "starlink_host",
+                    "unifi_url", "unifi_user", "unifi_password", "unifi_site",
+                    "omada_url", "omada_user", "omada_password", "omada_site",
+                    "tg_commands", "report_monthly", "report_monthly_day"],
     "internet": ["wan_enabled", "wan_targets", "wan_loss_pct", "wan_latency_ms", "wan_count"],
     "backups": ["mt_backup_day", "mt_backup_time", "mt_backup_keep"],
     "telegram": ["telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_photos"],
@@ -3555,8 +3678,10 @@ SECTIONS = {
 }
 SECTION_LABEL = {"general": "General", "alerts": "Alerts", "internet": "Internet", "backups": "MikroTik backups",
                  "telegram": "Telegram", "email": "Outgoing e-mail", "webhook": "Webhook",
+                 "controllers": "Controllers",
                  "receiver": "Incoming e-mail", "snmp": "SNMP"}
 CHOICES = {"ping_method": {"auto", "icmplib", "system"}, "dashboard_access": {"login", "public"},
+           "ui_lang": {"en", "el"},
            "smtp_security": {"none", "starttls", "ssl"}, "rx_security": {"none", "starttls", "ssl"},
            "rx_forward_min": {"info", "warning", "critical", "none"}, "snmp_forward_min": {"info", "warning", "critical", "none"},
            "trap_forward_min": {"info", "warning", "critical", "none"}}
@@ -3568,7 +3693,9 @@ RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold"
           "mt_backup_day": (0, 6), "mt_backup_keep": (1, 520),
           "health_disk_warn_pct": (0, 100), "health_disk_crit_pct": (0, 100),
           "health_backup_grace_h": (0, 168), "health_watchdog_sec": (30, 3600),
-          "iot_interval": (30, 3600)}
+          "iot_interval": (30, 3600), "latency_ms": (1, 10000), "loss_pct": (1, 100),
+          "quality_window_min": (5, 240), "speed_ms": (0, 10000), "nut_port": (1, 65535),
+          "report_monthly_day": (1, 28)}
 
 
 def _apply_section(section):
@@ -3642,7 +3769,7 @@ def settings():
     graph_rows = _graph_rows(hosts)
     mt_hosts, mt_files = _mikrotik_rows()
     lookup = session.get("tg_lookup") or {}
-    return page(SETTINGS_BODY, hosts=hosts, tzs=tzs, rx_status=RECEIVER.status(), trap_status=SNMP.trap_status,
+    return page(SETTINGS_BODY, hosts=hosts, tzs=tzs, categories=siteops.CATEGORIES, rx_status=RECEIVER.status(), trap_status=SNMP.trap_status,
                 snmp_ok=SNMP.available, graph_rows=graph_rows, mt_hosts=mt_hosts, mt_files=mt_files,
                 ping_name=_ping_impl["name"] or "not started",
                 tg_chats=lookup.get("chats") or [], tg_webhook=bool(lookup.get("webhook")),
@@ -3830,7 +3957,10 @@ def _host_form():
             parent_id = int(raw_parent)
         except ValueError:
             raise ValueError("upstream device is not valid")
-    return name, host, grp, dt, 1 if request.form.get("enabled") else 0, fail_n, maint, repeat_min, ping_every, parent_id
+    category = (request.form.get("category") or "").strip()
+    if category not in siteops.CATEGORY_IDS:
+        category = siteops.guess_category(dt, name)
+    return name, host, grp, dt, 1 if request.form.get("enabled") else 0, fail_n, maint, repeat_min, ping_every, parent_id, category
 
 
 def _assign_parent(c, hid, parent_id):
@@ -3852,13 +3982,13 @@ def _assign_parent(c, hid, parent_id):
 @admin_required
 def host_add():
     try:
-        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id, category = _host_form()
     except ValueError as e:
         flash(f"Not added: {e}")
         return redirect(url_for("settings") + "#hosts")
     with _db_lock, db() as c:
-        c.execute("INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, fail_n, maint_until, repeat_min, ping_every) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                  (name, host, grp, dt, en, time.time(), "pending" if en else "disabled", fail_n, maint, repeat_min, ping_every))
+        c.execute("INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, fail_n, maint_until, repeat_min, ping_every, category) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, host, grp, dt, en, time.time(), "pending" if en else "disabled", fail_n, maint, repeat_min, ping_every, category))
         hid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
         try:
             _assign_parent(c, hid, parent_id)
@@ -3874,7 +4004,7 @@ def host_add():
 @admin_required
 def host_save(hid):
     try:
-        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id, category = _host_form()
     except ValueError as e:
         flash(f"Not saved: {e}")
         return redirect(url_for("settings") + "#hosts")
@@ -3891,8 +4021,8 @@ def host_save(hid):
         except ValueError as e:
             flash(f"Not saved: {e}")
             return redirect(url_for("settings") + "#hosts")
-        c.execute("UPDATE hosts SET name=?, host=?, grp=?, device_type=?, enabled=?, fail_n=?, maint_until=?, repeat_min=?, ping_every=? WHERE id=?",
-                  (name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, hid))
+        c.execute("UPDATE hosts SET name=?, host=?, grp=?, device_type=?, enabled=?, fail_n=?, maint_until=?, repeat_min=?, ping_every=?, category=? WHERE id=?",
+                  (name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, category, hid))
         if reset:  # new address or re-enabled: start fresh, no stale alerts
             c.execute("UPDATE hosts SET state=?, consec_fail=0, down_since=NULL, last_ms=NULL WHERE id=?",
                       ("pending" if en else "disabled", hid))
@@ -4280,6 +4410,7 @@ def report_page():
                         headers={"Content-Disposition": f"attachment; filename=report-{lang}.pdf"})
     body = """<div class="card" style="max-width:640px"><h2>Report</h2>
 <p class="section-intro">Download a PDF for a client. Greek and English are separate documents.</p>
+<p><a href="{{ url_for('monthly_report', lang='en') }}">Monthly report (English)</a> · <a href="{{ url_for('monthly_report', lang='el') }}">Μηνιαία αναφορά (Ελληνικά)</a></p>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
 <label>Site name</label><div><input type="text" name="site" value="{{ s.site_name }}"></div>
@@ -5363,6 +5494,378 @@ def backup_local_download(name):
     if not os.path.isfile(path):
         abort(404)
     return send_file(path, as_attachment=True, download_name=safe)
+
+
+def _extra_put(key, data):
+    with _db_lock, db() as c:
+        c.execute("INSERT OR REPLACE INTO extra_state(key, ts, data) VALUES(?,?,?)",
+                  (key, time.time(), json.dumps(data)))
+
+
+def _extra_get(key):
+    with db() as c:
+        row = c.execute("SELECT data FROM extra_state WHERE key=?", (key,)).fetchone()
+    if not row or not row["data"]:
+        return {}
+    try:
+        return json.loads(row["data"])
+    except (TypeError, ValueError):
+        return {}
+
+
+def _quality_check(s, now):
+    window = max(5, int(s.get("quality_window_min") or 15)) * 60
+    latency = int(s.get("latency_ms") or 0)
+    loss = int(s.get("loss_pct") or 0)
+    with db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT id, name, host, state FROM hosts WHERE enabled=1")]
+    for host in hosts:
+        if host["state"] == "down":
+            continue
+        with db() as c:
+            rows = c.execute("SELECT ts, ok, ms FROM results WHERE host_id=? AND ts>=? ORDER BY ts",
+                             (host["id"], now - window)).fetchall()
+        samples = [(r["ts"], bool(r["ok"]), r["ms"]) for r in rows]
+        problem = siteops.sustained_bad(samples, now, window, latency, loss)
+        key = f"quality:{host['id']}"
+        prev = _extra_get(key)
+        if not problem:
+            if prev.get("kind"):
+                msg = f"{host['name']} latency and loss are back within the limits."
+                add_event("ping", "quality_ok", "info", host, "Link quality restored", msg)
+                consider_notify(s, host, "info", f"[{s['site_name']}] Link quality restored: {host['name']}", msg,
+                                build_payload(s, "device_alert", None, host, severity="info", message=msg))
+                _extra_put(key, {})
+            continue
+        if prev.get("kind") == problem["kind"]:
+            continue
+        title = "High latency" if problem["kind"] == "latency" else "Packet loss"
+        msg = f"{host['name']} {problem['kind']} is {problem['value']} over {int(window/60)} min."
+        add_event("ping", "quality_" + problem["kind"], "warning", host, title, msg, problem)
+        consider_notify(s, host, "warning", f"[{s['site_name']}] {title}: {host['name']}", msg,
+                        build_payload(s, "device_alert", None, host, severity="warning", message=msg))
+        _extra_put(key, problem)
+
+
+def _due(key, every):
+    row_ts = 0
+    with db() as c:
+        row = c.execute("SELECT ts FROM extra_state WHERE key=?", (key,)).fetchone()
+        if row and row["ts"]:
+            row_ts = row["ts"]
+    if row_ts and time.time() - row_ts < every:
+        return False
+    _extra_put(key, {"ran": True})
+    return True
+
+
+def _cert_check(s, now):
+    if not _due("cert-ran", 6 * 3600):
+        return
+    marks = []
+    for part in str(s.get("cert_warn_days") or "30,14,7").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            marks.append(int(part))
+    if not marks:
+        return
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM cert_watch")]
+    for row in rows:
+        if row["kind"] == "domain":
+            data, err = siteops._json_call("GET", "https://rdap.org/domain/" + row["name"], timeout=8)
+            days = siteops.rdap_expiry(data) if data else None
+            detail = err
+        else:
+            days, detail = siteops.cert_not_after(row["name"], row["port"] or 443)
+        hit = siteops.next_threshold(days, marks, int(row["last_mark"]) if str(row["last_mark"]).lstrip("-").isdigit() else None)
+        if hit is None:
+            if days is not None and days > max(marks) and row["last_mark"]:
+                add_event("cert", "cert_ok", "info", None, "Certificate ok", f"{row['name']} has {days} days left.")
+                with _db_lock, db() as c:
+                    c.execute("UPDATE cert_watch SET last_days=?, last_mark='' WHERE id=?", (days, row["id"]))
+            continue
+        label = "expired" if hit <= 0 and (days or 0) <= 0 else f"{days} days left"
+        msg = f"{row['name']} ({row['kind']}) {label}."
+        if detail and days is None:
+            msg = f"{row['name']}: {detail}"
+            continue
+        add_event("cert", "cert_warn", "warning", None, "Expiry warning", msg, {"days": days, "mark": hit})
+        consider_notify(s, None, "warning", f"[{s['site_name']}] Expiry: {row['name']}", msg,
+                        build_payload(s, "device_alert", None, None, severity="warning", message=msg))
+        with _db_lock, db() as c:
+            c.execute("UPDATE cert_watch SET last_days=?, last_mark=? WHERE id=?", (days, str(hit), row["id"]))
+
+
+def _nut_check(s):
+    if not _due("nut-ran", 60):
+        return
+    host = (s.get("nut_host") or "").strip()
+    if not host:
+        return
+    text, err = siteops.nut_query(host, s.get("nut_port") or 3493, s.get("nut_name") or "ups")
+    if err or not text:
+        _extra_put("nut", {"error": err or "no reply"})
+        return
+    cur = siteops.parse_nut(text)
+    if not cur:
+        _extra_put("nut", {"error": "unreadable"})
+        return
+    prev = _extra_get("nut")
+    for kind, sev, title, msg in wirelogic.ups_alerts(prev if prev.get("charge_pct") is not None or prev.get("on_battery") else None, cur, s.get("ups_runtime_min") or 0, s.get("ups_load_pct") or 0):
+        add_event("ups", kind, sev, None, title, msg)
+        consider_notify(s, None, sev, f"[{s['site_name']}] {title}", msg,
+                        build_payload(s, "device_alert", None, None, severity=sev, message=msg))
+    _extra_put("nut", cur)
+
+
+def _controller_check(s):
+    if not _due("ctrl-ran", 300):
+        return
+    if s.get("unifi_url"):
+        devices, err = siteops.fetch_unifi(s.get("unifi_url"), s.get("unifi_user"), decrypt_secret(s.get("unifi_password") or ""), s.get("unifi_site") or "default")
+        _extra_put("unifi", {"devices": devices, "error": err})
+    if s.get("omada_url"):
+        devices, err = siteops.fetch_omada(s.get("omada_url"), s.get("omada_user"), decrypt_secret(s.get("omada_password") or ""), s.get("omada_site") or "")
+        _extra_put("omada", {"devices": devices, "error": err})
+    if s.get("starlink_host"):
+        parsed, err = siteops.fetch_starlink(s.get("starlink_host"))
+        _extra_put("starlink", {"status": parsed, "error": err})
+
+
+def _speed_check(s):
+    if not _due("speed-ran", 6 * 3600):
+        return
+    limit = int(s.get("speed_ms") or 0)
+    if limit <= 0:
+        return
+    binary = shutil.which("speedtest") or shutil.which("speedtest-cli")
+    args = siteops.speedtest_args(binary)
+    if not args:
+        _extra_put("speed", {"skipped": True, "detail": "speedtest command is not installed"})
+        return
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=90)
+        payload = json.loads(out.stdout or "{}")
+    except Exception as exc:
+        _extra_put("speed", {"error": str(exc)[:160]})
+        return
+    down = ((payload.get("download") or {}).get("bandwidth") or 0) * 8 / 1e6
+    _extra_put("speed", {"mbps": round(down, 1)})
+    prev = _extra_get("speed-alert")
+    slow = down and down < limit
+    if slow and not prev.get("slow"):
+        msg = f"Download {down:.1f} Mbps is below {limit} Mbps."
+        add_event("wan", "speed_low", "warning", None, "Slow speed", msg)
+        consider_notify(s, None, "warning", f"[{s['site_name']}] Slow speed", msg,
+                        build_payload(s, "device_alert", None, None, severity="warning", message=msg))
+        _extra_put("speed-alert", {"slow": True})
+    elif not slow and prev.get("slow"):
+        add_event("wan", "speed_ok", "info", None, "Speed restored", "The speed test is back above the limit.")
+        _extra_put("speed-alert", {"slow": False})
+
+
+def _snapshot(s):
+    with db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT name, state, device_type, category FROM hosts WHERE enabled=1")]
+    counts = siteops.summary_counts(hosts)
+    ups = []
+    nut = _extra_get("nut")
+    if nut.get("charge_pct") is not None or nut.get("on_battery"):
+        ups.append({"name": s.get("nut_name") or "ups", "charge": nut.get("charge_pct"),
+                    "source": "battery" if nut.get("on_battery") else "mains"})
+    return {"site": s.get("site_name") or "", "online": counts["online"], "offline": counts["offline"],
+            "availability": counts["availability"],
+            "down_names": [h["name"] for h in hosts if h["state"] == "down"], "ups": ups}
+
+
+def _tg_commands(s):
+    if not s.get("tg_commands") or not s.get("telegram_token"):
+        return
+    try:
+        info = telegram_call(s["telegram_token"], "getWebhookInfo")
+    except TelegramError:
+        return
+    if ((info.get("result") or {}).get("url") or "").strip():
+        return
+    offset = int(s.get("tg_cmd_offset") or 0)
+    try:
+        data = telegram_call(s["telegram_token"], "getUpdates", {"timeout": "0", "offset": str(offset or "")})
+    except TelegramError:
+        return
+    allowed = [s.get("telegram_chat_id") or ""]
+    snap = _snapshot(s)
+    newest = offset
+    for upd in data.get("result") or []:
+        newest = max(newest, int(upd.get("update_id") or 0) + 1)
+        msg = upd.get("message") or {}
+        chat = (msg.get("chat") or {}).get("id")
+        reply = siteops.command_reply(msg.get("text") or "", chat, allowed, snap, s.get("ui_lang") or "en")
+        if reply and chat is not None:
+            try:
+                telegram_call(s["telegram_token"], "sendMessage", {"chat_id": str(chat), "text": reply[:4000]})
+            except TelegramError:
+                log.info("telegram command reply failed")
+    if newest != offset:
+        set_settings(tg_cmd_offset=newest)
+
+
+def _monthly_report(s, now):
+    if not s.get("report_monthly"):
+        return
+    local = datetime.fromtimestamp(now, tzinfo())
+    if local.day != int(s.get("report_monthly_day") or 1):
+        return
+    stamp = local.strftime("%Y-%m")
+    if _extra_get("monthly").get("stamp") == stamp:
+        return
+    end = datetime(local.year, local.month, 1, tzinfo=local.tzinfo).timestamp()
+    start = end - 28 * 86400
+    for lang in ("en", "el"):
+        data = jobs.report_context(sys.modules[__name__], start, end, lang, s.get("site_name") or "")
+        pdf = reportpdf.build_pdf(data, _logo_file())
+        _send_pdf(s, pdf, f"report-{lang}-{stamp}.pdf", lang)
+    _extra_put("monthly", {"stamp": stamp})
+
+
+def _send_pdf(s, pdf, filename, lang):
+    if not s.get("telegram_token") or not s.get("telegram_chat_id"):
+        return
+    boundary = uuid.uuid4().hex
+    caption = "Μηνιαία αναφορά" if lang == "el" else "Monthly report"
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{s["telegram_chat_id"]}\r\n'.encode(),
+        f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'.encode(),
+        (f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+         f'Content-Type: application/pdf\r\n\r\n').encode() + pdf + b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ]
+    url = f"https://api.telegram.org/bot{s['telegram_token']}/sendDocument"
+    try:
+        _http_post(url, b"".join(parts), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    except Exception:
+        log.info("monthly report telegram send failed")
+
+
+def ops_cycle():
+    s = get_settings()
+    now = time.time()
+    for fn in (_quality_check, _cert_check):
+        try:
+            fn(s, now)
+        except Exception:
+            log.info("ops step failed", exc_info=True)
+    for fn in (_nut_check, _controller_check, _speed_check, _tg_commands):
+        try:
+            fn(s)
+        except Exception:
+            log.info("ops step failed", exc_info=True)
+    try:
+        _monthly_report(s, now)
+    except Exception:
+        log.info("monthly report failed", exc_info=True)
+
+
+@app.route("/lang", methods=["POST"])
+def set_lang():
+    lang = request.form.get("lang")
+    if lang in ("en", "el"):
+        session["ui_lang"] = lang
+    return redirect(request.referrer or url_for("index"))
+
+
+@app.route("/map")
+@viewer_required
+def network_map():
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT id, name, parent_id, state FROM hosts ORDER BY name")]
+    body = """<div class="card"><h2>{{ tr.map_title }}</h2><p class="hint">{{ tr.map_hint }}</p>{{ svg|safe }}</div>"""
+    return page(body, svg=siteops.map_svg(rows, _lang()))
+
+
+@app.route("/devices")
+@viewer_required
+def device_list():
+    category = request.args.get("category") or ""
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT id, name, host, device_type, category, state FROM hosts ORDER BY name")]
+    _fill_categories(rows)
+    if category in siteops.CATEGORY_IDS:
+        rows = [r for r in rows if r.get("category") == category]
+    body = """<div class="card"><h2>{{ tr.devices }}</h2>
+<table><tr><th>Name</th><th>Address</th><th>Category</th><th>State</th></tr>
+{% for h in rows %}<tr><td><a href="{{ url_for('host_page', hid=h.id) }}">{{ h.name }}</a></td><td>{{ h.host }}</td>
+<td>{{ h.category }}</td><td>{{ h.state }}</td></tr>{% else %}<tr><td colspan="4">{{ tr.empty }}</td></tr>{% endfor %}
+</table></div>"""
+    return page(body, rows=rows)
+
+
+@app.route("/users")
+@viewer_required
+def users_page():
+    s = get_settings()
+    body = """<div class="card"><h2>{{ tr.users }}</h2><p>{{ tr.users_body }}</p>
+<p>Admin: {{ 'set' if s.admin_hash else 'missing' }} · Viewer: {{ 'set' if s.viewer_hash else 'not set' }}</p>
+{% if role()=='admin' %}<p><a href="{{ url_for('settings') }}#password">{{ tr.settings }}</a></p>{% endif %}</div>"""
+    return page(body)
+
+
+@app.route("/vendors")
+@viewer_required
+def vendors_page():
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT device_type, COUNT(*) AS n FROM hosts GROUP BY device_type ORDER BY n DESC")]
+    body = """<div class="card"><h2>{{ tr.vendors_title }}</h2>
+<table><tr><th>Vendor</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ r.device_type }}</td><td>{{ r.n }}</td></tr>{% else %}<tr><td colspan="2">{{ tr.empty }}</td></tr>{% endfor %}
+</table></div>"""
+    return page(body, rows=rows)
+
+
+@app.route("/settings/certs", methods=["GET", "POST"])
+@admin_required
+def cert_page():
+    if request.method == "POST":
+        if request.form.get("delete"):
+            with _db_lock, db() as c:
+                c.execute("DELETE FROM cert_watch WHERE id=?", (request.form.get("delete"),))
+        else:
+            name = (request.form.get("name") or "").strip().lower()
+            kind = "domain" if request.form.get("kind") == "domain" else "tls"
+            try:
+                port = int(request.form.get("port") or 443)
+            except ValueError:
+                port = 443
+            if name:
+                with _db_lock, db() as c:
+                    c.execute("INSERT INTO cert_watch(name, kind, port) VALUES(?,?,?)", (name[:253], kind, port))
+        return redirect(url_for("cert_page"))
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM cert_watch ORDER BY name")]
+    body = """<div class="card"><h2>Certificates and domains</h2>
+<p class="section-intro">Warn once at each configured day threshold. TLS uses the live certificate. Domains use RDAP when the registry publishes an expiration date.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<input name="name" placeholder="host.example.com" required>
+<select name="kind"><option value="tls">TLS certificate</option><option value="domain">Domain (RDAP)</option></select>
+<input type="number" name="port" value="443" style="width:90px"><button>Add</button></form>
+<table><tr><th>Name</th><th>Kind</th><th>Days</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ r.name }}</td><td>{{ r.kind }}</td><td>{{ r.last_days if r.last_days is not none else '—' }}</td>
+<td><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button name="delete" value="{{ r.id }}" class="del">Delete</button></form></td></tr>{% endfor %}
+</table></div>"""
+    return page(body, rows=rows)
+
+
+@app.route("/report/monthly")
+@admin_required
+def monthly_report():
+    lang = request.args.get("lang") if request.args.get("lang") in ("en", "el") else "en"
+    now = datetime.now(tzinfo())
+    end = datetime(now.year, now.month, 1, tzinfo=now.tzinfo)
+    start = end.timestamp() - 31 * 86400
+    data = jobs.report_context(sys.modules[__name__], start, end.timestamp(), lang, get_settings().get("site_name") or "")
+    pdf = reportpdf.build_pdf(data, _logo_file())
+    return Response(pdf, mimetype="application/pdf",
+                    headers={"Content-Disposition": f"attachment; filename=monthly-{lang}.pdf"})
 
 
 def main():
