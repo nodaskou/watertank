@@ -971,7 +971,7 @@ def report_context(pm, start, end, lang, site):
         "power": power,
         "alerts": counts,
         "version": getattr(pm, "VERSION", ""),
-        "client_name": s.get("client_brand") or "",
+        "client_name": s.get("site_name") or "",
         "client_subtitle": s.get("client_subtitle") or "",
         "client_logo": branding.find(getattr(pm, "DATA_DIR", None), s.get("client_logo") or "") or "",
     }

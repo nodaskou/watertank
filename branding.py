@@ -123,6 +123,15 @@ def find(data_dir, filename):
     return path if os.path.isfile(path) else None
 
 
+def adopt_client_name(site_name, brand_name):
+    """Use a leftover branding name only when General has no client name."""
+    site = (site_name or "").strip()
+    brand = (brand_name or "").strip()
+    if not site and brand:
+        return brand
+    return site
+
+
 def remove(data_dir):
     folder = os.path.join(data_dir or "", "brand")
     if not os.path.isdir(folder):

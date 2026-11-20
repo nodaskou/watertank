@@ -312,6 +312,14 @@ def init_db():
         for k in ("secret_key", "api_token"):
             if not c.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()[0]:
                 c.execute("UPDATE settings SET value=? WHERE key=?", (secrets.token_urlsafe(32), k))
+        site = c.execute("SELECT value FROM settings WHERE key='site_name'").fetchone()
+        brand = c.execute("SELECT value FROM settings WHERE key='client_brand'").fetchone()
+        if site and brand:
+            adopted = branding.adopt_client_name(site["value"], brand["value"])
+            if adopted != (site["value"] or "").strip():
+                c.execute("UPDATE settings SET value=? WHERE key='site_name'", (adopted,))
+            if (brand["value"] or "").strip():
+                c.execute("UPDATE settings SET value='' WHERE key='client_brand'")
 
 
 def get_settings():
@@ -2429,15 +2437,13 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 <link rel="icon" id="site-icon" href="{{ url_for('brand_logo') }}" type="image/jpeg">
 <title>{{ s.site_name }} - """ + APP_NAME + """</title><style>""" + CSS + """</style>
 {% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body{% if hid is defined and hid %} data-live-id="{{ hid }}"{% endif %}>
-<header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>""" + APP_NAME + """ <small>· {{ s.site_name }}</small></span>
-{% if client.logo or client.name or client.subtitle %}<span class="clientbrand">{% if client.logo %}<img src="{{ url_for('client_logo') }}" alt="">{% endif %}{% if client.name or client.subtitle %}<span class="clienttext">{% if client.name %}<b>{{ client.name }}</b>{% endif %}{% if client.subtitle %}<small>{{ client.subtitle }}</small>{% endif %}</span>{% endif %}</span>{% endif %}
+<header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave">{% if client.logo %}<img class="logo" src="{{ url_for('client_logo') }}" alt="">{% endif %}<span>""" + APP_NAME + """ <small>· {{ s.site_name }}{% if client.subtitle %} · {{ client.subtitle }}{% endif %}</small></span>
 </h1><div>
 <a href="{{ url_for('index') }}">{{ tr.dashboard }}</a>
 {% if role() %}<a href="{{ url_for('event_log') }}">{{ tr.log }}</a>{% endif %}
 {% if role() == 'admin' %}<a href="{{ url_for('report_page') }}">{{ tr.report }}</a><a href="{{ url_for('settings') }}">{{ tr.settings }}</a>{% endif %}
 {% if role() %}<a href="{{ url_for('logout') }}">{{ tr.logout }} ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">{{ tr.login }}</a>{% endif %}
 </div></header><div class="shell"><aside class="side">
-{% if client.logo or client.name or client.subtitle %}<div class="clientbrand">{% if client.logo %}<img src="{{ url_for('client_logo') }}" alt="">{% endif %}{% if client.name or client.subtitle %}<span class="clienttext">{% if client.name %}<b>{{ client.name }}</b>{% endif %}{% if client.subtitle %}<small>{{ client.subtitle }}</small>{% endif %}</span>{% endif %}</div>{% endif %}
 <a href="{{ url_for('index') }}">{{ tr.dashboard }}</a>
 <a href="{{ url_for('network_map') }}">{{ tr.map }}</a>
 <a href="{{ url_for('device_list') }}">{{ tr.devices }}</a>
@@ -3238,7 +3244,7 @@ def _client_brand():
     s = get_settings() if DB_PATH else {}
     filename = (s.get("client_logo") or "") if s else ""
     return {
-        "name": (s.get("client_brand") or "").strip() if s else "",
+        "name": (s.get("site_name") or "").strip() if s else "",
         "subtitle": (s.get("client_subtitle") or "").strip() if s else "",
         "logo": bool(branding.find(DATA_DIR, filename)),
     }
@@ -3273,11 +3279,10 @@ def client_logo():
 @app.route("/settings/brand", methods=["POST"])
 @admin_required
 def save_brand():
-    name = (request.form.get("client_brand") or "").strip()[:80]
     subtitle = (request.form.get("client_subtitle") or "").strip()[:120]
     if request.form.get("remove"):
         branding.remove(DATA_DIR)
-        set_settings(client_brand=name, client_subtitle=subtitle, client_logo="")
+        set_settings(client_subtitle=subtitle, client_logo="", client_brand="")
         flash("Client logo removed." if _lang() != "el" else "Το λογότυπο αφαιρέθηκε.")
         return redirect(url_for("settings") + "#general")
     uploaded = request.files.get("logo")
@@ -3289,7 +3294,7 @@ def save_brand():
         except branding.LogoError as exc:
             flash(str(exc))
             return redirect(url_for("settings") + "#general")
-    set_settings(client_brand=name, client_subtitle=subtitle, client_logo=filename)
+    set_settings(client_subtitle=subtitle, client_logo=filename, client_brand="")
     flash("Client branding saved." if _lang() != "el" else "Η εμφάνιση πελάτη αποθηκεύτηκε.")
     return redirect(url_for("settings") + "#general")
 
@@ -3405,9 +3410,8 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <h2>{{ tr.brand_title }}</h2>
 <form method="post" action="{{ url_for('save_brand') }}" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
-<label>{{ tr.brand_name }}</label><div><input type="text" name="client_brand" value="{{ s.client_brand }}" maxlength="80">
+<label>{{ tr.brand_subtitle }}</label><div><input type="text" name="client_subtitle" value="{{ s.client_subtitle }}" maxlength="120">
 <p class="hint">{{ tr.brand_hint }}</p></div>
-<label>{{ tr.brand_subtitle }}</label><div><input type="text" name="client_subtitle" value="{{ s.client_subtitle }}" maxlength="120"></div>
 <label>{{ tr.brand_upload }}</label><div><input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/svg+xml,.svg">
 {% if client.logo %}<p class="hint"><img src="{{ url_for('client_logo') }}" alt="" style="height:36px;width:36px;object-fit:contain"></p>{% endif %}</div>
 <span></span><div><button>{{ tr.brand_save }}</button>
@@ -6088,9 +6092,9 @@ def kiosk(token):
     body = """<meta http-equiv="refresh" content="30">
 <style>body{margin:0;background:#0b2a55;color:#fff} .k{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;padding:16px}
 .tile{background:#123;border-radius:12px;padding:12px} .up{color:#86efac}.down{color:#fecaca}</style>
-<h1 style="padding:12px 16px;margin:0">""" + APP_NAME + """</h1>
+<h1 style="padding:12px 16px;margin:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap"><img src="{{ url_for('brand_logo') }}" alt="Wirewave" style="height:36px;width:36px;border-radius:50%;object-fit:cover">{% if client.logo %}<img src="{{ url_for('client_logo') }}" alt="" style="height:36px;width:36px;object-fit:contain;background:#fff;border-radius:8px">{% endif %}<span>""" + APP_NAME + """ <small style="font-weight:400;opacity:.85">· {{ client.name }}{% if client.subtitle %} · {{ client.subtitle }}{% endif %}</small></span></h1>
 <div class="k">{% for h in rows %}<div class="tile"><b>{{ h.name }}</b><div class="{{ 'down' if h.state=='down' else 'up' }}">{{ h.state }}</div><div>{{ h.category }}</div></div>{% endfor %}</div>"""
-    return render_template_string("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">" + body, rows=rows)
+    return render_template_string("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">" + body, rows=rows, client=_client_brand())
 
 
 @app.route("/settings/kiosk", methods=["POST"])

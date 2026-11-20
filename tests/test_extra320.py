@@ -24,6 +24,8 @@ class Brand(unittest.TestCase):
         self.assertIn(b"<rect", safe)
         with self.assertRaises(branding.LogoError):
             branding.prepare(b"<html></html>")
+        self.assertEqual(branding.adopt_client_name("", "Hotel"), "Hotel")
+        self.assertEqual(branding.adopt_client_name("Kept", "Hotel"), "Kept")
         with self.assertRaises(branding.LogoError):
             branding.prepare(b"\x89PNG\r\n\x1a\n" + b"x" * (branding.MAX_LOGO + 2))
 
