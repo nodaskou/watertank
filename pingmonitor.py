@@ -5905,6 +5905,74 @@ def ops_cycle():
         _escalate_oncall(s, now)
     except Exception:
         log.info("on-call escalation failed", exc_info=True)
+    try:
+        _mikrotik_live(s)
+    except Exception:
+        log.info("mikrotik status failed", exc_info=True)
+
+
+def _mikrotik_live(s):
+    """RouterOS 7 REST, read-only. No REST service means no reading and no false failover."""
+    if not _due("mt-rest", 120):
+        return
+    with db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT * FROM hosts WHERE enabled=1 AND device_type='mikrotik'")]
+    for host in hosts:
+        try:
+            cfg = json.loads(host.get("mtbak") or "{}")
+        except (TypeError, ValueError):
+            continue
+        user = cfg.get("user") or ""
+        password = decrypt_secret(cfg.get("password") or "")
+        if not user or not password:
+            continue
+        port = int(cfg.get("rest_port") or 80)
+        base = f"http://{host['host']}:{port}/rest"
+        try:
+            resource = _mt_rest(base + "/system/resource", user, password)
+            routes = _mt_rest(base + "/ip/route", user, password)
+            sfp = _mt_rest(base + "/interface/ethernet", user, password)
+        except Exception:
+            continue
+        if not isinstance(resource, dict):
+            continue
+        gateway = extraops.parse_default_gateway(routes if isinstance(routes, list) else [])
+        prev = _extra_get(f"mtlive:{host['id']}")
+        event = extraops.route_event(prev.get("gateway"), gateway)
+        if event == "changed":
+            msg = f"{host['name']} default route changed from {prev.get('gateway')} to {gateway}."
+            add_event("backup", "wan_failover", "warning", host, "WAN route changed", msg)
+            consider_notify(s, host, "warning", f"[{s['site_name']}] WAN route changed: {host['name']}", msg,
+                            build_payload(s, "device_alert", None, host, severity="warning", message=msg))
+        optics = []
+        if isinstance(sfp, list):
+            optics = extraops.parse_sfp(sfp)
+        for item in optics:
+            level = extraops.sfp_level(item.get("rx"), s.get("sfp_warn_dbm"), s.get("sfp_crit_dbm"))
+            old = next((x for x in prev.get("sfp") or [] if x.get("name") == item.get("name")), {})
+            previous_level = extraops.sfp_level(old.get("rx"), s.get("sfp_warn_dbm"), s.get("sfp_crit_dbm"))
+            if level == "ok" and previous_level in ("warning", "critical"):
+                add_event("snmp", "sfp_ok", "info", host, "Optical power restored", f"{item['name']} RX is back in range.")
+            if level in ("warning", "critical") and previous_level == "ok":
+                msg = f"{item['name']} RX {item.get('rx')} dBm is {level}."
+                add_event("snmp", "sfp_" + level, "warning" if level == "warning" else "critical", host, "Optical power low", msg)
+                consider_notify(s, host, "critical" if level == "critical" else "warning",
+                                f"[{s['site_name']}] Optical power: {host['name']}", msg,
+                                build_payload(s, "device_alert", None, host, severity="warning", message=msg))
+        history = list(prev.get("history") or [])
+        if optics and optics[0].get("rx") is not None:
+            history.append(optics[0]["rx"])
+            history = history[-120:]
+        _extra_put(f"mtlive:{host['id']}", {"gateway": gateway, "resource": extraops.parse_routeros_resource(resource),
+                                            "sfp": optics, "history": history, "spark": extraops.sparkline(history)})
+
+
+def _mt_rest(url, user, password):
+    password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_mgr.add_password(None, url, user, password)
+    opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(password_mgr))
+    with opener.open(url, timeout=8) as resp:
+        return json.loads(resp.read(1_000_000).decode("utf-8", "replace"))
 
 
 @app.route("/lang", methods=["POST"])
