@@ -34,6 +34,14 @@ class Rules(unittest.TestCase):
         self.assertEqual(no_flood["last_alert"], 5000)
         again = wirelogic.plan_ping("down", 10, 1, 5000, 0, 900, False, 5100, 3, 30, False)
         self.assertIsNone(again["action"])
+        fresh = wirelogic.plan_ping("down", 4, 1, 1000, 0, 500, False, 9000, 3, 30, False, True)
+        self.assertEqual(fresh["action"], "down")
+        self.assertEqual(fresh["rearm"], 0)
+        follow = wirelogic.plan_ping("down", 5, 1, 9000, 0, 500, False, 9060, 3, 30, False, False)
+        self.assertIsNone(follow["action"])
+        held_rearm = wirelogic.plan_ping("down", 4, 1, 1000, 0, 500, False, 9000, 3, 30, True, True)
+        self.assertIsNone(held_rearm["action"])
+        self.assertEqual(held_rearm["dep_held"], 1)
 
     def test_disk_and_backup_rules(self):
         self.assertEqual(healthmon.disk_level(5, 100, 15, 5), "critical")

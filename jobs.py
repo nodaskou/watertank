@@ -246,6 +246,7 @@ def wan_probe(pm):
         avg = round(sum(samples) / len(samples), 2) if samples else None
         rows.append({"target": target, "loss": loss, "avg_ms": avg, "jitter": wirelogic.jitter_ms(samples)})
     state = wirelogic.judge_wan(rows, s.get("wan_loss_pct") or 0, s.get("wan_latency_ms") or 0)
+    rearm_wan = bool((pm._extra_get("alarm_rearm_wan") or {}).get("on"))
     with pm._db_lock, pm.db() as c:
         for row in rows:
             c.execute("INSERT INTO wan_samples(ts, target, loss, avg_ms, jitter, g) VALUES(?,?,?,?,?,0)",
@@ -283,6 +284,26 @@ def wan_probe(pm):
                 alerted = 0
         elif prev_state is None:
             alerted = 0
+        if rearm_wan and state == "down" and prev_state == "down":
+            how = pm.consider_notify(
+                s, None, "critical", f"[{s['site_name']}] Internet down",
+                "Internet is still down.",
+                pm.build_payload(s, "internet_down", None, None, "down", severity="critical",
+                                 message="Internet down", ts=now))
+            alerted = 1 if how in ("sent", "queued") else 0
+            pm.add_event("wan", "internet_down", "critical", None, "Internet down",
+                         "Internet is still down.", {"targets": rows}, ts=now, conn=c)
+        elif rearm_wan and state == "degraded" and prev_state == "degraded":
+            pm.add_event("wan", "internet_degraded", "warning", None, "Internet degraded",
+                         "Loss or latency is still above the threshold.", {"targets": rows}, ts=now, conn=c)
+            pm.consider_notify(
+                s, None, "warning", f"[{s['site_name']}] Internet degraded",
+                "Packet loss or latency is still above the threshold.",
+                pm.build_payload(s, "internet_degraded", None, None, severity="warning",
+                                 message="Internet degraded", ts=now))
+        if rearm_wan:
+            c.execute("INSERT OR REPLACE INTO extra_state(key, ts, data) VALUES('alarm_rearm_wan', ?, ?)",
+                      (now, json.dumps({"on": False})))
         detail = json.dumps(rows)
         c.execute("INSERT OR REPLACE INTO wan_status(id, state, since_ts, alerted, detail) VALUES(1,?,?,?,?)",
                   (state, since_ts, alerted, detail))
@@ -569,6 +590,11 @@ def apply_iot_result(pm, host, result, prev, now, blocked):
                            prev.get("held"), result.get("observation") or "unknown", now,
                            pm.fail_limit(host, s), pm.repeat_minutes(host, s), blocked)
     action = plan.get("action")
+    if prev.get("rearm") and action is None and plan.get("reach") == "offline" and not blocked:
+        action = "down"
+        plan["action"] = "down"
+        plan["alerted"] = 0
+        plan["last_alert"] = 0
     label = f"{host['name']} ({host['host']})"
     if action in ("down", "release"):
         msg = f"{label} is not answering its status API ({result.get('detail') or plan.get('diag')})."
@@ -622,7 +648,7 @@ def apply_iot_result(pm, host, result, prev, now, blocked):
         "last_alert": plan["last_alert"], "held": plan["held"], "diag": result.get("detail") or plan.get("diag"),
         "observation": result.get("observation"), "parsed": result.get("parsed"),
         "mode": result.get("mode"), "brand": result.get("brand"), "calls": result.get("calls") or [],
-        "notified": notified, "limits": prev.get("limits") or {}, "ts": now,
+        "notified": notified, "limits": prev.get("limits") or {}, "rearm": 0, "ts": now,
         "last_seen": now if result.get("observation") == "online" else prev.get("last_seen"),
     }
     with pm._db_lock, pm.db() as c:

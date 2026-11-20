@@ -1,6 +1,9 @@
 """Client branding and the extra 3.2.0 checks. Payloads are local fixtures, not live devices."""
+import json
 import os
 import sys
+import tempfile
+import time
 import unittest
 from datetime import datetime
 
@@ -8,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import branding
 import extraops
+import pingmonitor as pm
 
 
 class Brand(unittest.TestCase):
@@ -79,6 +83,145 @@ class ExtraChecks(unittest.TestCase):
         duty = extraops.on_duty([{"name": "Ada", "chat_id": "55", "day": 0, "start": "09:00", "end": "17:00"}], when)
         self.assertEqual(duty["chat_id"], "55")
         self.assertIsNone(extraops.on_duty([{"name": "Ada", "chat_id": "55", "day": 1, "start": "09:00", "end": "17:00"}], when))
+
+
+class ClearMapKiosk(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._db = pm.DB_PATH
+        self._data = pm.DATA_DIR
+        self._snap = pm.SNAP_DIR
+        pm.DB_PATH = os.path.join(self.tmp.name, "t.db")
+        pm.DATA_DIR = self.tmp.name
+        pm.SNAP_DIR = os.path.join(self.tmp.name, "snap")
+        os.makedirs(pm.SNAP_DIR, exist_ok=True)
+        pm.init_db()
+        pm.set_settings(site_name="Kept", fail_threshold=1, repeat_min=0, quiet_start="", quiet_end="",
+                        maintenance_until=0, kiosk_token="tok", ui_lang="en")
+        self._ping = {}
+        self._real = pm.get_pinger
+
+        def fake(_method):
+            def ping(host, _timeout):
+                ok = self._ping.get(host, False)
+                return (ok, 1.0 if ok else None)
+            return {"fn": ping, "name": "mock"}
+
+        pm.get_pinger = fake
+        pm.app.secret_key = "t"
+
+    def tearDown(self):
+        pm.get_pinger = self._real
+        pm.DB_PATH = self._db
+        pm.DATA_DIR = self._data
+        pm.SNAP_DIR = self._snap
+        self.tmp.cleanup()
+
+    def _pool(self):
+        class Pool:
+            def map(self, fn, items):
+                return list(map(fn, items))
+        return Pool()
+
+    def test_clear_alarms_rearms_once_and_keeps_history(self):
+        now = time.time()
+        with pm.db() as c:
+            c.execute("""INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, alerted_down, last_alert, down_since, repeat_min)
+                         VALUES('Cam','10.1.1.5','Shop','generic',1,?,?,1,?,?,-1)""",
+                      (now, "down", now - 100, now - 100))
+            c.execute("INSERT INTO results(host_id, ts, ok, ms) VALUES(1, ?, 0, NULL)", (now,))
+            c.execute("""INSERT INTO events(ts, source, kind, severity, title, message)
+                         VALUES(?, 'ping', 'host_down', 'critical', 'History kept', 'old')""", (now - 50,))
+            c.execute("""INSERT INTO sia_accounts(account, name, state, offline_alerted, last_text)
+                         VALUES('123456','Panel','alarm',0,'Burglary')""")
+            c.execute("""INSERT INTO sia_accounts(account, name, state, offline_alerted, last_ts)
+                         VALUES('999999','Quiet','offline',1,?)""", (now - 9999,))
+        before = None
+        with pm.db() as c:
+            before = c.execute("SELECT COUNT(*) AS n FROM results").fetchone()["n"]
+        pm.clear_all_alarms("203.0.113.8")
+        with pm.db() as c:
+            host = c.execute("SELECT alarm_rearm, alerted_down, last_alert, repeat_min, state FROM hosts").fetchone()
+            msgs = [r["message"] for r in c.execute("SELECT message FROM events ORDER BY id")]
+            ack = c.execute("SELECT ack_at, ack_by FROM sia_accounts WHERE account='123456'").fetchone()
+            offline = c.execute("SELECT offline_alerted, state FROM sia_accounts WHERE account='999999'").fetchone()
+            kept = c.execute("SELECT COUNT(*) AS n FROM events WHERE title='History kept'").fetchone()["n"]
+            results = c.execute("SELECT COUNT(*) AS n FROM results").fetchone()["n"]
+        self.assertEqual(host["alarm_rearm"], 1)
+        self.assertEqual(host["alerted_down"], 0)
+        self.assertEqual(host["last_alert"], 0)
+        self.assertEqual(host["repeat_min"], -1)
+        self.assertEqual(host["state"], "down")
+        self.assertEqual(pm.get_settings()["site_name"], "Kept")
+        self.assertEqual(results, before)
+        self.assertEqual(kept, 1)
+        self.assertEqual(msgs.count("Alarms cleared by admin from 203.0.113.8"), 1)
+        self.assertGreater(ack["ack_at"], 0)
+        self.assertEqual(ack["ack_by"], "admin")
+        self.assertEqual(offline["offline_alerted"], 0)
+        self.assertEqual(offline["state"], "offline")
+        self.assertIsNone(pm._problem_banner({"state": "down"}, []))
+        pm.monitor_cycle(self._pool())
+        with pm.db() as c:
+            c.execute("UPDATE hosts SET last_check=0")
+        pm.monitor_cycle(self._pool())
+        with pm.db() as c:
+            titles = [r["title"] for r in c.execute("SELECT title FROM events ORDER BY id")]
+            host = c.execute("SELECT alarm_rearm, alerted_down FROM hosts").fetchone()
+        self.assertEqual(titles.count("Down"), 1)
+        self.assertEqual(host["alarm_rearm"], 0)
+        self.assertEqual(host["alerted_down"], 1)
+        pm.release_alarm_quiet()
+        self.assertIsNotNone(pm._problem_banner({"state": "down"}, []))
+
+    def test_clear_button_admin_csrf_and_map_kiosk(self):
+        client = pm.app.test_client()
+        with client.session_transaction() as sess:
+            sess["role"] = "viewer"
+            sess["csrf"] = "t"
+        denied = client.post("/alarms/clear", data={"csrf": "t"})
+        self.assertEqual(denied.status_code, 302)
+        with client.session_transaction() as sess:
+            sess["role"] = "admin"
+            sess["csrf"] = "t"
+        missing = client.post("/alarms/clear", data={})
+        self.assertEqual(missing.status_code, 400)
+        page = client.get("/").get_data(as_text=True)
+        self.assertIn("Clear all alarms", page)
+        self.assertIn('data-confirm=', page)
+        ok = client.post("/alarms/clear", data={"csrf": "t"})
+        self.assertEqual(ok.status_code, 302)
+        with client.session_transaction() as sess:
+            sess["ui_lang"] = "el"
+        greek = client.get("/").get_data(as_text=True)
+        self.assertIn("Εκκαθάριση όλων των συναγερμών", greek)
+        with pm.db() as c:
+            c.execute("""INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state)
+                         VALUES('Core','10.0.0.1','Shop','mikrotik',1,?,'up')""", (time.time(),))
+            c.execute("""INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, parent_id)
+                         VALUES('Other','10.0.0.2','Other','generic',1,?,'down',1)""", (time.time(),))
+        mapped = client.get("/map?site=Shop").get_data(as_text=True)
+        self.assertIn("map-zoom-in", mapped)
+        self.assertIn("map-fit", mapped)
+        self.assertNotIn("cdn.", mapped)
+        self.assertIn("Core", mapped)
+        self.assertNotIn('data-name="Other"', mapped)
+        board = client.get("/kiosk/tok").get_data(as_text=True)
+        self.assertIn("fetch(", board)
+        self.assertNotIn('http-equiv="refresh"', board)
+        self.assertNotIn("cdn.", board)
+        self.assertIn("id=\"clock\"", board)
+        light = client.get("/kiosk/tok?theme=light").get_data(as_text=True)
+        self.assertIn('class="light"', light)
+        self.assertEqual(client.get("/kiosk/nope").status_code, 404)
+        live = client.get("/kiosk/tok/live").get_json()
+        blob = json.dumps(live).lower()
+        for banned in ("password", "secret", "kiosk_token", "api_token"):
+            self.assertNotIn(banned, blob)
+        self.assertIn("categories", live)
+        self.assertIn("availability", live)
+        self.assertIn("down", live)
+        self.assertTrue(any(item["name"] == "Other" for item in live["down"]))
 
 
 if __name__ == "__main__":

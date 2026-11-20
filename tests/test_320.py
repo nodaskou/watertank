@@ -35,7 +35,17 @@ class MapAndUps(unittest.TestCase):
         self.assertIn("#dc2626", svg)
         self.assertIn("#16a34a", svg)
         self.assertIn("<line", svg)
+        self.assertIn('font-size="14"', svg)
         self.assertNotIn("cdn.", svg)
+        layout = siteops.map_layout([
+            {"id": 1, "name": "Core router", "parent_id": None, "state": "up", "category": "routers"},
+            {"id": 2, "name": "Left switch", "parent_id": 1, "state": "up", "category": "switches"},
+            {"id": 3, "name": "Right switch", "parent_id": 1, "state": "down", "category": "switches"},
+        ])
+        placed = {node["id"]: node for node in layout["nodes"]}
+        self.assertGreaterEqual(placed[2]["label_px"], 14)
+        self.assertGreaterEqual(abs(placed[2]["x"] - placed[3]["x"]), 140)
+        self.assertGreater(placed[2]["y"], placed[1]["y"])
 
     def test_nut_parser(self):
         text = '\n'.join([

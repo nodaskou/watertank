@@ -265,6 +265,7 @@ def _migrate(c):
     _add_col(c, "hosts", "dep_held", "INTEGER NOT NULL DEFAULT 0")
     _add_col(c, "hosts", "iot", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "hosts", "category", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "hosts", "alarm_rearm", "INTEGER NOT NULL DEFAULT 0")
     c.execute("UPDATE hosts SET category='' WHERE category IS NULL")
     c.executescript("""
         CREATE TABLE IF NOT EXISTS cert_watch(
@@ -988,6 +989,112 @@ def clear_event_log(actor, ip):
     return now
 
 
+def _alarm_quiet():
+    """True after Clear all alarms, until the next monitor pass."""
+    try:
+        return bool(_extra_get("alarm_quiet").get("on"))
+    except Exception:
+        return False
+
+
+def release_alarm_quiet():
+    """Show live problems again once a check has had a chance to re-raise them."""
+    if _alarm_quiet():
+        _extra_put("alarm_quiet", {"on": False})
+
+
+def _problem_banner(wan, hosts):
+    if _alarm_quiet():
+        return None
+    lan_up = any(h.get("state") == "up" and _private_host(h.get("host")) for h in hosts)
+    if wan and wan.get("state") == "down":
+        return {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
+    if any(h.get("lan_down") for h in hosts):
+        names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
+        return {"cls": "warn", "text": "LAN device down: " + names}
+    return None
+
+
+def _rewrite_state_json(conn, table, id_col, mutator):
+    try:
+        rows = conn.execute(f"SELECT {id_col}, data FROM {table}").fetchall()
+    except sqlite3.OperationalError:
+        return
+    for row in rows:
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if mutator(data):
+            conn.execute(f"UPDATE {table} SET data=? WHERE {id_col}=?", (json.dumps(data), row[id_col]))
+
+
+def clear_all_alarms(ip):
+    """Acknowledge active alarms and reset repeat latches. Config and history stay.
+
+    A condition that is still failing raises one new alert on its next check.
+    """
+    ip = (ip or "").strip() or "unknown"
+    now = time.time()
+    with _db_lock, db() as c:
+        c.execute("""UPDATE sia_accounts SET ack_at=?, ack_by='admin'
+                     WHERE state='alarm' AND IFNULL(ack_at, 0)=0""", (now,))
+        c.execute("UPDATE sia_accounts SET offline_alerted=0 WHERE state='offline'")
+        c.execute("""UPDATE hosts SET alarm_rearm=1, alerted_down=0, last_alert=0
+                     WHERE state='down'""")
+        try:
+            c.execute("UPDATE wan_status SET alerted=0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("""UPDATE health_state SET alerted=0
+                         WHERE status IN ('warning', 'critical', 'stale', 'hung', 'stopped')""")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("UPDATE cert_watch SET last_mark='' WHERE last_mark!=''")
+        except sqlite3.OperationalError:
+            pass
+
+        def _cam(data):
+            if not data.get("notified"):
+                return False
+            data["notified"] = {}
+            return True
+
+        def _iot(data):
+            changed = False
+            if data.get("reach") == "offline" or data.get("alerted"):
+                data["rearm"] = 1
+                data["alerted"] = 0
+                data["last_alert"] = 0
+                changed = True
+            if data.get("notified"):
+                data["notified"] = {}
+                changed = True
+            return changed
+
+        _rewrite_state_json(c, "cam_state", "host_id", _cam)
+        _rewrite_state_json(c, "iot_state", "host_id", _iot)
+        try:
+            for row in c.execute("SELECT key, data FROM extra_state WHERE key LIKE 'quality:%' OR key='speed-alert'"):
+                if str(row["key"]).startswith("quality:"):
+                    c.execute("UPDATE extra_state SET data='{}' WHERE key=?", (row["key"],))
+                elif row["key"] == "speed-alert":
+                    c.execute("UPDATE extra_state SET data=? WHERE key='speed-alert'", (json.dumps({"slow": False}),))
+        except sqlite3.OperationalError:
+            pass
+        payload = json.dumps({"on": True})
+        for key in ("alarm_quiet", "alarm_rearm_wan", "nut_rearm"):
+            c.execute("INSERT OR REPLACE INTO extra_state(key, ts, data) VALUES(?, ?, ?)", (key, now, payload))
+        add_event("alarm", "alarms_cleared", "info",
+                  {"id": None, "name": "admin", "host": ip},
+                  "Alarms cleared", f"Alarms cleared by admin from {ip}",
+                  {"ip": ip, "by": "admin"}, ts=now, conn=c)
+
+
 def add_event(source, kind, severity, host=None, title="", message="", details=None, attachments=None, ts=None, conn=None):
     if conn is None:
         with _db_lock, db() as c:
@@ -1051,7 +1158,7 @@ def monitor_cycle(pool):
             plan = wirelogic.plan_ping(
                 h.get("state"), h.get("consec_fail"), h.get("alerted_down"), h.get("last_alert"),
                 h.get("dep_held"), h.get("down_since"), ok, now, fail_limit(h, s),
-                repeat_minutes(h, s), bool(ancestor))
+                repeat_minutes(h, s), bool(ancestor), bool(h.get("alarm_rearm")))
             label = f"{h['name']} ({h['host']})"
             alerted = plan["alerted_down"]
             last_alert = plan["last_alert"]
@@ -1092,9 +1199,9 @@ def monitor_cycle(pool):
                           {"upstream": ancestor_name}, ts=now, conn=c)
             seen = now if ok else h.get("last_seen")
             c.execute("""UPDATE hosts SET state=?, consec_fail=?, last_ms=?, last_check=?, last_seen=?,
-                         down_since=?, alerted_down=?, last_alert=?, dep_held=? WHERE id=?""",
+                         down_since=?, alerted_down=?, last_alert=?, dep_held=?, alarm_rearm=? WHERE id=?""",
                       (plan["state"], plan["consec_fail"], ms if ok else None, now, seen,
-                       plan["down_since"], alerted, last_alert, plan["dep_held"], h["id"]))
+                       plan["down_since"], alerted, last_alert, plan["dep_held"], int(plan.get("rearm") or 0), h["id"]))
 
 
 def refresh_public_ip():
@@ -1173,6 +1280,7 @@ def _alarm_rows(tz):
             "test_time": fmt_ts(test_ts, tz) if test_ts else "",
             "site": site, "brand": brand, "color": color, "label": label, "cls": cls,
             "flash": state == "alarm" and not acked, "acked": acked,
+            "latched": bool(r["offline_alerted"]) if "offline_alerted" in r.keys() else state == "offline",
             "ack_by": (r["ack_by"] if "ack_by" in r.keys() else "") or "",
             "ack_time": fmt_ts(ack_at, tz) if ack_at else "",
             "skew": siarecv.clock_warning(skew) if skew else "",
@@ -1216,12 +1324,15 @@ def _status_bar(hosts, wan, alarms):
             worse("bad")
             break
     for alarm in alarms or []:
-        if alarm.get("state") == "alarm":
+        if alarm.get("state") == "alarm" and not alarm.get("acked"):
             reasons.append("Alarm: " + (alarm.get("last_text") or alarm.get("name") or "panel")[:48])
             worse("bad")
-        elif alarm.get("state") == "offline":
+        elif alarm.get("state") == "offline" and alarm.get("latched"):
             reasons.append("panel communication lost: " + (alarm.get("name") or ""))
             worse("bad")
+    quiet = _alarm_quiet()
+    if quiet:
+        level, reasons = "ok", ["Alarms cleared"]
     return {
         "level": level,
         "reason": " · ".join(reasons) if reasons else "All clear",
@@ -1230,7 +1341,7 @@ def _status_bar(hosts, wan, alarms):
         "ip": s.get("public_ip") or "",
         "isp": s.get("public_ip_isp") or "",
         "checked": fmt_ts(s.get("public_ip_at"), tzinfo()) if s.get("public_ip_at") else "—",
-        "alarm_flash": any(a.get("flash") for a in (alarms or [])),
+        "alarm_flash": False if quiet else any(a.get("flash") for a in (alarms or [])),
     }
 
 
@@ -1333,6 +1444,10 @@ def monitor_loop(stop):
                         configbackup.write_local(c, DATA_DIR, VERSION, s["secret_key"])
             except Exception:
                 log.exception("schedule lookup failed")
+            try:
+                release_alarm_quiet()
+            except Exception:
+                log.debug("alarm quiet", exc_info=True)
             stop.wait(max(1, interval - (time.time() - start)))
 
 
@@ -2720,6 +2835,8 @@ INDEX_BODY = CHART_JS + """
 <div>{{ c.el if lang=='el' else c.en }}</div><b>{{ c.total }}</b>
 <div>{{ c.online }} {{ tr.online }} · {{ c.offline }} {{ tr.offline }}</div>
 <div class="bar"><span style="width:{{ c.pct }}%"></span></div></a>{% endif %}{% endfor %}</div>
+{% if role()=='admin' %}<form method="post" action="{{ url_for('clear_alarms') }}" style="margin:0 0 12px" data-confirm="{{ tr.confirm_clear_alarms }}" onsubmit="return confirm(this.dataset.confirm)">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del" type="submit">{{ tr.clear_alarms }}</button></form>{% endif %}
 <div class="statusbar {{ bar.level }}{% if bar.alarm_flash %} alarm{% endif %}" id="bar">
  <span class="why" id="bar-why">{{ bar.reason }}</span>
  <span id="bar-alarms">{% for a in alarms %}{% if a.flash %}<span class="alarm-pill flash">{{ a.name }} · ALARM</span>{% endif %}{% endfor %}</span>
@@ -3125,13 +3242,7 @@ def index():
         groups[idx[h["grp"]]][1].append(h)
     counts = {k: sum(1 for h in hosts if h["state"] == k) for k in ("up", "down", "warn", "pending")}
     alarms = _alarm_rows(tzinfo())
-    banner = None
-    lan_up = any(h["state"] == "up" and _private_host(h["host"]) for h in hosts)
-    if wan and wan["state"] == "down":
-        banner = {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
-    elif any(h.get("lan_down") for h in hosts):
-        names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
-        banner = {"cls": "warn", "text": "LAN device down: " + names}
+    banner = _problem_banner(wan, hosts)
     health = _health_lines()
     _fill_categories(hosts)
     return page(INDEX_BODY, charts=True, live="dashboard", groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
@@ -4452,12 +4563,7 @@ def api_live():
         h["lan_down"] = h["state"] == "down" and not h.get("maint") and wan and wan["state"] == "up" and _private_host(h["host"])
     counts = {k: sum(1 for h in hosts if h["state"] == k) for k in ("up", "down", "warn", "pending")}
     alarms = _alarm_rows(tz)
-    lan_up = any(h["state"] == "up" and _private_host(h["host"]) for h in hosts)
-    banner = None
-    if wan and wan.get("state") == "down":
-        banner = {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
-    elif any(h.get("lan_down") for h in hosts):
-        banner = {"cls": "warn", "text": "LAN device down: " + ", ".join(h["name"] for h in hosts if h.get("lan_down"))}
+    banner = _problem_banner(wan, hosts)
     bar = _status_bar(hosts, wan, alarms)
     traffic = _traffic_cards(since)
     return jsonify(now=now, bar=bar, banner=banner, counts=counts, alarms=alarms,
@@ -4496,6 +4602,14 @@ def event_log():
         sources = [r[0] for r in c.execute("SELECT DISTINCT source FROM events ORDER BY source")]
     return page(LOG_BODY, live="log", events=events, sources=sources, filt=filt, keep=keep,
                 last_cleared=last_cleared_text(tz), clear_next="log")
+
+
+@app.route("/alarms/clear", methods=["POST"])
+@admin_required
+def clear_alarms():
+    clear_all_alarms(client_ip())
+    flash("Alarms cleared." if _lang() != "el" else "Οι συναγερμοί καθαρίστηκαν.")
+    return redirect(url_for("index"))
 
 
 @app.route("/log/clear", methods=["POST"])
@@ -5718,7 +5832,8 @@ def _cert_check(s, now):
 
 
 def _nut_check(s):
-    if not _due("nut-ran", 60):
+    rearm = bool(_extra_get("nut_rearm").get("on"))
+    if not rearm and not _due("nut-ran", 60):
         return
     host = (s.get("nut_host") or "").strip()
     if not host:
@@ -5732,6 +5847,14 @@ def _nut_check(s):
         _extra_put("nut", {"error": "unreadable"})
         return
     prev = _extra_get("nut")
+    if rearm and (cur.get("on_battery") or cur.get("battery_status") in ("low", "depleted")):
+        msg = "The UPS is still reporting a power problem."
+        add_event("ups", "ups_still", "critical" if cur.get("on_battery") else "warning", None, "UPS problem", msg)
+        consider_notify(s, None, "critical" if cur.get("on_battery") else "warning",
+                        f"[{s['site_name']}] UPS problem", msg,
+                        build_payload(s, "device_alert", None, None, severity="warning", message=msg))
+    if rearm:
+        _extra_put("nut_rearm", {"on": False})
     for kind, sev, title, msg in wirelogic.ups_alerts(prev if prev.get("charge_pct") is not None or prev.get("on_battery") else None, cur, s.get("ups_runtime_min") or 0, s.get("ups_load_pct") or 0):
         add_event("ups", kind, sev, None, title, msg)
         consider_notify(s, None, sev, f"[{s['site_name']}] {title}", msg,
@@ -5990,10 +6113,117 @@ def set_lang():
 @app.route("/map")
 @viewer_required
 def network_map():
+    site = (request.args.get("site") or "").strip()
+    tz = tzinfo()
     with db() as c:
-        rows = [dict(r) for r in c.execute("SELECT id, name, parent_id, state FROM hosts ORDER BY name")]
-    body = """<div class="card"><h2>{{ tr.map_title }}</h2><p class="hint">{{ tr.map_hint }}</p>{{ svg|safe }}</div>"""
-    return page(body, svg=siteops.map_svg(rows, _lang()))
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, name, host, parent_id, state, category, grp, last_seen FROM hosts ORDER BY name")]
+    _fill_categories(rows)
+    sites = sorted({(r.get("grp") or "").strip() for r in rows if (r.get("grp") or "").strip()})
+    for row in rows:
+        row["last_seen"] = fmt_ts(row.get("last_seen"), tz) if row.get("last_seen") else ""
+    shown = rows
+    if site:
+        shown = []
+        ids = {r["id"] for r in rows if (r.get("grp") or "").strip() == site}
+        for row in rows:
+            if row["id"] not in ids:
+                continue
+            item = dict(row)
+            if item.get("parent_id") not in ids:
+                item["parent_id"] = None
+            shown.append(item)
+    body = """<style>
+.mapbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
+.mapbar select,.mapbar button{font-size:14px;padding:8px 12px;border-radius:8px}
+#map-stage{height:calc(100vh - 150px);min-height:520px;background:#f8fafc;border-radius:12px;overflow:hidden;touch-action:none}
+#netmap{width:100%;height:100%;cursor:grab;touch-action:none}
+#map-detail{margin-top:10px;background:#fff;border-radius:12px;padding:12px 14px;font-size:15px}
+#map-detail b{font-size:18px}
+</style>
+<div class="card"><h2>{{ tr.map_title }}</h2><p class="hint">{{ tr.map_hint }}</p>
+<div class="mapbar">
+<form method="get" action="{{ url_for('network_map') }}"><label>{{ tr.map_site }}
+<select name="site" onchange="this.form.submit()"><option value="">{{ tr.map_all }}</option>
+{% for g in sites %}<option value="{{ g }}" {{ 'selected' if g==site else '' }}>{{ g }}</option>{% endfor %}
+</select></label></form>
+<button type="button" id="map-zoom-in">{{ tr.map_zoom_in }}</button>
+<button type="button" id="map-zoom-out">{{ tr.map_zoom_out }}</button>
+<button type="button" id="map-fit">{{ tr.map_fit }}</button>
+</div>
+<div id="map-stage">{{ svg|safe }}</div>
+<div id="map-detail" hidden></div>
+</div>
+<script>
+(function(){
+  const svg=document.getElementById('netmap');
+  const detail=document.getElementById('map-detail');
+  if(!svg) return;
+  const box=svg.viewBox.baseVal;
+  let vx=box.x, vy=box.y, vw=box.width||800, vh=box.height||600;
+  const home={x:vx,y:vy,w:vw,h:vh};
+  const labels={status:{{ tr.map_status|tojson }}, seen:{{ tr.map_last|tojson }}, open:{{ tr.map_open|tojson }}};
+  function apply(){ svg.setAttribute('viewBox', vx+' '+vy+' '+vw+' '+vh); }
+  function zoomAt(px, py, factor){
+    const rect=svg.getBoundingClientRect();
+    const rx=(px-rect.left)/rect.width, ry=(py-rect.top)/rect.height;
+    const nw=Math.min(home.w*8, Math.max(home.w/8, vw/factor));
+    const nh=vh*(nw/vw);
+    vx=vx+(vw-nw)*rx; vy=vy+(vh-nh)*ry; vw=nw; vh=nh; apply();
+  }
+  document.getElementById('map-zoom-in').onclick=function(){ const r=svg.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, 1.25); };
+  document.getElementById('map-zoom-out').onclick=function(){ const r=svg.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, 0.8); };
+  document.getElementById('map-fit').onclick=function(){ vx=home.x; vy=home.y; vw=home.w; vh=home.h; apply(); };
+  svg.addEventListener('wheel', function(e){ e.preventDefault(); zoomAt(e.clientX, e.clientY, e.deltaY<0?1.12:1/1.12); }, {passive:false});
+  const pts=new Map();
+  svg.addEventListener('pointerdown', function(e){ svg.setPointerCapture(e.pointerId); pts.set(e.pointerId,{x:e.clientX,y:e.clientY}); svg.style.cursor='grabbing'; });
+  svg.addEventListener('pointerup', function(e){ pts.delete(e.pointerId); svg.style.cursor='grab'; });
+  svg.addEventListener('pointercancel', function(e){ pts.delete(e.pointerId); });
+  svg.addEventListener('pointermove', function(e){
+    if(!pts.has(e.pointerId)) return;
+    const prev=pts.get(e.pointerId);
+    const rect=svg.getBoundingClientRect();
+    if(pts.size>=2){
+      const ids=[...pts.keys()];
+      const a=pts.get(ids[0]), b=pts.get(ids[1]);
+      const before=Math.hypot(a.x-b.x, a.y-b.y)||1;
+      pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      const a2=pts.get(ids[0]), b2=pts.get(ids[1]);
+      const after=Math.hypot(a2.x-b2.x, a2.y-b2.y)||1;
+      zoomAt((a2.x+b2.x)/2, (a2.y+b2.y)/2, after/before);
+      return;
+    }
+    vx-=(e.clientX-prev.x)*vw/rect.width;
+    vy-=(e.clientY-prev.y)*vh/rect.height;
+    pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    apply();
+  });
+  function line(text){ const d=document.createElement('div'); d.textContent=text; return d; }
+  function show(node){
+    if(!node){ detail.hidden=true; return; }
+    const id=node.getAttribute('data-id')||'';
+    detail.hidden=false;
+    detail.textContent='';
+    const title=document.createElement('b');
+    title.textContent=node.getAttribute('data-name')||'';
+    detail.appendChild(title);
+    detail.appendChild(line(node.getAttribute('data-ip')||''));
+    detail.appendChild(line(labels.status+': '+(node.getAttribute('data-state')||'')));
+    detail.appendChild(line(labels.seen+': '+(node.getAttribute('data-seen')||'—')));
+    if(/^\\d+$/.test(id)){
+      const link=document.createElement('a');
+      link.href='/host/'+id;
+      link.textContent=labels.open;
+      const wrap=document.createElement('div');
+      wrap.appendChild(link);
+      detail.appendChild(wrap);
+    }
+  }
+  svg.addEventListener('click', function(e){ const n=e.target.closest?e.target.closest('.node'):null; if(n) show(n); });
+  svg.addEventListener('mousemove', function(e){ const n=e.target.closest?e.target.closest('.node'):null; svg.title=n?(n.getAttribute('data-name')+' · '+n.getAttribute('data-ip')+' · '+n.getAttribute('data-state')):''; });
+})();
+</script>"""
+    return page(body, svg=siteops.map_svg(shown, _lang()), sites=sites, site=site)
 
 
 @app.route("/devices")
@@ -6081,20 +6311,199 @@ def monthly_report():
                     headers={"Content-Disposition": f"attachment; filename=monthly-{lang}.pdf"})
 
 
+def _kiosk_ok(token):
+    return extraops.kiosk_matches(token, get_settings().get("kiosk_token"))
+
+
+def kiosk_payload(lang):
+    """Read-only board data. Names, states and timings only — no passwords or tokens."""
+    lang = "el" if lang == "el" else "en"
+    tr = siteops.strings(lang)
+    tz = tzinfo()
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT name, host, state, category, down_since FROM hosts WHERE enabled=1 ORDER BY name")]
+    _fill_categories(rows)
+    now = time.time()
+    down = []
+    for host in rows:
+        if host.get("state") != "down":
+            continue
+        down.append({
+            "name": host.get("name") or "",
+            "host": host.get("host") or "",
+            "category": siteops.category_label(host.get("category"), lang),
+            "down_for": fmt_dur(now - host["down_since"]) if host.get("down_since") else "",
+        })
+    summary = siteops.summary_counts(rows)
+    categories = []
+    for row in siteops.category_counts(rows):
+        if not row["total"]:
+            continue
+        categories.append({
+            "label": row["el"] if lang == "el" else row["en"],
+            "color": row["color"],
+            "total": row["total"],
+            "online": row["online"],
+            "offline": row["offline"],
+            "pct": round(row["pct"], 1),
+        })
+    events = [{"time": e.get("time") or "", "title": e.get("title") or "", "severity": e.get("severity") or ""}
+              for e in event_rows(limit=12, tz=tz)]
+    moment = datetime.now(tz)
+    days = (("Monday", "Δευτέρα"), ("Tuesday", "Τρίτη"), ("Wednesday", "Τετάρτη"),
+            ("Thursday", "Πέμπτη"), ("Friday", "Παρασκευή"), ("Saturday", "Σάββατο"), ("Sunday", "Κυριακή"))
+    day = days[moment.weekday()][1 if lang == "el" else 0]
+    client = _client_brand()
+    return {
+        "time": moment.strftime("%H:%M:%S"),
+        "date": f"{day} {moment.strftime('%d/%m/%Y')}",
+        "epoch": moment.timestamp(),
+        "offset": moment.utcoffset().total_seconds() if moment.utcoffset() else 0,
+        "availability": summary["availability"],
+        "online": summary["online"],
+        "offline": summary["offline"],
+        "total": summary["total"],
+        "categories": categories,
+        "down": down,
+        "events": events,
+        "client": {"name": client["name"], "subtitle": client["subtitle"], "logo": bool(client["logo"])},
+        "labels": {
+            "online": tr["online"], "offline": tr["offline"], "availability": tr["availability"],
+            "down_title": tr["kiosk_offline"], "none": tr["kiosk_none_down"], "events": tr["kiosk_events"],
+        },
+    }
+
+
 @app.route("/kiosk/<token>")
 def kiosk(token):
     """Full-screen read-only board. The token is the only credential, and it is not printed again."""
-    if not extraops.kiosk_matches(token, get_settings().get("kiosk_token")):
+    if not _kiosk_ok(token):
         abort(404)
-    with db() as c:
-        rows = [dict(r) for r in c.execute("SELECT id, name, state, category FROM hosts WHERE enabled=1 ORDER BY name")]
-    _fill_categories(rows)
-    body = """<meta http-equiv="refresh" content="30">
-<style>body{margin:0;background:#0b2a55;color:#fff} .k{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;padding:16px}
-.tile{background:#123;border-radius:12px;padding:12px} .up{color:#86efac}.down{color:#fecaca}</style>
-<h1 style="padding:12px 16px;margin:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap"><img src="{{ url_for('brand_logo') }}" alt="Wirewave" style="height:36px;width:36px;border-radius:50%;object-fit:cover">{% if client.logo %}<img src="{{ url_for('client_logo') }}" alt="" style="height:36px;width:36px;object-fit:contain;background:#fff;border-radius:8px">{% endif %}<span>""" + APP_NAME + """ <small style="font-weight:400;opacity:.85">· {{ client.name }}{% if client.subtitle %} · {{ client.subtitle }}{% endif %}</small></span></h1>
-<div class="k">{% for h in rows %}<div class="tile"><b>{{ h.name }}</b><div class="{{ 'down' if h.state=='down' else 'up' }}">{{ h.state }}</div><div>{{ h.category }}</div></div>{% endfor %}</div>"""
-    return render_template_string("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">" + body, rows=rows, client=_client_brand())
+    theme = "light" if request.args.get("theme") == "light" else "dark"
+    lang = request.args.get("lang") if request.args.get("lang") in ("en", "el") else (get_settings().get("ui_lang") or "en")
+    data = kiosk_payload(lang)
+    other = "dark" if theme == "light" else "light"
+    tr = siteops.strings(lang)
+    page_html = """<!doctype html><html class="{{ theme }}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ data.client.name or '""" + APP_NAME + """' }}</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#07111f;color:#e8eef7}
+html.light body{background:#eef3f9;color:#0f172a}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:14px 20px;background:#0b2a55;color:#fff;flex-wrap:wrap}
+html.light .top{background:#fff;color:#0f172a;box-shadow:0 1px 0 #dbe3ee}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.brand img{height:52px;width:52px;object-fit:cover;border-radius:50%;background:#fff}
+.brand img.client{object-fit:contain;border-radius:10px}
+.brand b{font-size:clamp(18px,2vw,28px)}
+.brand small{display:block;font-weight:500;opacity:.85}
+.clock{text-align:right}
+.clock .t{font-size:clamp(36px,4vw,72px);font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.clock .d{font-size:clamp(14px,1.4vw,22px);opacity:.85}
+.avail{font-size:clamp(28px,3vw,48px);font-weight:700}
+.theme{color:inherit;font-size:14px}
+.layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(280px,.7fr);gap:16px;padding:16px}
+.cats{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;align-content:start}
+.cat{color:#fff;border-radius:16px;padding:14px 16px;min-height:118px}
+.cat b{font-size:clamp(16px,1.5vw,22px)}
+.cat .n{font-size:clamp(28px,2.4vw,40px);font-weight:700;line-height:1.1}
+.bar{height:10px;background:rgba(255,255,255,.35);border-radius:6px;margin-top:10px}
+.bar span{display:block;height:10px;background:#fff;border-radius:6px}
+.panel{background:#12263f;border-radius:16px;padding:16px}
+html.light .panel{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.panel h2{margin:0 0 10px;font-size:clamp(18px,1.6vw,26px)}
+.down{list-style:none;margin:0;padding:0}
+.down li{padding:10px 0;border-bottom:1px solid rgba(255,255,255,.12);font-size:clamp(16px,1.4vw,22px)}
+html.light .down li{border-color:#e2e8f0}
+.down small{display:block;opacity:.8;font-size:.8em}
+.ticker{margin:0 16px 16px;background:#12263f;border-radius:12px;padding:10px 14px;overflow:hidden;white-space:nowrap}
+html.light .ticker{background:#fff}
+.ticker b{margin-right:8px}
+#events{display:inline-block;padding-left:100%;animation:tick 40s linear infinite}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-100%)}}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.clock{text-align:left}}
+@media(min-width:1800px){body{font-size:20px}.cat{min-height:150px}}
+</style></head><body>
+<header class="top">
+<div class="brand"><img src="{{ url_for('brand_logo') }}" alt="Wirewave">{% if data.client.logo %}<img class="client" src="{{ url_for('client_logo') }}" alt="">{% endif %}
+<div><b id="client-name">{{ data.client.name }}</b><small>""" + APP_NAME + """{% if data.client.subtitle %} · {{ data.client.subtitle }}{% endif %}</small></div></div>
+<div class="clock"><div class="t" id="clock">{{ data.time }}</div><div class="d" id="date">{{ data.date }}</div>
+<div class="avail"><span id="avail">{{ data.availability }}</span>% {{ tr.availability }}</div>
+<a class="theme" href="?theme={{ other }}">{{ theme_label }}</a></div>
+</header>
+<div class="layout">
+<div class="cats" id="cats"></div>
+<section class="panel"><h2 id="down-title">{{ tr.kiosk_offline }}</h2><ul class="down" id="down"></ul></section>
+</div>
+<div class="ticker"><b id="ev-title">{{ tr.kiosk_events }}</b><span id="events"></span></div>
+<script>
+const boot={{ data|tojson }};
+let offset={{ data.offset|tojson }};
+function pad(n){ return String(n).padStart(2,'0'); }
+function tick(){
+  const d=new Date(Date.now()+offset*1000);
+  const el=document.getElementById('clock');
+  if(el) el.textContent=pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds());
+}
+function paint(data){
+  offset=data.offset||0;
+  document.getElementById('date').textContent=data.date||'';
+  document.getElementById('avail').textContent=data.availability;
+  document.getElementById('client-name').textContent=(data.client&&data.client.name)||'';
+  const cats=document.getElementById('cats');
+  cats.textContent='';
+  (data.categories||[]).forEach(function(c){
+    const card=document.createElement('article');
+    card.className='cat';
+    card.style.background=c.color||'#334155';
+    const title=document.createElement('b'); title.textContent=c.label||'';
+    const nums=document.createElement('div'); nums.className='n'; nums.textContent=String(c.total);
+    const sub=document.createElement('div');
+    sub.textContent=(data.labels.online||'')+' '+c.online+' · '+(data.labels.offline||'')+' '+c.offline;
+    const bar=document.createElement('div'); bar.className='bar';
+    const span=document.createElement('span'); span.style.width=(c.pct||0)+'%'; bar.appendChild(span);
+    card.appendChild(title); card.appendChild(nums); card.appendChild(sub); card.appendChild(bar);
+    cats.appendChild(card);
+  });
+  const list=document.getElementById('down');
+  list.textContent='';
+  const rows=data.down||[];
+  if(!rows.length){
+    const li=document.createElement('li'); li.textContent=(data.labels&&data.labels.none)||''; list.appendChild(li);
+  }
+  rows.forEach(function(h){
+    const li=document.createElement('li');
+    const name=document.createElement('b'); name.textContent=h.name||'';
+    const small=document.createElement('small'); small.textContent=(h.host||'')+' · '+(h.category||'')+' · '+(h.down_for||'');
+    li.appendChild(name); li.appendChild(small); list.appendChild(li);
+  });
+  const ev=document.getElementById('events');
+  ev.textContent=(data.events||[]).map(function(e){ return (e.time||'')+' '+(e.title||''); }).join('    ·    ');
+}
+paint(boot);
+setInterval(tick, 1000); tick();
+async function refresh(){
+  try{
+    const res=await fetch(location.pathname.replace(/\\/$/,'')+'/live', {headers:{'Accept':'application/json'}, cache:'no-store'});
+    if(!res.ok) return;
+    paint(await res.json());
+  }catch(e){}
+}
+setInterval(refresh, 10000);
+</script></body></html>"""
+    return render_template_string(page_html, data=data, theme=theme, other=other, tr=tr,
+                                  theme_label=tr["kiosk_theme_dark"] if theme == "light" else tr["kiosk_theme_light"],
+                                  client=_client_brand())
+
+
+@app.route("/kiosk/<token>/live")
+def kiosk_live(token):
+    if not _kiosk_ok(token):
+        abort(404)
+    lang = request.args.get("lang") if request.args.get("lang") in ("en", "el") else (get_settings().get("ui_lang") or "en")
+    return jsonify(kiosk_payload(lang))
 
 
 @app.route("/settings/kiosk", methods=["POST"])

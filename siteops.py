@@ -34,7 +34,14 @@ UI = {
         "availability": "Availability", "lang": "Ελληνικά",
         "users_body": "Admin can change settings. Viewer can open the dashboard only.",
         "vendors_title": "Vendors", "empty": "Nothing in this list.",
-        "map_title": "Network map", "map_hint": "Drawn from each device's upstream link. Colour is the current status.",
+        "map_title": "Network map", "map_hint": "Drawn from each device's upstream link. Colour is the current status. Scroll or pinch to zoom, drag to pan.",
+        "map_zoom_in": "Zoom in", "map_zoom_out": "Zoom out", "map_fit": "Fit",
+        "map_site": "Site", "map_all": "All sites", "map_last": "Last seen", "map_status": "Status",
+        "map_open": "Open device",
+        "clear_alarms": "Clear all alarms",
+        "confirm_clear_alarms": "Clear all current alarms? Anything still failing will raise one new alert on the next check.",
+        "kiosk_offline": "Currently offline", "kiosk_none_down": "Everything online",
+        "kiosk_events": "Recent events", "kiosk_theme_light": "Light", "kiosk_theme_dark": "Dark",
         "held": "Alerts held",
         "brand_title": "Client logo",
         "brand_name": "Client name",
@@ -59,7 +66,14 @@ UI = {
         "availability": "Διαθεσιμότητα", "lang": "English",
         "users_body": "Ο διαχειριστής αλλάζει ρυθμίσεις. Ο θεατής βλέπει μόνο τον πίνακα.",
         "vendors_title": "Κατασκευαστές", "empty": "Κενή λίστα.",
-        "map_title": "Χάρτης δικτύου", "map_hint": "Σχεδιάζεται από τη σύνδεση «upstream» κάθε συσκευής. Το χρώμα είναι η τρέχουσα κατάσταση.",
+        "map_title": "Χάρτης δικτύου", "map_hint": "Σχεδιάζεται από τη σύνδεση «upstream» κάθε συσκευής. Το χρώμα είναι η τρέχουσα κατάσταση. Κύλιση ή τσίμπημα για μεγέθυνση, σύρσιμο για μετακίνηση.",
+        "map_zoom_in": "Μεγέθυνση", "map_zoom_out": "Σμίκρυνση", "map_fit": "Ταίριασμα",
+        "map_site": "Χώρος", "map_all": "Όλοι οι χώροι", "map_last": "Τελευταία επαφή", "map_status": "Κατάσταση",
+        "map_open": "Άνοιγμα συσκευής",
+        "clear_alarms": "Εκκαθάριση όλων των συναγερμών",
+        "confirm_clear_alarms": "Να καθαρίσουν όλοι οι τρέχοντες συναγερμοί; Ό,τι ακόμα αποτυγχάνει θα ειδοποιήσει μία φορά στον επόμενο έλεγχο.",
+        "kiosk_offline": "Εκτός λειτουργίας τώρα", "kiosk_none_down": "Όλα σε λειτουργία",
+        "kiosk_events": "Πρόσφατα γεγονότα", "kiosk_theme_light": "Φωτεινό", "kiosk_theme_dark": "Σκούρο",
         "held": "Οι ειδοποιήσεις κρατούνται",
         "brand_title": "Λογότυπο πελάτη",
         "brand_name": "Όνομα πελάτη",
@@ -146,62 +160,133 @@ def summary_counts(hosts):
             "availability": round(100.0 * online / total, 1) if total else 0}
 
 
-def map_svg(nodes, lang="en"):
-    """SVG from parent links. Nodes without a parent sit on the top row.
+MAP_LABEL_PX = 14
+MAP_NODE_R = 28
 
-    nodes: id, name, parent_id, state. Pure layout, no external script.
+
+def _xml(text):
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def map_layout(nodes):
+    """Hierarchical tree from parent links. Spacing follows label width so text does not overlap.
+
+    Returns width, height, placed nodes (x, y, label_px) and edges. No external assets.
     """
-    by_id = {n["id"]: n for n in nodes}
-    depth = {}
-
-    def level(nid, seen=None):
-        if nid in depth:
-            return depth[nid]
-        seen = seen or set()
-        if nid in seen:
-            depth[nid] = 0
-            return 0
-        parent = by_id.get(nid, {}).get("parent_id")
-        if not parent or parent not in by_id:
-            depth[nid] = 0
-            return 0
-        depth[nid] = level(parent, seen | {nid}) + 1
-        return depth[nid]
-
+    by_id = {}
+    children = {}
     for node in nodes:
-        level(node["id"])
-    rows = {}
-    for node in nodes:
-        rows.setdefault(depth[node["id"]], []).append(node)
-    pos = {}
-    width = 760
-    for depth_n, group in rows.items():
-        for index, node in enumerate(group):
-            x = 80 + (index + 1) * (width - 100) / (len(group) + 1)
-            pos[node["id"]] = (x, 40 + depth_n * 90)
-    colors = {"up": "#16a34a", "down": "#dc2626", "warn": "#d97706"}
-    lines = []
+        by_id[node["id"]] = node
+    roots = []
     for node in nodes:
         parent = node.get("parent_id")
-        if parent in pos and node["id"] in pos:
-            x1, y1 = pos[parent]
-            x2, y2 = pos[node["id"]]
-            lines.append(f'<line x1="{x1:.0f}" y1="{y1+16:.0f}" x2="{x2:.0f}" y2="{y2-16:.0f}" stroke="#94a3b8" stroke-width="2"/>')
-    circles = []
+        if parent in by_id and parent != node["id"]:
+            children.setdefault(parent, []).append(node["id"])
+        else:
+            roots.append(node["id"])
+    for key in children:
+        children[key].sort(key=lambda nid: (by_id[nid].get("name") or "", nid))
+    roots.sort(key=lambda nid: (by_id[nid].get("name") or "", nid))
+    gap = 40
+    width_of = {}
+
+    def measure(nid, seen):
+        if nid in seen:
+            width_of[nid] = 160
+            return 160
+        name = by_id[nid].get("name") or ""
+        label_w = max(160, int(8.6 * min(len(name), 28)) + 28)
+        kids = [kid for kid in children.get(nid, []) if kid not in seen]
+        if not kids:
+            width_of[nid] = label_w
+            return label_w
+        kids_w = sum(measure(kid, seen | {nid}) for kid in kids) + gap * (len(kids) - 1)
+        width_of[nid] = max(label_w, kids_w)
+        return width_of[nid]
+
+    for root in roots:
+        measure(root, set())
+    pos = {}
+
+    def place(nid, left, depth, seen):
+        span = width_of.get(nid, 160)
+        pos[nid] = (left + span / 2.0, depth)
+        kids = [kid for kid in children.get(nid, []) if kid not in seen]
+        if not kids:
+            return
+        used = sum(width_of.get(kid, 160) for kid in kids) + gap * (len(kids) - 1)
+        cursor = left + max(0, (span - used) / 2.0)
+        for kid in kids:
+            place(kid, cursor, depth + 1, seen | {nid})
+            cursor += width_of.get(kid, 160) + gap
+
+    cursor = 0
+    for root in roots:
+        place(root, cursor, 0, set())
+        cursor += width_of.get(root, 160) + gap
+    missing = [node["id"] for node in nodes if node["id"] not in pos]
+    for nid in missing:
+        measure(nid, set(pos))
+        place(nid, cursor, 0, set(pos))
+        cursor += width_of.get(nid, 160) + gap
+    row_h = 150
+    pad = 56
+    placed = []
+    max_depth = 0
     for node in nodes:
-        x, y = pos[node["id"]]
-        color = colors.get(node.get("state"), "#64748b")
-        label = (node.get("name") or "")[:18].replace("&", "&amp;").replace("<", "&lt;")
-        circles.append(
-            f'<a href="/host/{node["id"]}"><circle cx="{x:.0f}" cy="{y:.0f}" r="16" fill="{color}"/>'
-            f'<text x="{x:.0f}" y="{y+32:.0f}" text-anchor="middle" font-size="11" fill="#0f172a">{label}</text></a>'
+        if node["id"] not in pos:
+            continue
+        unit_x, depth = pos[node["id"]]
+        max_depth = max(max_depth, depth)
+        item = dict(node)
+        item["x"] = pad + unit_x
+        item["y"] = pad + depth * row_h
+        item["label_px"] = MAP_LABEL_PX
+        placed.append(item)
+    total = cursor if nodes else 640
+    height = pad + (max_depth + 1) * row_h + 36 if nodes else 180
+    edges = []
+    ids = {node["id"] for node in placed}
+    for node in placed:
+        parent = node.get("parent_id")
+        if parent in ids:
+            edges.append((parent, node["id"]))
+    return {"width": max(640, int(pad * 2 + total)), "height": int(height), "nodes": placed, "edges": edges}
+
+
+def map_svg(nodes, lang="en"):
+    """Readable SVG map. Status fills the node. The ring colour is the category."""
+    layout = map_layout(nodes)
+    colors = {"up": "#16a34a", "down": "#dc2626", "warn": "#d97706"}
+    by_id = {node["id"]: node for node in layout["nodes"]}
+    lines = []
+    for parent, child in layout["edges"]:
+        a, b = by_id[parent], by_id[child]
+        lines.append(
+            f'<line x1="{a["x"]:.0f}" y1="{a["y"]+MAP_NODE_R:.0f}" x2="{b["x"]:.0f}" y2="{b["y"]-MAP_NODE_R:.0f}" '
+            f'stroke="#94a3b8" stroke-width="3"/>'
         )
-    height = 80 + (max(rows) if rows else 0) * 90
-    title = strings(lang)["map_title"]
-    body = "\n".join(lines + circles) or f'<text x="20" y="40">{strings(lang)["empty"]}</text>'
-    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
-            f'role="img" aria-label="{title}" style="width:100%;height:auto;background:#f8fafc;border-radius:12px">'
-            f'{body}</svg>')
+    glyphs = []
+    for node in layout["nodes"]:
+        color = colors.get(node.get("state"), "#64748b")
+        ring = category_color(node.get("category") or "other")
+        label = _xml((node.get("name") or "")[:28])
+        mark = _xml((node.get("category") or "other")[:1].upper())
+        glyphs.append(
+            f'<g class="node" data-name="{_xml(node.get("name"))}" data-ip="{_xml(node.get("host"))}" '
+            f'data-state="{_xml(node.get("state"))}" data-seen="{_xml(node.get("last_seen"))}" '
+            f'data-id="{int(node["id"])}">'
+            f'<circle cx="{node["x"]:.0f}" cy="{node["y"]:.0f}" r="{MAP_NODE_R + 6}" fill="none" stroke="{ring}" stroke-width="4"/>'
+            f'<circle cx="{node["x"]:.0f}" cy="{node["y"]:.0f}" r="{MAP_NODE_R}" fill="{color}"/>'
+            f'<text x="{node["x"]:.0f}" y="{node["y"]+6:.0f}" text-anchor="middle" font-size="18" font-weight="700" fill="#fff">{mark}</text>'
+            f'<text x="{node["x"]:.0f}" y="{node["y"]+MAP_NODE_R+22:.0f}" text-anchor="middle" font-size="{MAP_LABEL_PX}" fill="#0f172a">{label}</text>'
+            f'</g>'
+        )
+    title = _xml(strings(lang)["map_title"])
+    body = "\n".join(lines + glyphs) or f'<text x="24" y="48" font-size="{MAP_LABEL_PX}">{_xml(strings(lang)["empty"])}</text>'
+    return (f'<svg id="netmap" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {layout["width"]} {layout["height"]}" '
+            f'role="img" aria-label="{title}">'
+            f'<g id="scene">{body}</g></svg>')
 
 
 def parse_nut(text):
