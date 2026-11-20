@@ -100,7 +100,7 @@ main() {
   install -m 0644 "$SRC_DIR/pingmonitor.py" "$SRC_DIR/wirelogic.py" "$SRC_DIR/camapi.py" \
     "$SRC_DIR/mtbackup.py" "$SRC_DIR/reportpdf.py" "$SRC_DIR/jobs.py" "$SRC_DIR/siarecv.py" \
     "$SRC_DIR/configbackup.py" "$SRC_DIR/healthmon.py" "$SRC_DIR/iotmon.py" "$SRC_DIR/watchdog.py" \
-    "$SRC_DIR/siteops.py" \
+    "$SRC_DIR/siteops.py" "$SRC_DIR/branding.py" "$SRC_DIR/extraops.py" \
     "$SRC_DIR/requirements.txt" "$APP_DIR/"
   if [[ -f "$SRC_DIR/assets/wirewave_logo.jpg" ]]; then
     install -m 0644 "$SRC_DIR/assets/wirewave_logo.jpg" "$APP_DIR/assets/wirewave_logo.jpg"

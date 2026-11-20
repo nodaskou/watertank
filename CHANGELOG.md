@@ -11,6 +11,13 @@
 - A list of hostnames warns once at each configured day before a TLS certificate or an RDAP domain expiry.
 - The monthly uptime PDF is one English file and one Greek file. It can be downloaded, and optionally sent on Telegram on a chosen day.
 - Telegram commands /status, /site, /down, /ups and /help answer only the saved chat. They stay off until enabled, and they do not run while the bot has a webhook.
+- An optional client logo (PNG, JPG, WebP, or a stripped SVG) and a name with a subtitle can sit beside the Wirewave logo. The same name is printed on the English and Greek monthly PDFs. Nothing extra is shown until it is set.
+- A revocable read-only display link opens a full-screen board with no settings and no secrets. Regenerating the token disables the old link.
+- Camera health lists video loss, tamper, clock drift and recording gaps only when the recorder sent that field.
+- MikroTik read-only resource and default-route data can raise one WAN-failover alert and one recovery. A changed export sends one alert with a short diff and passwords masked. SFP RX/TX power uses warning and critical dBm thresholds.
+- Optional SIP, AMI, FreePBX or Yeastar readings stay unknown until a reply actually contains trunk or extension status.
+- Power-cycle of a Shelly, Sonoff DIY or Tasmota relay is off until enabled on that device, then an admin confirms it and the action is logged with the source address.
+- A weekly on-call rota sends Telegram alerts to the technician on duty, and can copy the main chat after a configurable number of minutes.
 
 ## 3.1.0
 

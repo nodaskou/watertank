@@ -7,7 +7,9 @@ import os
 import time
 from datetime import datetime
 
+import branding
 import camapi
+import extraops
 import healthmon
 import iotmon
 import mtbackup
@@ -790,6 +792,7 @@ def run_backup(pm, host, reason="schedule"):
         except OSError:
             previous = ""
     changed, diff = mtbackup.compare_exports(previous, text)
+    diff = extraops.mask_secrets(diff)
     with pm._db_lock, pm.db() as c:
         c.execute(
             "INSERT INTO backups(host_id, ts, ok, error, path, bin_path, sha, changed, diff, bytes) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -814,6 +817,10 @@ def run_backup(pm, host, reason="schedule"):
                            pm.build_payload(s, "device_alert", None, host, severity="warning", message=bin_err[:400]))
     pm.add_event("backup", "backup_ok", "info", host, "Config backup saved",
                  f"Saved via {via}." + (" Config changed." if changed else " No config change."))
+    if changed and diff:
+        pm.add_event("backup", "config_changed", "warning", host, "Config changed", diff[:800])
+        pm.consider_notify(s, host, "warning", f"[{s['site_name']}] Config changed: {host['name']}", diff[:800],
+                           pm.build_payload(s, "device_alert", None, host, severity="warning", message=diff[:800]))
     return {"via": via, "changed": changed, "path": path}
 
 
@@ -964,4 +971,7 @@ def report_context(pm, start, end, lang, site):
         "power": power,
         "alerts": counts,
         "version": getattr(pm, "VERSION", ""),
+        "client_name": s.get("client_brand") or "",
+        "client_subtitle": s.get("client_subtitle") or "",
+        "client_logo": branding.find(getattr(pm, "DATA_DIR", None), s.get("client_logo") or "") or "",
     }
