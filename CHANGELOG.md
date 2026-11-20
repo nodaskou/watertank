@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.2.0
+
+- The dashboard opens with summary cards and coloured category tiles (routers, switches, Wi-Fi, VoIP, cameras, NVR, servers, printers, UPS, smart devices, other). Each tile shows total, online and offline, and opens a filtered list. A sidebar switches between English and Greek. Category is guessed from the device type and can be edited.
+- The network map is drawn from the existing upstream links. Nodes are coloured by status. The drawing is local SVG, with no extra script.
+- UPS readings from SNMP stay, and an optional NUT address (TCP 3493) can be added. Going to battery, low battery, and recovery each alert once.
+- A local UniFi or Omada controller can be polled read-only for AP client counts and, when the controller sends them, channel and utilisation. Passwords are stored and not shown back.
+- Ping latency and loss history stay on the graphs. A sustained high latency or loss alerts even when the host is not fully down. A speed test runs only if a speedtest command is already installed.
+- An optional Starlink dish address reads the local status page. If that request fails, the dish is unavailable rather than marked healthy.
+- A list of hostnames warns once at each configured day before a TLS certificate or an RDAP domain expiry.
+- The monthly uptime PDF is one English file and one Greek file. It can be downloaded, and optionally sent on Telegram on a chosen day.
+- Telegram commands /status, /site, /down, /ups and /help answer only the saved chat. They stay off until enabled, and they do not run while the bot has a webhook.
+- An optional client logo (PNG, JPG, WebP, or a stripped SVG) and a name with a subtitle can sit beside the Wirewave logo. The same name is printed on the English and Greek monthly PDFs. Nothing extra is shown until it is set.
+- A revocable read-only display link opens a full-screen board with no settings and no secrets. Regenerating the token disables the old link.
+- Camera health lists video loss, tamper, clock drift and recording gaps only when the recorder sent that field.
+- MikroTik read-only resource and default-route data can raise one WAN-failover alert and one recovery. A changed export sends one alert with a short diff and passwords masked. SFP RX/TX power uses warning and critical dBm thresholds.
+- Optional SIP, AMI, FreePBX or Yeastar readings stay unknown until a reply actually contains trunk or extension status.
+- Power-cycle of a Shelly, Sonoff DIY or Tasmota relay is off until enabled on that device, then an admin confirms it and the action is logged with the source address.
+- A weekly on-call rota sends Telegram alerts to the technician on duty, and can copy the main chat after a configurable number of minutes.
+
 ## 3.1.0
 
 - A host can name an upstream device. The choice cannot loop. When that upstream device is down, its outage is sent once under the usual quiet hours, maintenance and repeat rules, and the children’s outage notifications are held. The children still show down and keep ping history. The card says alerts are held. When the upstream device recovers, a child that is still down and was never notified gets one alert; repeats are not dumped in a burst.

@@ -22,7 +22,10 @@ import configbackup
 import jobs
 import mtbackup
 import reportpdf
+import branding
+import extraops
 import siarecv
+import siteops
 import wirelogic
 import hashlib
 import hmac
@@ -63,7 +66,7 @@ except ImportError:  # pragma: no cover
 from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template_string,
                    request, send_file, send_from_directory, session, url_for)
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 APP_NAME = "Wirewave Network Infrastructure Monitor"
 log = logging.getLogger("pingmonitor")
 MOCK_TELEGRAM = os.environ.get("PINGMON_MOCK_TELEGRAM") == "1"
@@ -142,9 +145,23 @@ DEFAULTS = {
     "health_backup_grace_h": 12, "health_watchdog_sec": 180,
     "health_heartbeat_url": "",
     "iot_interval": 60,
+    "ui_lang": "en",
+    "latency_ms": 200, "loss_pct": 20, "quality_window_min": 15,
+    "speed_ms": 0, "cert_warn_days": "30,14,7",
+    "nut_host": "", "nut_port": 3493, "nut_name": "ups",
+    "starlink_host": "",
+    "unifi_url": "", "unifi_user": "", "unifi_password": "", "unifi_site": "default",
+    "omada_url": "", "omada_user": "", "omada_password": "", "omada_site": "",
+    "tg_commands": 0, "tg_cmd_offset": 0,
+    "report_monthly": 0, "report_monthly_day": 1,
+    "client_brand": "", "client_subtitle": "", "client_logo": "",
+    "kiosk_token": "",
+    "sfp_warn_dbm": -20, "sfp_crit_dbm": -28,
+    "oncall_json": "[]", "oncall_escalate_min": 0,
 }
 INT_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, int)}
-SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password"}
+SECRET_KEYS = {"telegram_token", "smtp_password", "webhook_header_value", "rx_password",
+               "unifi_password", "omada_password"}
 SEVERITY_RANK = {"info": 1, "warning": 2, "critical": 3, "none": 99}
 
 _db_lock = threading.RLock()
@@ -247,6 +264,15 @@ def _migrate(c):
     _add_col(c, "hosts", "parent_id", "INTEGER")
     _add_col(c, "hosts", "dep_held", "INTEGER NOT NULL DEFAULT 0")
     _add_col(c, "hosts", "iot", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "hosts", "category", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "hosts", "alarm_rearm", "INTEGER NOT NULL DEFAULT 0")
+    c.execute("UPDATE hosts SET category='' WHERE category IS NULL")
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS cert_watch(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'tls',
+            port INTEGER NOT NULL DEFAULT 443, last_days INTEGER, last_mark TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS extra_state(key TEXT PRIMARY KEY, ts REAL, data TEXT);
+    """)
     c.executescript("""
         CREATE TABLE IF NOT EXISTS health_state(
             key TEXT PRIMARY KEY, status TEXT NOT NULL, since_ts REAL,
@@ -287,6 +313,14 @@ def init_db():
         for k in ("secret_key", "api_token"):
             if not c.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()[0]:
                 c.execute("UPDATE settings SET value=? WHERE key=?", (secrets.token_urlsafe(32), k))
+        site = c.execute("SELECT value FROM settings WHERE key='site_name'").fetchone()
+        brand = c.execute("SELECT value FROM settings WHERE key='client_brand'").fetchone()
+        if site and brand:
+            adopted = branding.adopt_client_name(site["value"], brand["value"])
+            if adopted != (site["value"] or "").strip():
+                c.execute("UPDATE settings SET value=? WHERE key='site_name'", (adopted,))
+            if (brand["value"] or "").strip():
+                c.execute("UPDATE settings SET value='' WHERE key='client_brand'")
 
 
 def get_settings():
@@ -854,9 +888,20 @@ def notify(subject, text, payload, photo=None, sync=False):
     if APP_NAME not in text[:120]:
         text = APP_NAME + "\n" + text
     s = get_settings()
+    try:
+        person = extraops.on_duty(json.loads(s.get("oncall_json") or "[]"), datetime.now(tzinfo()))
+    except (TypeError, ValueError):
+        person = None
+    send_s = s
+    if person:
+        send_s = dict(s)
+        send_s["telegram_chat_id"] = person["chat_id"]
+        if int(s.get("oncall_escalate_min") or 0) > 0:
+            _extra_put("oncall-pending", {"ts": time.time(), "text": text[:500], "escalated": False,
+                                          "main": s.get("telegram_chat_id") or ""})
     jobs = []
     if s["telegram_enabled"]:
-        jobs.append(("telegram", lambda: send_telegram(s, text, photo if s["telegram_photos"] else None)))
+        jobs.append(("telegram", lambda: send_telegram(send_s, text, photo if s["telegram_photos"] else None)))
     if s["email_enabled"]:
         jobs.append(("email", lambda: send_email(s, subject, text)))
     if s["webhook_enabled"]:
@@ -944,6 +989,112 @@ def clear_event_log(actor, ip):
     return now
 
 
+def _alarm_quiet():
+    """True after Clear all alarms, until the next monitor pass."""
+    try:
+        return bool(_extra_get("alarm_quiet").get("on"))
+    except Exception:
+        return False
+
+
+def release_alarm_quiet():
+    """Show live problems again once a check has had a chance to re-raise them."""
+    if _alarm_quiet():
+        _extra_put("alarm_quiet", {"on": False})
+
+
+def _problem_banner(wan, hosts):
+    if _alarm_quiet():
+        return None
+    lan_up = any(h.get("state") == "up" and _private_host(h.get("host")) for h in hosts)
+    if wan and wan.get("state") == "down":
+        return {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
+    if any(h.get("lan_down") for h in hosts):
+        names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
+        return {"cls": "warn", "text": "LAN device down: " + names}
+    return None
+
+
+def _rewrite_state_json(conn, table, id_col, mutator):
+    try:
+        rows = conn.execute(f"SELECT {id_col}, data FROM {table}").fetchall()
+    except sqlite3.OperationalError:
+        return
+    for row in rows:
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if mutator(data):
+            conn.execute(f"UPDATE {table} SET data=? WHERE {id_col}=?", (json.dumps(data), row[id_col]))
+
+
+def clear_all_alarms(ip):
+    """Acknowledge active alarms and reset repeat latches. Config and history stay.
+
+    A condition that is still failing raises one new alert on its next check.
+    """
+    ip = (ip or "").strip() or "unknown"
+    now = time.time()
+    with _db_lock, db() as c:
+        c.execute("""UPDATE sia_accounts SET ack_at=?, ack_by='admin'
+                     WHERE state='alarm' AND IFNULL(ack_at, 0)=0""", (now,))
+        c.execute("UPDATE sia_accounts SET offline_alerted=0 WHERE state='offline'")
+        c.execute("""UPDATE hosts SET alarm_rearm=1, alerted_down=0, last_alert=0
+                     WHERE state='down'""")
+        try:
+            c.execute("UPDATE wan_status SET alerted=0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("""UPDATE health_state SET alerted=0
+                         WHERE status IN ('warning', 'critical', 'stale', 'hung', 'stopped')""")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("UPDATE cert_watch SET last_mark='' WHERE last_mark!=''")
+        except sqlite3.OperationalError:
+            pass
+
+        def _cam(data):
+            if not data.get("notified"):
+                return False
+            data["notified"] = {}
+            return True
+
+        def _iot(data):
+            changed = False
+            if data.get("reach") == "offline" or data.get("alerted"):
+                data["rearm"] = 1
+                data["alerted"] = 0
+                data["last_alert"] = 0
+                changed = True
+            if data.get("notified"):
+                data["notified"] = {}
+                changed = True
+            return changed
+
+        _rewrite_state_json(c, "cam_state", "host_id", _cam)
+        _rewrite_state_json(c, "iot_state", "host_id", _iot)
+        try:
+            for row in c.execute("SELECT key, data FROM extra_state WHERE key LIKE 'quality:%' OR key='speed-alert'"):
+                if str(row["key"]).startswith("quality:"):
+                    c.execute("UPDATE extra_state SET data='{}' WHERE key=?", (row["key"],))
+                elif row["key"] == "speed-alert":
+                    c.execute("UPDATE extra_state SET data=? WHERE key='speed-alert'", (json.dumps({"slow": False}),))
+        except sqlite3.OperationalError:
+            pass
+        payload = json.dumps({"on": True})
+        for key in ("alarm_quiet", "alarm_rearm_wan", "nut_rearm"):
+            c.execute("INSERT OR REPLACE INTO extra_state(key, ts, data) VALUES(?, ?, ?)", (key, now, payload))
+        add_event("alarm", "alarms_cleared", "info",
+                  {"id": None, "name": "admin", "host": ip},
+                  "Alarms cleared", f"Alarms cleared by admin from {ip}",
+                  {"ip": ip, "by": "admin"}, ts=now, conn=c)
+
+
 def add_event(source, kind, severity, host=None, title="", message="", details=None, attachments=None, ts=None, conn=None):
     if conn is None:
         with _db_lock, db() as c:
@@ -1007,7 +1158,7 @@ def monitor_cycle(pool):
             plan = wirelogic.plan_ping(
                 h.get("state"), h.get("consec_fail"), h.get("alerted_down"), h.get("last_alert"),
                 h.get("dep_held"), h.get("down_since"), ok, now, fail_limit(h, s),
-                repeat_minutes(h, s), bool(ancestor))
+                repeat_minutes(h, s), bool(ancestor), bool(h.get("alarm_rearm")))
             label = f"{h['name']} ({h['host']})"
             alerted = plan["alerted_down"]
             last_alert = plan["last_alert"]
@@ -1048,9 +1199,9 @@ def monitor_cycle(pool):
                           {"upstream": ancestor_name}, ts=now, conn=c)
             seen = now if ok else h.get("last_seen")
             c.execute("""UPDATE hosts SET state=?, consec_fail=?, last_ms=?, last_check=?, last_seen=?,
-                         down_since=?, alerted_down=?, last_alert=?, dep_held=? WHERE id=?""",
+                         down_since=?, alerted_down=?, last_alert=?, dep_held=?, alarm_rearm=? WHERE id=?""",
                       (plan["state"], plan["consec_fail"], ms if ok else None, now, seen,
-                       plan["down_since"], alerted, last_alert, plan["dep_held"], h["id"]))
+                       plan["down_since"], alerted, last_alert, plan["dep_held"], int(plan.get("rearm") or 0), h["id"]))
 
 
 def refresh_public_ip():
@@ -1129,6 +1280,7 @@ def _alarm_rows(tz):
             "test_time": fmt_ts(test_ts, tz) if test_ts else "",
             "site": site, "brand": brand, "color": color, "label": label, "cls": cls,
             "flash": state == "alarm" and not acked, "acked": acked,
+            "latched": bool(r["offline_alerted"]) if "offline_alerted" in r.keys() else state == "offline",
             "ack_by": (r["ack_by"] if "ack_by" in r.keys() else "") or "",
             "ack_time": fmt_ts(ack_at, tz) if ack_at else "",
             "skew": siarecv.clock_warning(skew) if skew else "",
@@ -1172,12 +1324,15 @@ def _status_bar(hosts, wan, alarms):
             worse("bad")
             break
     for alarm in alarms or []:
-        if alarm.get("state") == "alarm":
+        if alarm.get("state") == "alarm" and not alarm.get("acked"):
             reasons.append("Alarm: " + (alarm.get("last_text") or alarm.get("name") or "panel")[:48])
             worse("bad")
-        elif alarm.get("state") == "offline":
+        elif alarm.get("state") == "offline" and alarm.get("latched"):
             reasons.append("panel communication lost: " + (alarm.get("name") or ""))
             worse("bad")
+    quiet = _alarm_quiet()
+    if quiet:
+        level, reasons = "ok", ["Alarms cleared"]
     return {
         "level": level,
         "reason": " · ".join(reasons) if reasons else "All clear",
@@ -1186,7 +1341,7 @@ def _status_bar(hosts, wan, alarms):
         "ip": s.get("public_ip") or "",
         "isp": s.get("public_ip_isp") or "",
         "checked": fmt_ts(s.get("public_ip_at"), tzinfo()) if s.get("public_ip_at") else "—",
-        "alarm_flash": any(a.get("flash") for a in (alarms or [])),
+        "alarm_flash": False if quiet else any(a.get("flash") for a in (alarms or [])),
     }
 
 
@@ -1199,6 +1354,19 @@ def prune():
     with db() as c:
         c.execute("PRAGMA optimize")
     log.info("History rollup finished (raw 2 days, 5 min to 7 days, hourly after that)")
+
+
+def _fill_categories(hosts):
+    for h in hosts:
+        if h.get("category"):
+            continue
+        h["category"] = siteops.guess_category(h.get("device_type"), h.get("name"))
+        try:
+            with _db_lock, db() as c:
+                c.execute("UPDATE hosts SET category=? WHERE id=? AND (category IS NULL OR category='')",
+                          (h["category"], h["id"]))
+        except Exception:
+            log.debug("category fill", exc_info=True)
 
 
 def _health_lines():
@@ -1256,6 +1424,10 @@ def monitor_loop(stop):
                     last_prune = start
             except Exception:
                 log.exception("monitor cycle failed")
+            try:
+                ops_cycle()
+            except Exception:
+                log.exception("optional checks failed")
             _write_heartbeat()
             s = get_settings()
             _ping_external_heartbeat(s)
@@ -1272,6 +1444,10 @@ def monitor_loop(stop):
                         configbackup.write_local(c, DATA_DIR, VERSION, s["secret_key"])
             except Exception:
                 log.exception("schedule lookup failed")
+            try:
+                release_alarm_quiet()
+            except Exception:
+                log.debug("alarm quiet", exc_info=True)
             stop.wait(max(1, interval - (time.time() - start)))
 
 
@@ -2348,6 +2524,23 @@ header h1 span{overflow-wrap:anywhere}
 @media (prefers-reduced-motion: reduce){
  .alarm-tile.flash,.statusbar.alarm,.alarm-pill.flash{animation:none;background:#b91c1c;color:#fff}
 }
+.shell{display:flex;align-items:stretch}.side{width:196px;flex:none;background:#0b2a55;color:#e2e8f0;padding:12px}
+.side a{display:block;color:#e2e8f0;text-decoration:none;padding:8px 10px;border-radius:8px;margin:2px 0}
+.side a:hover{background:#1d4ed8}.side form{margin-top:10px}
+.clientbrand{display:inline-flex;align-items:center;gap:8px;min-width:0;max-width:100%}
+.clientbrand img{height:36px;width:36px;object-fit:contain;background:#fff;border-radius:8px}
+.clientbrand .clienttext{display:flex;flex-direction:column;line-height:1.15;min-width:0}
+.clientbrand small{font-weight:400;opacity:.8;overflow-wrap:anywhere}
+.side .clientbrand{display:flex;margin:0 0 12px;color:#fff}
+header .clientbrand{margin-left:8px}
+@media (max-width:760px){header .clientbrand{margin:6px 0 0;width:100%}.side .clientbrand{width:100%}}
+.catgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin:0 0 16px}
+.cat{display:block;color:#fff;text-decoration:none;border-radius:12px;padding:12px}
+.cat b{font-size:22px}.bar{height:8px;background:rgba(255,255,255,.35);border-radius:6px;margin-top:8px}
+.bar span{display:block;height:8px;background:#fff;border-radius:6px}
+.sumgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:0 0 16px}
+.sum{background:#fff;border-radius:12px;padding:12px}
+@media (max-width:760px){.shell{display:block}.side{width:auto;display:flex;flex-wrap:wrap;gap:4px}.side a{display:inline-block}.sumgrid{grid-template-columns:1fr 1fr}}
 .snmpline{font-size:12.5px;color:#334155;margin:2px 0 8px}.lnk{display:inline-block;color:#fff;border-radius:6px;padding:1px 6px;margin:0 4px 3px 0;font-size:11.5px;font-weight:600}
 .lnk small{font-weight:400;opacity:.9}.kv td:first-child{color:#64748b;width:160px}
 code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:12px}
@@ -2359,14 +2552,24 @@ LAYOUT = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 <link rel="icon" id="site-icon" href="{{ url_for('brand_logo') }}" type="image/jpeg">
 <title>{{ s.site_name }} - """ + APP_NAME + """</title><style>""" + CSS + """</style>
 {% if charts %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>{% endif %}</head><body{% if hid is defined and hid %} data-live-id="{{ hid }}"{% endif %}>
-<header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave"><span>""" + APP_NAME + """ <small>· {{ s.site_name }}</small></span></h1><div>
-<a href="{{ url_for('index') }}">Dashboard</a>
-{% if role() %}<a href="{{ url_for('event_log') }}">Log</a>{% endif %}
-{% if role() == 'admin' %}<a href="{{ url_for('report_page') }}">Report</a><a href="{{ url_for('settings') }}">Settings</a>{% endif %}
-{% if role() %}<a href="{{ url_for('logout') }}">Logout ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">Login</a>{% endif %}
-</div></header><main>
+<header><h1><img class="logo" src="{{ url_for('brand_logo') }}" alt="Wirewave">{% if client.logo %}<img class="logo" src="{{ url_for('client_logo') }}" alt="">{% endif %}<span>""" + APP_NAME + """ <small>· {{ s.site_name }}{% if client.subtitle %} · {{ client.subtitle }}{% endif %}</small></span>
+</h1><div>
+<a href="{{ url_for('index') }}">{{ tr.dashboard }}</a>
+{% if role() %}<a href="{{ url_for('event_log') }}">{{ tr.log }}</a>{% endif %}
+{% if role() == 'admin' %}<a href="{{ url_for('report_page') }}">{{ tr.report }}</a><a href="{{ url_for('settings') }}">{{ tr.settings }}</a>{% endif %}
+{% if role() %}<a href="{{ url_for('logout') }}">{{ tr.logout }} ({{ role() }})</a>{% else %}<a href="{{ url_for('login') }}">{{ tr.login }}</a>{% endif %}
+</div></header><div class="shell"><aside class="side">
+<a href="{{ url_for('index') }}">{{ tr.dashboard }}</a>
+<a href="{{ url_for('network_map') }}">{{ tr.map }}</a>
+<a href="{{ url_for('device_list') }}">{{ tr.devices }}</a>
+<a href="{{ url_for('users_page') }}">{{ tr.users }}</a>
+<a href="{{ url_for('vendors_page') }}">{{ tr.vendors }}</a>
+{% if role() == 'admin' %}<a href="{{ url_for('settings') }}">{{ tr.settings }}</a>{% endif %}
+<form method="post" action="{{ url_for('set_lang') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<button class="sec" name="lang" value="{{ 'en' if lang=='el' else 'el' }}">{{ tr.lang }}</button></form>
+</aside><main>
 {% with m = get_flashed_messages() %}{% for x in m %}<div class="flash">{{ x }}</div>{% endfor %}{% endwith %}
-{{ body|safe }}</main>
+{{ body|safe }}</main></div>
 <footer class="sitefoot">""" + APP_NAME + """ {{ version }}</footer>
 {% if live %}<script>
 const LIVE = {{ live|tojson }};
@@ -2621,6 +2824,19 @@ CLEAR_LOG = """<span class="hint" id="last-cleared">Last cleared: {{ last_cleare
 </form>{% endif %}"""
 
 INDEX_BODY = CHART_JS + """
+<div class="sumgrid">
+<div class="sum"><div class="muted">{{ tr.total }}</div><b>{{ summary.total }}</b></div>
+<div class="sum"><div class="muted">{{ tr.online }}</div><b>{{ summary.online }}</b></div>
+<div class="sum"><div class="muted">{{ tr.offline }}</div><b>{{ summary.offline }}</b></div>
+<div class="sum"><div class="muted">{{ tr.availability }}</div><b>{{ summary.availability }}%</b></div>
+</div>
+<div class="catgrid">{% for c in cats %}{% if c.total %}
+<a class="cat" style="background:{{ c.color }}" href="{{ url_for('device_list', category=c.id) }}">
+<div>{{ c.el if lang=='el' else c.en }}</div><b>{{ c.total }}</b>
+<div>{{ c.online }} {{ tr.online }} · {{ c.offline }} {{ tr.offline }}</div>
+<div class="bar"><span style="width:{{ c.pct }}%"></span></div></a>{% endif %}{% endfor %}</div>
+{% if role()=='admin' %}<form method="post" action="{{ url_for('clear_alarms') }}" style="margin:0 0 12px" data-confirm="{{ tr.confirm_clear_alarms }}" onsubmit="return confirm(this.dataset.confirm)">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="del" type="submit">{{ tr.clear_alarms }}</button></form>{% endif %}
 <div class="statusbar {{ bar.level }}{% if bar.alarm_flash %} alarm{% endif %}" id="bar">
  <span class="why" id="bar-why">{{ bar.reason }}</span>
  <span id="bar-alarms">{% for a in alarms %}{% if a.flash %}<span class="alarm-pill flash">{{ a.name }} · ALARM</span>{% endif %}{% endfor %}</span>
@@ -2667,6 +2883,7 @@ INDEX_BODY = CHART_JS + """
  {% if h.cam_line %}<div class="snmpline">🎥 {% if h.cam and not h.cam.ok %}<span style="color:#dc2626">{{ h.cam_line }}</span>{% else %}{{ h.cam_line }}{% endif %}</div>{% endif %}
  {% if h.iot_line %}<div class="snmpline">{% if 'OFFLINE' in h.iot_line %}<b style="color:#dc2626">{{ h.iot_line }}</b>{% else %}{{ h.iot_line }}{% endif %}</div>{% endif %}
  {% if h.dep_note %}<div class="snmpline">{{ h.dep_note }}</div>{% endif %}
+ {% if role()=='admin' and h.power_cycle %}<form method="post" action="{{ url_for('power_cycle', hid=h.id) }}" onsubmit="return confirm('{{ tr.confirm_power }}')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="delay" value="5"><button class="sec" name="action" value="cycle">{{ tr.power_cycle }}</button></form>{% endif %}
  <div class="chartbox"><canvas id="c{{ h.id }}"></canvas></div><script>drawChart('c{{ h.id }}', {{ h.points|tojson }});</script>
 </div>{% endfor %}</div>{% else %}<div class="card">No hosts yet. {% if role()=='admin' %}<a href="{{ url_for('settings') }}#hosts">Add hosts in Settings</a>.{% endif %}</div>{% endfor %}
 <div id="alarm-section" {% if not alarms %}hidden{% endif %}>
@@ -2803,12 +3020,21 @@ def snmp_view(h, tz, full=False, since=None):
     return d
 
 
+def _lang():
+    chosen = session.get("ui_lang")
+    if chosen in ("en", "el"):
+        return chosen
+    return get_settings().get("ui_lang") or "en"
+
+
 def page(body_tpl, refresh=None, charts=False, live=None, **ctx):
     s = get_settings()
-    body = render_template_string(body_tpl, s=s, **ctx)
+    brand = _client_brand()
+    body = render_template_string(body_tpl, s=s, tr=siteops.strings(_lang()), lang=_lang(), client=brand, **ctx)
     ui = max(10, min(300, int(s.get("ui_refresh") or 30)))
     return render_template_string(LAYOUT, body=body, s=s, refresh=refresh, charts=charts, live=live, ui_refresh=ui,
-                                  hid=ctx.get("hid"), version=VERSION)
+                                  hid=ctx.get("hid"), version=VERSION, tr=siteops.strings(_lang()), lang=_lang(),
+                                  client=brand)
 
 
 def host_view(row, since, tz, full=False):
@@ -2853,6 +3079,7 @@ def host_view(row, since, tz, full=False):
             h["cam_line"] = h["cam"].get("error") or "camera API failed"
     h["iot_line"] = ""
     h["dep_note"] = ""
+    h["power_cycle"] = False
     with db() as c:
         iot = c.execute("SELECT data FROM iot_state WHERE host_id=?", (h["id"],)).fetchone()
         parent = None
@@ -2879,6 +3106,11 @@ def host_view(row, since, tz, full=False):
             parts.append(f"{max(watts):g} W")
         word = {"online": "online", "offline": "OFFLINE", "auth": "sign-in failed", "api_error": "API error"}.get(reach, "unknown")
         h["iot_line"] = f"{word} · last seen {seen}" + (" · " + " · ".join(parts) if parts else "")
+        try:
+            icfg = json.loads(h.get("iot") or "{}")
+        except (TypeError, ValueError):
+            icfg = {}
+        h["power_cycle"] = bool(icfg.get("power_cycle"))
         if reach == "auth":
             h["iot_line"] = "reachable, sign-in failed · not offline · " + h["iot_line"]
     if h.get("state") == "down" and h.get("dep_held") and parent:
@@ -3010,16 +3242,11 @@ def index():
         groups[idx[h["grp"]]][1].append(h)
     counts = {k: sum(1 for h in hosts if h["state"] == k) for k in ("up", "down", "warn", "pending")}
     alarms = _alarm_rows(tzinfo())
-    banner = None
-    lan_up = any(h["state"] == "up" and _private_host(h["host"]) for h in hosts)
-    if wan and wan["state"] == "down":
-        banner = {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
-    elif any(h.get("lan_down") for h in hosts):
-        names = ", ".join(h["name"] for h in hosts if h.get("lan_down"))
-        banner = {"cls": "warn", "text": "LAN device down: " + names}
+    banner = _problem_banner(wan, hosts)
     health = _health_lines()
+    _fill_categories(hosts)
     return page(INDEX_BODY, charts=True, live="dashboard", groups=groups, c=counts, events=event_rows(limit=25, tz=tz),
-                health=health,
+                health=health, cats=siteops.category_counts(hosts), summary=siteops.summary_counts(hosts),
                 now=fmt_ts(time.time(), tz), span=span, spans=list(SPAN_LABEL.items()), win_ms=seconds * 1000,
                 wan=wan, traffic=_traffic_cards(since), banner=banner, alarms=alarms, bar=_status_bar(hosts, wan, alarms),
                 last_cleared=last_cleared_text(tz), clear_next="dashboard")
@@ -3124,6 +3351,16 @@ def healthz():
 LOGO_FALLBACK_B64 = "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"
 
 
+def _client_brand():
+    s = get_settings() if DB_PATH else {}
+    filename = (s.get("client_logo") or "") if s else ""
+    return {
+        "name": (s.get("site_name") or "").strip() if s else "",
+        "subtitle": (s.get("client_subtitle") or "").strip() if s else "",
+        "logo": bool(branding.find(DATA_DIR, filename)),
+    }
+
+
 def _logo_file():
     base = os.path.dirname(os.path.abspath(__file__))
     for rel in ("assets/wirewave_logo.jpg", "wirewave_logo.jpg"):
@@ -3131,6 +3368,46 @@ def _logo_file():
         if os.path.isfile(path):
             return path
     return None
+
+
+@app.route("/client-logo")
+def client_logo():
+    """The uploaded client mark. SVG is served with a policy that blocks scripts."""
+    s = get_settings() if DB_PATH else {}
+    path = branding.find(DATA_DIR, (s.get("client_logo") or "") if s else "")
+    if not path:
+        abort(404)
+    ext = path.rsplit(".", 1)[-1].lower()
+    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "svg": "image/svg+xml"}.get(ext, "application/octet-stream")
+    resp = send_file(path, mimetype=mime, max_age=300, download_name=os.path.basename(path))
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    if ext == "svg":
+        resp.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'none'; script-src 'none'"
+    return resp
+
+
+@app.route("/settings/brand", methods=["POST"])
+@admin_required
+def save_brand():
+    subtitle = (request.form.get("client_subtitle") or "").strip()[:120]
+    if request.form.get("remove"):
+        branding.remove(DATA_DIR)
+        set_settings(client_subtitle=subtitle, client_logo="", client_brand="")
+        flash("Client logo removed." if _lang() != "el" else "Το λογότυπο αφαιρέθηκε.")
+        return redirect(url_for("settings") + "#general")
+    uploaded = request.files.get("logo")
+    filename = get_settings().get("client_logo") or ""
+    if uploaded and uploaded.filename:
+        raw = uploaded.read(branding.MAX_LOGO + 1)
+        try:
+            filename = branding.store(DATA_DIR, raw)
+        except branding.LogoError as exc:
+            flash(str(exc))
+            return redirect(url_for("settings") + "#general")
+    set_settings(client_subtitle=subtitle, client_logo=filename, client_brand="")
+    flash("Client branding saved." if _lang() != "el" else "Η εμφάνιση πελάτη αποθηκεύτηκε.")
+    return redirect(url_for("settings") + "#general")
 
 
 @app.route("/favicon.ico")
@@ -3162,6 +3439,7 @@ SETTINGS_NAV = """
 <option value="{{ url_for('settings') }}#graphs">Dashboard graphs</option>
 <option value="{{ url_for('settings') }}#backups">MikroTik backups</option>
 <option value="{{ url_for('settings') }}#telegram">Telegram</option>
+<option value="{{ url_for('settings') }}#controllers">Controllers</option>
 <option value="{{ url_for('settings') }}#email">Outgoing e-mail</option>
 <option value="{{ url_for('settings') }}#receiver">Incoming e-mail (devices)</option>
 <option value="{{ url_for('settings') }}#snmp">SNMP + traps</option>
@@ -3180,6 +3458,7 @@ SETTINGS_NAV = """
 <a href="{{ url_for('settings') }}#graphs">Dashboard graphs</a>
 <a href="{{ url_for('settings') }}#backups">MikroTik backups</a>
 <a href="{{ url_for('settings') }}#telegram">Telegram</a>
+<a href="{{ url_for('settings') }}#controllers">Controllers</a>
 <a href="{{ url_for('settings') }}#email">Outgoing e-mail</a>
 <a href="{{ url_for('settings') }}#receiver">Incoming e-mail (devices)</a>
 <a href="{{ url_for('settings') }}#snmp">SNMP + traps</a>
@@ -3215,7 +3494,9 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <form method="post" action="{{ url_for('save_section', section='general') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
 <label>Site / client name</label><div><input type="text" name="site_name" value="{{ s.site_name }}" required maxlength="80">
-<p class="hint">Put at the start of every alert so you can tell sites apart. Example: <code>Hotel Nikiana</code>. Set one name per installation.</p></div>
+<p class="hint">Put at the start of every alert so you can tell sites apart. Example: <code>Hotel Nikiana</code>. Set one name per installation. The picture and subtitle beside the Wirewave logo are set below and do not change this name.</p></div>
+<label>Language</label><div><select name="ui_lang"><option value="en" {{ 'selected' if s.ui_lang!='el' }}>English</option><option value="el" {{ 'selected' if s.ui_lang=='el' }}>Ελληνικά</option></select>
+<p class="hint">Default language for the sidebar. The sidebar button switches only this browser. English and Greek reports stay separate documents.</p></div>
 <label>Timezone</label><div><input type="text" name="timezone" value="{{ s.timezone }}" list="tzs"><datalist id="tzs">{% for z in tzs %}<option>{{ z }}</option>{% endfor %}</datalist>
 <p class="hint">Clock used for the dashboard, events and alert times. Example: <code>Europe/Athens</code>. Pick the zone where the devices are. The installer does not change this; set the PC clock with <code>timedatectl</code> as well.</p></div>
 <label>Ping interval (seconds)</label><div><input type="number" name="ping_interval" min="10" max="3600" value="{{ s.ping_interval }}">
@@ -3236,7 +3517,27 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <label>Viewer password (dashboard only)</label><div><input type="password" name="viewer_password" autocomplete="new-password" placeholder="{{ 'set - leave empty to keep' if s.viewer_hash else 'not set' }}" style="width:60%">
 <label class="hint"><input type="checkbox" name="viewer_clear" value="1"> remove viewer password</label>
 <p class="hint">Optional second password that can see the dashboard but not change settings. Example: a password for reception. At least 6 characters. Leave it empty to keep the current one. Tick remove to clear it.</p></div>
-<span></span><div><button>Save general settings</button> <span class="hint">Ping method in use: {{ ping_name }}</span></div></div></form></div>
+<span></span><div><button>Save general settings</button> <span class="hint">Ping method in use: {{ ping_name }}</span></div></div></form>
+<h2>{{ tr.brand_title }}</h2>
+<form method="post" action="{{ url_for('save_brand') }}" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>{{ tr.brand_subtitle }}</label><div><input type="text" name="client_subtitle" value="{{ s.client_subtitle }}" maxlength="120">
+<p class="hint">{{ tr.brand_hint }}</p></div>
+<label>{{ tr.brand_upload }}</label><div><input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/svg+xml,.svg">
+{% if client.logo %}<p class="hint"><img src="{{ url_for('client_logo') }}" alt="" style="height:36px;width:36px;object-fit:contain"></p>{% endif %}</div>
+<span></span><div><button>{{ tr.brand_save }}</button>
+{% if client.logo %}<button class="del" name="remove" value="1">{{ tr.brand_remove }}</button>{% endif %}</div>
+</div></form>
+{% if role()=='admin' %}<h2>{{ tr.kiosk }}</h2>
+<p class="hint">{{ tr.kiosk_hint }}</p>
+{% if s.kiosk_token %}<p><code>/kiosk/{{ s.kiosk_token }}</code></p>{% endif %}
+<form method="post" action="{{ url_for('regen_kiosk') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<button>{{ 'Regenerate display link' if lang!='el' else 'Νέος σύνδεσμος οθόνης' }}</button>
+{% if s.kiosk_token %}<button class="del" name="disable" value="1">{{ 'Turn off' if lang!='el' else 'Κλείσιμο' }}</button>{% endif %}
+</form>
+<p><a href="{{ url_for('camera_health') }}">{{ tr.camera_health }}</a> · <a href="{{ url_for('oncall_page') }}">{{ tr.oncall }}</a></p>
+{% endif %}
+</div>
 
 
 <div class="card" id="hosts"><h2>Hosts</h2>
@@ -3246,6 +3547,7 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <li><b>IP / hostname</b> — address that is pinged. Example: <code>192.168.1.50</code> or <code>nvr.lan</code>. Use the address of the device on this LAN.</li>
 <li><b>Group / location</b> — groups the cards on the dashboard. Example: <code>Cameras</code>, <code>Wi-Fi</code>, <code>Network</code>. Leave it blank on a very small site.</li>
 <li><b>Device type</b> — badge colour, and a hint when an alarm e-mail is parsed. Example: Hikvision camera / NVR. Pick the closest brand.</li>
+<li><b>Category</b> — dashboard tile. Example: Cameras. Leave it on Auto to guess from the type and the name. You can change it.</li>
 <li><b>On</b> — untick to stop pinging without deleting history. Use it while a device is powered off for maintenance.</li>
 <li><b>SNMP</b> — opens that host's SNMP page (community or v3 user, which ports to graph). Use it when the device answers SNMP.</li>
 <li><b>Fails</b> — missed pings before this host's alarm. Example: <code>3</code>. <code>0</code> uses the global “Failed pings before alert” (default 3).</li>
@@ -3262,7 +3564,8 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <td><input type="text" form="hf{{ h.id }}" name="name" value="{{ h.name }}" required maxlength="60" style="width:150px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="host" value="{{ h.host }}" required maxlength="253" style="width:140px"></td>
 <td><input type="text" form="hf{{ h.id }}" name="grp" value="{{ h.grp }}" maxlength="60" style="width:120px"></td>
-<td><select form="hf{{ h.id }}" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}" {{ 'selected' if k==h.device_type }}>{{ v[0] }}</option>{% endfor %}</select></td>
+<td><select form="hf{{ h.id }}" name="device_type">{% for k, v in DEVICE_TYPES.items() %}<option value="{{ k }}" {{ 'selected' if k==h.device_type }}>{{ v[0] }}</option>{% endfor %}</select>
+<select form="hf{{ h.id }}" name="category"><option value="">Auto</option>{% for cid, en, el, color in categories %}<option value="{{ cid }}" {{ 'selected' if cid==h.category }}>{{ el if lang=='el' else en }}</option>{% endfor %}</select></td>
 <td><select form="hf{{ h.id }}" name="parent_id"><option value="">—</option>{% for o in hosts %}{% if o.id != h.id %}<option value="{{ o.id }}" {{ 'selected' if o.id==h.parent_id }}>{{ o.name }}</option>{% endif %}{% endfor %}</select></td>
 <td><input type="checkbox" form="hf{{ h.id }}" name="enabled" value="1" {{ 'checked' if h.enabled }}></td>
 <td><input type="number" form="hf{{ h.id }}" name="fail_n" min="0" max="20" value="{{ h.fail_n or 0 }}" style="width:58px" title="0 = use the global fail count"></td>
@@ -3386,6 +3689,43 @@ SETTINGS_BODY = SETTINGS_NAV + """
 <td>{% if b.ok and b.path %}<a href="{{ url_for('backup_download', bid=b.id) }}">Download</a>{% endif %}{% if b.ok and b.bin_path %} · <a href="{{ url_for('backup_download', bid=b.id, kind='bin') }}">Binary</a>{% endif %}</td></tr>
 {% else %}<tr><td colspan="4" class="muted">No exports yet.</td></tr>{% endfor %}
 </table></div></div>
+
+<div class="card" id="controllers"><h2>Controllers and checks</h2>
+<p class="section-intro">Optional read-only checks. A blank password keeps the saved one. Nothing here turns a relay on or off. /help in English and Greek is on the bot when commands are enabled.</p>
+<form method="post" action="{{ url_for('save_section', section='controllers') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="form-grid">
+<label>Language default</label><div><p class="hint">The site default is under General. The sidebar button switches this browser.</p></div>
+<label>Sustained latency (ms)</label><div><input type="number" name="latency_ms" value="{{ s.latency_ms }}">
+<p class="hint">Alert when the average ping over the window stays at or above this, and the host is not fully down. Example: <code>200</code>.</p></div>
+<label>Sustained loss (%)</label><div><input type="number" name="loss_pct" value="{{ s.loss_pct }}">
+<p class="hint">Alert when loss over the window stays at or above this, while some pings still succeed. Example: <code>20</code>.</p></div>
+<label>Quality window (minutes)</label><div><input type="number" name="quality_window_min" value="{{ s.quality_window_min }}"></div>
+<label>Slow speed (Mbps)</label><div><input type="number" name="speed_ms" value="{{ s.speed_ms }}">
+<p class="hint"><code>0</code> turns the speed alert off. A speed test runs only when a <code>speedtest</code> command is installed. If it is missing, the check is skipped.</p></div>
+<label>Certificate warn days</label><div><input type="text" name="cert_warn_days" value="{{ s.cert_warn_days }}">
+<p class="hint">Comma-separated days before a certificate or domain expires. Example: <code>30,14,7</code>. Each threshold alerts once. <code>0</code> means the day it expires.</p></div>
+<label>NUT host</label><div><input type="text" name="nut_host" value="{{ s.nut_host }}" placeholder="127.0.0.1">
+<p class="hint">Optional upsd address. Empty skips NUT. Port <input type="number" name="nut_port" value="{{ s.nut_port }}" style="width:90px"> name <input type="text" name="nut_name" value="{{ s.nut_name }}" style="width:100px">. Read-only, TCP 3493. SNMP UPS readings still work without this.</p></div>
+<label>Starlink dish</label><div><input type="text" name="starlink_host" value="{{ s.starlink_host }}" placeholder="192.168.100.1">
+<p class="hint">Optional. Reads the local dish HTTP status when the dish serves it. Empty skips the check. If the dish only speaks gRPC and this request fails, the status stays unavailable. No cloud account.</p></div>
+<label>UniFi controller</label><div><input type="url" name="unifi_url" value="{{ s.unifi_url }}" placeholder="https://unifi.local:8443">
+<input type="text" name="unifi_user" value="{{ s.unifi_user }}" placeholder="local user">
+<input type="password" name="unifi_password" placeholder="{{ 'saved' if s.unifi_password else 'password' }}">
+<input type="text" name="unifi_site" value="{{ s.unifi_site }}" placeholder="default">
+<p class="hint">Local UniFi Network account, read-only. The password is not shown again.</p></div>
+<label>Omada controller</label><div><input type="url" name="omada_url" value="{{ s.omada_url }}" placeholder="https://omada.local:8043">
+<input type="text" name="omada_user" value="{{ s.omada_user }}">
+<input type="password" name="omada_password" placeholder="{{ 'saved' if s.omada_password else 'password' }}">
+<input type="text" name="omada_site" value="{{ s.omada_site }}" placeholder="site id">
+<p class="hint">Local Omada OpenAPI/login, read-only. The password is not shown again.</p></div>
+<label>Telegram commands</label><div><input type="checkbox" name="tg_commands" value="1" {{ 'checked' if s.tg_commands }}>
+<p class="hint">/status /site /down /ups /help from the saved chat only. Turn this on after Detect chat ID. If the bot has a webhook, commands wait. Detect chat ID still uses getUpdates when this is off.</p></div>
+<label>Monthly PDF to Telegram</label><div><input type="checkbox" name="report_monthly" value="1" {{ 'checked' if s.report_monthly }}>
+day <input type="number" name="report_monthly_day" min="1" max="28" value="{{ s.report_monthly_day }}">
+<p class="hint">On that day, send last month's report twice: one English PDF and one Greek PDF. The download page can do the same at any time.</p></div>
+<span></span><div><button>Save controllers</button></div></div></form>
+<p><a href="{{ url_for('cert_page') }}">Certificate and domain list</a></p>
+</div>
 
 <div class="card" id="telegram"><h2>Telegram</h2>
 <p class="section-intro">Sends a Telegram message when a host goes down or comes back, and for device or SNMP alerts that are set to be forwarded.</p>
@@ -3536,12 +3876,18 @@ Status: <b>{{ rx_status }}</b></p>
 <span></span><div><button>Change password</button></div></div></form></div>
 """
 BOOL_FIELDS = {"telegram_enabled", "telegram_photos", "email_enabled", "webhook_enabled", "rx_enabled", "rx_require_auth",
+               "tg_commands", "report_monthly",
                "snmp_enabled", "snmp_alert_ifdown", "snmp_alert_reboot", "trap_enabled", "quiet_critical", "wan_enabled"}
 SECTIONS = {
     "general": ["site_name", "timezone", "ping_interval", "ping_timeout", "ui_refresh", "retention_days",
-                "ping_method", "public_url", "dashboard_access"],
+                "ping_method", "public_url", "dashboard_access", "ui_lang"],
     "alerts": ["fail_threshold", "repeat_min", "disk_repeat_min", "quiet_start", "quiet_end", "quiet_critical", "maintenance_until", "event_keep",
                "health_disk_warn_pct", "health_disk_crit_pct", "health_backup_grace_h", "health_watchdog_sec", "health_heartbeat_url", "iot_interval"],
+    "controllers": ["latency_ms", "loss_pct", "quality_window_min", "speed_ms", "cert_warn_days",
+                    "nut_host", "nut_port", "nut_name", "starlink_host",
+                    "unifi_url", "unifi_user", "unifi_password", "unifi_site",
+                    "omada_url", "omada_user", "omada_password", "omada_site",
+                    "tg_commands", "report_monthly", "report_monthly_day"],
     "internet": ["wan_enabled", "wan_targets", "wan_loss_pct", "wan_latency_ms", "wan_count"],
     "backups": ["mt_backup_day", "mt_backup_time", "mt_backup_keep"],
     "telegram": ["telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_photos"],
@@ -3555,8 +3901,10 @@ SECTIONS = {
 }
 SECTION_LABEL = {"general": "General", "alerts": "Alerts", "internet": "Internet", "backups": "MikroTik backups",
                  "telegram": "Telegram", "email": "Outgoing e-mail", "webhook": "Webhook",
+                 "controllers": "Controllers",
                  "receiver": "Incoming e-mail", "snmp": "SNMP"}
 CHOICES = {"ping_method": {"auto", "icmplib", "system"}, "dashboard_access": {"login", "public"},
+           "ui_lang": {"en", "el"},
            "smtp_security": {"none", "starttls", "ssl"}, "rx_security": {"none", "starttls", "ssl"},
            "rx_forward_min": {"info", "warning", "critical", "none"}, "snmp_forward_min": {"info", "warning", "critical", "none"},
            "trap_forward_min": {"info", "warning", "critical", "none"}}
@@ -3568,7 +3916,9 @@ RANGES = {"ping_interval": (10, 3600), "ping_timeout": (1, 10), "fail_threshold"
           "mt_backup_day": (0, 6), "mt_backup_keep": (1, 520),
           "health_disk_warn_pct": (0, 100), "health_disk_crit_pct": (0, 100),
           "health_backup_grace_h": (0, 168), "health_watchdog_sec": (30, 3600),
-          "iot_interval": (30, 3600)}
+          "iot_interval": (30, 3600), "latency_ms": (1, 10000), "loss_pct": (1, 100),
+          "quality_window_min": (5, 240), "speed_ms": (0, 10000), "nut_port": (1, 65535),
+          "report_monthly_day": (1, 28)}
 
 
 def _apply_section(section):
@@ -3642,7 +3992,7 @@ def settings():
     graph_rows = _graph_rows(hosts)
     mt_hosts, mt_files = _mikrotik_rows()
     lookup = session.get("tg_lookup") or {}
-    return page(SETTINGS_BODY, hosts=hosts, tzs=tzs, rx_status=RECEIVER.status(), trap_status=SNMP.trap_status,
+    return page(SETTINGS_BODY, hosts=hosts, tzs=tzs, categories=siteops.CATEGORIES, rx_status=RECEIVER.status(), trap_status=SNMP.trap_status,
                 snmp_ok=SNMP.available, graph_rows=graph_rows, mt_hosts=mt_hosts, mt_files=mt_files,
                 ping_name=_ping_impl["name"] or "not started",
                 tg_chats=lookup.get("chats") or [], tg_webhook=bool(lookup.get("webhook")),
@@ -3830,7 +4180,10 @@ def _host_form():
             parent_id = int(raw_parent)
         except ValueError:
             raise ValueError("upstream device is not valid")
-    return name, host, grp, dt, 1 if request.form.get("enabled") else 0, fail_n, maint, repeat_min, ping_every, parent_id
+    category = (request.form.get("category") or "").strip()
+    if category not in siteops.CATEGORY_IDS:
+        category = siteops.guess_category(dt, name)
+    return name, host, grp, dt, 1 if request.form.get("enabled") else 0, fail_n, maint, repeat_min, ping_every, parent_id, category
 
 
 def _assign_parent(c, hid, parent_id):
@@ -3852,13 +4205,13 @@ def _assign_parent(c, hid, parent_id):
 @admin_required
 def host_add():
     try:
-        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id, category = _host_form()
     except ValueError as e:
         flash(f"Not added: {e}")
         return redirect(url_for("settings") + "#hosts")
     with _db_lock, db() as c:
-        c.execute("INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, fail_n, maint_until, repeat_min, ping_every) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                  (name, host, grp, dt, en, time.time(), "pending" if en else "disabled", fail_n, maint, repeat_min, ping_every))
+        c.execute("INSERT INTO hosts(name, host, grp, device_type, enabled, created_at, state, fail_n, maint_until, repeat_min, ping_every, category) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, host, grp, dt, en, time.time(), "pending" if en else "disabled", fail_n, maint, repeat_min, ping_every, category))
         hid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
         try:
             _assign_parent(c, hid, parent_id)
@@ -3874,7 +4227,7 @@ def host_add():
 @admin_required
 def host_save(hid):
     try:
-        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id = _host_form()
+        name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, parent_id, category = _host_form()
     except ValueError as e:
         flash(f"Not saved: {e}")
         return redirect(url_for("settings") + "#hosts")
@@ -3891,8 +4244,8 @@ def host_save(hid):
         except ValueError as e:
             flash(f"Not saved: {e}")
             return redirect(url_for("settings") + "#hosts")
-        c.execute("UPDATE hosts SET name=?, host=?, grp=?, device_type=?, enabled=?, fail_n=?, maint_until=?, repeat_min=?, ping_every=? WHERE id=?",
-                  (name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, hid))
+        c.execute("UPDATE hosts SET name=?, host=?, grp=?, device_type=?, enabled=?, fail_n=?, maint_until=?, repeat_min=?, ping_every=?, category=? WHERE id=?",
+                  (name, host, grp, dt, en, fail_n, maint, repeat_min, ping_every, category, hid))
         if reset:  # new address or re-enabled: start fresh, no stale alerts
             c.execute("UPDATE hosts SET state=?, consec_fail=0, down_since=NULL, last_ms=NULL WHERE id=?",
                       ("pending" if en else "disabled", hid))
@@ -4210,12 +4563,7 @@ def api_live():
         h["lan_down"] = h["state"] == "down" and not h.get("maint") and wan and wan["state"] == "up" and _private_host(h["host"])
     counts = {k: sum(1 for h in hosts if h["state"] == k) for k in ("up", "down", "warn", "pending")}
     alarms = _alarm_rows(tz)
-    lan_up = any(h["state"] == "up" and _private_host(h["host"]) for h in hosts)
-    banner = None
-    if wan and wan.get("state") == "down":
-        banner = {"cls": "bad", "text": "Internet down (LAN OK)" if lan_up else "Internet down"}
-    elif any(h.get("lan_down") for h in hosts):
-        banner = {"cls": "warn", "text": "LAN device down: " + ", ".join(h["name"] for h in hosts if h.get("lan_down"))}
+    banner = _problem_banner(wan, hosts)
     bar = _status_bar(hosts, wan, alarms)
     traffic = _traffic_cards(since)
     return jsonify(now=now, bar=bar, banner=banner, counts=counts, alarms=alarms,
@@ -4256,6 +4604,14 @@ def event_log():
                 last_cleared=last_cleared_text(tz), clear_next="log")
 
 
+@app.route("/alarms/clear", methods=["POST"])
+@admin_required
+def clear_alarms():
+    clear_all_alarms(client_ip())
+    flash("Alarms cleared." if _lang() != "el" else "Οι συναγερμοί καθαρίστηκαν.")
+    return redirect(url_for("index"))
+
+
 @app.route("/log/clear", methods=["POST"])
 @admin_required
 def clear_log():
@@ -4280,6 +4636,7 @@ def report_page():
                         headers={"Content-Disposition": f"attachment; filename=report-{lang}.pdf"})
     body = """<div class="card" style="max-width:640px"><h2>Report</h2>
 <p class="section-intro">Download a PDF for a client. Greek and English are separate documents.</p>
+<p><a href="{{ url_for('monthly_report', lang='en') }}">Monthly report (English)</a> · <a href="{{ url_for('monthly_report', lang='el') }}">Μηνιαία αναφορά (Ελληνικά)</a></p>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
 <div class="form-grid">
 <label>Site name</label><div><input type="text" name="site" value="{{ s.site_name }}"></div>
@@ -4410,6 +4767,11 @@ def host_iot(hid):
         if request.form.get("password"):
             cfg["password"] = encrypt_secret(request.form.get("password"))
         cfg["device_id"] = (request.form.get("device_id") or "").strip()[:64]
+        cfg["power_cycle"] = 1 if request.form.get("power_cycle") else 0
+        try:
+            cfg["power_delay"] = max(1, min(60, int(request.form.get("power_delay") or 5)))
+        except ValueError:
+            cfg["power_delay"] = 5
         for key, default in (("temp_max", 0), ("power_max", 0), ("stale_sec", 180), ("mqtt_port", 1883)):
             try:
                 cfg[key] = float(request.form.get(key) or default) if key in ("temp_max", "power_max") else int(request.form.get(key) or default)
@@ -4458,6 +4820,9 @@ def host_iot(hid):
 <p class="hint">Only for MQTT mode. Use a broker that is already running. The switch is online only from its last-will and a fresh status, not because the broker accepted this connection.</p></div>
 <label>MQTT port / user</label><div><input type="number" name="mqtt_port" value="{{ cfg.mqtt_port or 1883 }}" style="width:100px"> <input type="text" name="mqtt_user" value="{{ cfg.mqtt_user or '' }}" placeholder="user"></div>
 <label>MQTT password / topic</label><div><input type="password" name="mqtt_password" placeholder="{{ 'saved' if cfg.mqtt_password else 'optional' }}"> <input type="text" name="mqtt_topic" value="{{ cfg.mqtt_topic or '' }}" placeholder="sonoff-basic"></div>
+<label>Allow power cycle</label><div><input type="checkbox" name="power_cycle" value="1" {{ 'checked' if cfg.power_cycle }}>
+delay <input type="number" name="power_delay" value="{{ cfg.power_delay or 5 }}" min="1" max="60" style="width:70px"> s
+<p class="hint">Off unless you tick this. An admin can then cycle the relay from the dashboard. The click asks for confirmation and is logged with the admin address. Relay off during normal monitoring is still not an offline alarm.</p></div>
 <label>MQTT stale (seconds)</label><div><input type="number" name="stale_sec" value="{{ cfg.stale_sec or 180 }}">
 <p class="hint">If the last will says Online but no status arrives within this many seconds, the switch is stale and counts as offline. No message yet stays unknown.</p></div>
 <span></span><div><button name="do" value="save">Save</button>
@@ -5363,6 +5728,934 @@ def backup_local_download(name):
     if not os.path.isfile(path):
         abort(404)
     return send_file(path, as_attachment=True, download_name=safe)
+
+
+def _extra_put(key, data):
+    with _db_lock, db() as c:
+        c.execute("INSERT OR REPLACE INTO extra_state(key, ts, data) VALUES(?,?,?)",
+                  (key, time.time(), json.dumps(data)))
+
+
+def _extra_get(key):
+    with db() as c:
+        row = c.execute("SELECT data FROM extra_state WHERE key=?", (key,)).fetchone()
+    if not row or not row["data"]:
+        return {}
+    try:
+        return json.loads(row["data"])
+    except (TypeError, ValueError):
+        return {}
+
+
+def _quality_check(s, now):
+    window = max(5, int(s.get("quality_window_min") or 15)) * 60
+    latency = int(s.get("latency_ms") or 0)
+    loss = int(s.get("loss_pct") or 0)
+    with db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT id, name, host, state FROM hosts WHERE enabled=1")]
+    for host in hosts:
+        if host["state"] == "down":
+            continue
+        with db() as c:
+            rows = c.execute("SELECT ts, ok, ms FROM results WHERE host_id=? AND ts>=? ORDER BY ts",
+                             (host["id"], now - window)).fetchall()
+        samples = [(r["ts"], bool(r["ok"]), r["ms"]) for r in rows]
+        problem = siteops.sustained_bad(samples, now, window, latency, loss)
+        key = f"quality:{host['id']}"
+        prev = _extra_get(key)
+        if not problem:
+            if prev.get("kind"):
+                msg = f"{host['name']} latency and loss are back within the limits."
+                add_event("ping", "quality_ok", "info", host, "Link quality restored", msg)
+                consider_notify(s, host, "info", f"[{s['site_name']}] Link quality restored: {host['name']}", msg,
+                                build_payload(s, "device_alert", None, host, severity="info", message=msg))
+                _extra_put(key, {})
+            continue
+        if prev.get("kind") == problem["kind"]:
+            continue
+        title = "High latency" if problem["kind"] == "latency" else "Packet loss"
+        msg = f"{host['name']} {problem['kind']} is {problem['value']} over {int(window/60)} min."
+        add_event("ping", "quality_" + problem["kind"], "warning", host, title, msg, problem)
+        consider_notify(s, host, "warning", f"[{s['site_name']}] {title}: {host['name']}", msg,
+                        build_payload(s, "device_alert", None, host, severity="warning", message=msg))
+        _extra_put(key, problem)
+
+
+def _due(key, every):
+    row_ts = 0
+    with db() as c:
+        row = c.execute("SELECT ts FROM extra_state WHERE key=?", (key,)).fetchone()
+        if row and row["ts"]:
+            row_ts = row["ts"]
+    if row_ts and time.time() - row_ts < every:
+        return False
+    _extra_put(key, {"ran": True})
+    return True
+
+
+def _cert_check(s, now):
+    if not _due("cert-ran", 6 * 3600):
+        return
+    marks = []
+    for part in str(s.get("cert_warn_days") or "30,14,7").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            marks.append(int(part))
+    if not marks:
+        return
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM cert_watch")]
+    for row in rows:
+        if row["kind"] == "domain":
+            data, err = siteops._json_call("GET", "https://rdap.org/domain/" + row["name"], timeout=8)
+            days = siteops.rdap_expiry(data) if data else None
+            detail = err
+        else:
+            days, detail = siteops.cert_not_after(row["name"], row["port"] or 443)
+        hit = siteops.next_threshold(days, marks, int(row["last_mark"]) if str(row["last_mark"]).lstrip("-").isdigit() else None)
+        if hit is None:
+            if days is not None and days > max(marks) and row["last_mark"]:
+                add_event("cert", "cert_ok", "info", None, "Certificate ok", f"{row['name']} has {days} days left.")
+                with _db_lock, db() as c:
+                    c.execute("UPDATE cert_watch SET last_days=?, last_mark='' WHERE id=?", (days, row["id"]))
+            continue
+        label = "expired" if hit <= 0 and (days or 0) <= 0 else f"{days} days left"
+        msg = f"{row['name']} ({row['kind']}) {label}."
+        if detail and days is None:
+            msg = f"{row['name']}: {detail}"
+            continue
+        add_event("cert", "cert_warn", "warning", None, "Expiry warning", msg, {"days": days, "mark": hit})
+        consider_notify(s, None, "warning", f"[{s['site_name']}] Expiry: {row['name']}", msg,
+                        build_payload(s, "device_alert", None, None, severity="warning", message=msg))
+        with _db_lock, db() as c:
+            c.execute("UPDATE cert_watch SET last_days=?, last_mark=? WHERE id=?", (days, str(hit), row["id"]))
+
+
+def _nut_check(s):
+    rearm = bool(_extra_get("nut_rearm").get("on"))
+    if not rearm and not _due("nut-ran", 60):
+        return
+    host = (s.get("nut_host") or "").strip()
+    if not host:
+        return
+    text, err = siteops.nut_query(host, s.get("nut_port") or 3493, s.get("nut_name") or "ups")
+    if err or not text:
+        _extra_put("nut", {"error": err or "no reply"})
+        return
+    cur = siteops.parse_nut(text)
+    if not cur:
+        _extra_put("nut", {"error": "unreadable"})
+        return
+    prev = _extra_get("nut")
+    if rearm and (cur.get("on_battery") or cur.get("battery_status") in ("low", "depleted")):
+        msg = "The UPS is still reporting a power problem."
+        add_event("ups", "ups_still", "critical" if cur.get("on_battery") else "warning", None, "UPS problem", msg)
+        consider_notify(s, None, "critical" if cur.get("on_battery") else "warning",
+                        f"[{s['site_name']}] UPS problem", msg,
+                        build_payload(s, "device_alert", None, None, severity="warning", message=msg))
+    if rearm:
+        _extra_put("nut_rearm", {"on": False})
+    for kind, sev, title, msg in wirelogic.ups_alerts(prev if prev.get("charge_pct") is not None or prev.get("on_battery") else None, cur, s.get("ups_runtime_min") or 0, s.get("ups_load_pct") or 0):
+        add_event("ups", kind, sev, None, title, msg)
+        consider_notify(s, None, sev, f"[{s['site_name']}] {title}", msg,
+                        build_payload(s, "device_alert", None, None, severity=sev, message=msg))
+    _extra_put("nut", cur)
+
+
+def _controller_check(s):
+    if not _due("ctrl-ran", 300):
+        return
+    if s.get("unifi_url"):
+        devices, err = siteops.fetch_unifi(s.get("unifi_url"), s.get("unifi_user"), decrypt_secret(s.get("unifi_password") or ""), s.get("unifi_site") or "default")
+        _extra_put("unifi", {"devices": devices, "error": err})
+    if s.get("omada_url"):
+        devices, err = siteops.fetch_omada(s.get("omada_url"), s.get("omada_user"), decrypt_secret(s.get("omada_password") or ""), s.get("omada_site") or "")
+        _extra_put("omada", {"devices": devices, "error": err})
+    if s.get("starlink_host"):
+        parsed, err = siteops.fetch_starlink(s.get("starlink_host"))
+        _extra_put("starlink", {"status": parsed, "error": err})
+
+
+def _speed_check(s):
+    if not _due("speed-ran", 6 * 3600):
+        return
+    limit = int(s.get("speed_ms") or 0)
+    if limit <= 0:
+        return
+    binary = shutil.which("speedtest") or shutil.which("speedtest-cli")
+    args = siteops.speedtest_args(binary)
+    if not args:
+        _extra_put("speed", {"skipped": True, "detail": "speedtest command is not installed"})
+        return
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=90)
+        payload = json.loads(out.stdout or "{}")
+    except Exception as exc:
+        _extra_put("speed", {"error": str(exc)[:160]})
+        return
+    down = ((payload.get("download") or {}).get("bandwidth") or 0) * 8 / 1e6
+    _extra_put("speed", {"mbps": round(down, 1)})
+    prev = _extra_get("speed-alert")
+    slow = down and down < limit
+    if slow and not prev.get("slow"):
+        msg = f"Download {down:.1f} Mbps is below {limit} Mbps."
+        add_event("wan", "speed_low", "warning", None, "Slow speed", msg)
+        consider_notify(s, None, "warning", f"[{s['site_name']}] Slow speed", msg,
+                        build_payload(s, "device_alert", None, None, severity="warning", message=msg))
+        _extra_put("speed-alert", {"slow": True})
+    elif not slow and prev.get("slow"):
+        add_event("wan", "speed_ok", "info", None, "Speed restored", "The speed test is back above the limit.")
+        _extra_put("speed-alert", {"slow": False})
+
+
+def _snapshot(s):
+    with db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT name, state, device_type, category FROM hosts WHERE enabled=1")]
+    counts = siteops.summary_counts(hosts)
+    ups = []
+    nut = _extra_get("nut")
+    if nut.get("charge_pct") is not None or nut.get("on_battery"):
+        ups.append({"name": s.get("nut_name") or "ups", "charge": nut.get("charge_pct"),
+                    "source": "battery" if nut.get("on_battery") else "mains"})
+    return {"site": s.get("site_name") or "", "online": counts["online"], "offline": counts["offline"],
+            "availability": counts["availability"],
+            "down_names": [h["name"] for h in hosts if h["state"] == "down"], "ups": ups}
+
+
+def _tg_commands(s):
+    if not s.get("tg_commands") or not s.get("telegram_token"):
+        return
+    try:
+        info = telegram_call(s["telegram_token"], "getWebhookInfo")
+    except TelegramError:
+        return
+    if ((info.get("result") or {}).get("url") or "").strip():
+        return
+    offset = int(s.get("tg_cmd_offset") or 0)
+    try:
+        data = telegram_call(s["telegram_token"], "getUpdates", {"timeout": "0", "offset": str(offset or "")})
+    except TelegramError:
+        return
+    allowed = [s.get("telegram_chat_id") or ""]
+    snap = _snapshot(s)
+    newest = offset
+    for upd in data.get("result") or []:
+        newest = max(newest, int(upd.get("update_id") or 0) + 1)
+        msg = upd.get("message") or {}
+        chat = (msg.get("chat") or {}).get("id")
+        reply = siteops.command_reply(msg.get("text") or "", chat, allowed, snap, s.get("ui_lang") or "en")
+        if reply and chat is not None:
+            try:
+                telegram_call(s["telegram_token"], "sendMessage", {"chat_id": str(chat), "text": reply[:4000]})
+            except TelegramError:
+                log.info("telegram command reply failed")
+    if newest != offset:
+        set_settings(tg_cmd_offset=newest)
+
+
+def _monthly_report(s, now):
+    if not s.get("report_monthly"):
+        return
+    local = datetime.fromtimestamp(now, tzinfo())
+    if local.day != int(s.get("report_monthly_day") or 1):
+        return
+    stamp = local.strftime("%Y-%m")
+    if _extra_get("monthly").get("stamp") == stamp:
+        return
+    end = datetime(local.year, local.month, 1, tzinfo=local.tzinfo).timestamp()
+    start = end - 28 * 86400
+    for lang in ("en", "el"):
+        data = jobs.report_context(sys.modules[__name__], start, end, lang, s.get("site_name") or "")
+        pdf = reportpdf.build_pdf(data, _logo_file())
+        _send_pdf(s, pdf, f"report-{lang}-{stamp}.pdf", lang)
+    _extra_put("monthly", {"stamp": stamp})
+
+
+def _send_pdf(s, pdf, filename, lang):
+    if not s.get("telegram_token") or not s.get("telegram_chat_id"):
+        return
+    boundary = uuid.uuid4().hex
+    caption = "Μηνιαία αναφορά" if lang == "el" else "Monthly report"
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{s["telegram_chat_id"]}\r\n'.encode(),
+        f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'.encode(),
+        (f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+         f'Content-Type: application/pdf\r\n\r\n').encode() + pdf + b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ]
+    url = f"https://api.telegram.org/bot{s['telegram_token']}/sendDocument"
+    try:
+        _http_post(url, b"".join(parts), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    except Exception:
+        log.info("monthly report telegram send failed")
+
+
+def _escalate_oncall(s, now):
+    minutes = int(s.get("oncall_escalate_min") or 0)
+    if minutes <= 0:
+        return
+    pending = _extra_get("oncall-pending")
+    if not pending or pending.get("escalated") or not pending.get("ts"):
+        return
+    if now - float(pending["ts"]) < minutes * 60:
+        return
+    main = pending.get("main") or s.get("telegram_chat_id") or ""
+    if main and s.get("telegram_enabled"):
+        send = dict(s)
+        send["telegram_chat_id"] = main
+        try:
+            send_telegram(send, "Escalation: " + (pending.get("text") or "unacknowledged alert"))
+        except Exception:
+            log.info("on-call escalation failed")
+    pending["escalated"] = True
+    _extra_put("oncall-pending", pending)
+
+
+def ops_cycle():
+    s = get_settings()
+    now = time.time()
+    for fn in (_quality_check, _cert_check):
+        try:
+            fn(s, now)
+        except Exception:
+            log.info("ops step failed", exc_info=True)
+    for fn in (_nut_check, _controller_check, _speed_check, _tg_commands):
+        try:
+            fn(s)
+        except Exception:
+            log.info("ops step failed", exc_info=True)
+    try:
+        _monthly_report(s, now)
+    except Exception:
+        log.info("monthly report failed", exc_info=True)
+    try:
+        _escalate_oncall(s, now)
+    except Exception:
+        log.info("on-call escalation failed", exc_info=True)
+    try:
+        _mikrotik_live(s)
+    except Exception:
+        log.info("mikrotik status failed", exc_info=True)
+
+
+def _mikrotik_live(s):
+    """RouterOS 7 REST, read-only. No REST service means no reading and no false failover."""
+    if not _due("mt-rest", 120):
+        return
+    with db() as c:
+        hosts = [dict(r) for r in c.execute("SELECT * FROM hosts WHERE enabled=1 AND device_type='mikrotik'")]
+    for host in hosts:
+        try:
+            cfg = json.loads(host.get("mtbak") or "{}")
+        except (TypeError, ValueError):
+            continue
+        user = cfg.get("user") or ""
+        password = decrypt_secret(cfg.get("password") or "")
+        if not user or not password:
+            continue
+        port = int(cfg.get("rest_port") or 80)
+        base = f"http://{host['host']}:{port}/rest"
+        try:
+            resource = _mt_rest(base + "/system/resource", user, password)
+            routes = _mt_rest(base + "/ip/route", user, password)
+            sfp = _mt_rest(base + "/interface/ethernet", user, password)
+        except Exception:
+            continue
+        if not isinstance(resource, dict):
+            continue
+        gateway = extraops.parse_default_gateway(routes if isinstance(routes, list) else [])
+        prev = _extra_get(f"mtlive:{host['id']}")
+        event = extraops.route_event(prev.get("gateway"), gateway)
+        if event == "changed":
+            msg = f"{host['name']} default route changed from {prev.get('gateway')} to {gateway}."
+            add_event("backup", "wan_failover", "warning", host, "WAN route changed", msg)
+            consider_notify(s, host, "warning", f"[{s['site_name']}] WAN route changed: {host['name']}", msg,
+                            build_payload(s, "device_alert", None, host, severity="warning", message=msg))
+        optics = []
+        if isinstance(sfp, list):
+            optics = extraops.parse_sfp(sfp)
+        for item in optics:
+            level = extraops.sfp_level(item.get("rx"), s.get("sfp_warn_dbm"), s.get("sfp_crit_dbm"))
+            old = next((x for x in prev.get("sfp") or [] if x.get("name") == item.get("name")), {})
+            previous_level = extraops.sfp_level(old.get("rx"), s.get("sfp_warn_dbm"), s.get("sfp_crit_dbm"))
+            if level == "ok" and previous_level in ("warning", "critical"):
+                add_event("snmp", "sfp_ok", "info", host, "Optical power restored", f"{item['name']} RX is back in range.")
+            if level in ("warning", "critical") and previous_level == "ok":
+                msg = f"{item['name']} RX {item.get('rx')} dBm is {level}."
+                add_event("snmp", "sfp_" + level, "warning" if level == "warning" else "critical", host, "Optical power low", msg)
+                consider_notify(s, host, "critical" if level == "critical" else "warning",
+                                f"[{s['site_name']}] Optical power: {host['name']}", msg,
+                                build_payload(s, "device_alert", None, host, severity="warning", message=msg))
+        history = list(prev.get("history") or [])
+        if optics and optics[0].get("rx") is not None:
+            history.append(optics[0]["rx"])
+            history = history[-120:]
+        _extra_put(f"mtlive:{host['id']}", {"gateway": gateway, "resource": extraops.parse_routeros_resource(resource),
+                                            "sfp": optics, "history": history, "spark": extraops.sparkline(history)})
+
+
+def _mt_rest(url, user, password):
+    password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_mgr.add_password(None, url, user, password)
+    opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(password_mgr))
+    with opener.open(url, timeout=8) as resp:
+        return json.loads(resp.read(1_000_000).decode("utf-8", "replace"))
+
+
+@app.route("/lang", methods=["POST"])
+def set_lang():
+    lang = request.form.get("lang")
+    if lang in ("en", "el"):
+        session["ui_lang"] = lang
+    return redirect(request.referrer or url_for("index"))
+
+
+@app.route("/map")
+@viewer_required
+def network_map():
+    site = (request.args.get("site") or "").strip()
+    tz = tzinfo()
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, name, host, parent_id, state, category, grp, last_seen FROM hosts ORDER BY name")]
+    _fill_categories(rows)
+    sites = sorted({(r.get("grp") or "").strip() for r in rows if (r.get("grp") or "").strip()})
+    for row in rows:
+        row["last_seen"] = fmt_ts(row.get("last_seen"), tz) if row.get("last_seen") else ""
+    shown = rows
+    if site:
+        shown = []
+        ids = {r["id"] for r in rows if (r.get("grp") or "").strip() == site}
+        for row in rows:
+            if row["id"] not in ids:
+                continue
+            item = dict(row)
+            if item.get("parent_id") not in ids:
+                item["parent_id"] = None
+            shown.append(item)
+    body = """<style>
+.mapbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
+.mapbar select,.mapbar button{font-size:14px;padding:8px 12px;border-radius:8px}
+#map-stage{height:calc(100vh - 150px);min-height:520px;background:#f8fafc;border-radius:12px;overflow:hidden;touch-action:none}
+#netmap{width:100%;height:100%;cursor:grab;touch-action:none}
+#map-detail{margin-top:10px;background:#fff;border-radius:12px;padding:12px 14px;font-size:15px}
+#map-detail b{font-size:18px}
+</style>
+<div class="card"><h2>{{ tr.map_title }}</h2><p class="hint">{{ tr.map_hint }}</p>
+<div class="mapbar">
+<form method="get" action="{{ url_for('network_map') }}"><label>{{ tr.map_site }}
+<select name="site" onchange="this.form.submit()"><option value="">{{ tr.map_all }}</option>
+{% for g in sites %}<option value="{{ g }}" {{ 'selected' if g==site else '' }}>{{ g }}</option>{% endfor %}
+</select></label></form>
+<button type="button" id="map-zoom-in">{{ tr.map_zoom_in }}</button>
+<button type="button" id="map-zoom-out">{{ tr.map_zoom_out }}</button>
+<button type="button" id="map-fit">{{ tr.map_fit }}</button>
+</div>
+<div id="map-stage">{{ svg|safe }}</div>
+<div id="map-detail" hidden></div>
+</div>
+<script>
+(function(){
+  const svg=document.getElementById('netmap');
+  const detail=document.getElementById('map-detail');
+  if(!svg) return;
+  const box=svg.viewBox.baseVal;
+  let vx=box.x, vy=box.y, vw=box.width||800, vh=box.height||600;
+  const home={x:vx,y:vy,w:vw,h:vh};
+  const labels={status:{{ tr.map_status|tojson }}, seen:{{ tr.map_last|tojson }}, open:{{ tr.map_open|tojson }}};
+  function apply(){ svg.setAttribute('viewBox', vx+' '+vy+' '+vw+' '+vh); }
+  function zoomAt(px, py, factor){
+    const rect=svg.getBoundingClientRect();
+    const rx=(px-rect.left)/rect.width, ry=(py-rect.top)/rect.height;
+    const nw=Math.min(home.w*8, Math.max(home.w/8, vw/factor));
+    const nh=vh*(nw/vw);
+    vx=vx+(vw-nw)*rx; vy=vy+(vh-nh)*ry; vw=nw; vh=nh; apply();
+  }
+  document.getElementById('map-zoom-in').onclick=function(){ const r=svg.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, 1.25); };
+  document.getElementById('map-zoom-out').onclick=function(){ const r=svg.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, 0.8); };
+  document.getElementById('map-fit').onclick=function(){ vx=home.x; vy=home.y; vw=home.w; vh=home.h; apply(); };
+  svg.addEventListener('wheel', function(e){ e.preventDefault(); zoomAt(e.clientX, e.clientY, e.deltaY<0?1.12:1/1.12); }, {passive:false});
+  const pts=new Map();
+  svg.addEventListener('pointerdown', function(e){ svg.setPointerCapture(e.pointerId); pts.set(e.pointerId,{x:e.clientX,y:e.clientY}); svg.style.cursor='grabbing'; });
+  svg.addEventListener('pointerup', function(e){ pts.delete(e.pointerId); svg.style.cursor='grab'; });
+  svg.addEventListener('pointercancel', function(e){ pts.delete(e.pointerId); });
+  svg.addEventListener('pointermove', function(e){
+    if(!pts.has(e.pointerId)) return;
+    const prev=pts.get(e.pointerId);
+    const rect=svg.getBoundingClientRect();
+    if(pts.size>=2){
+      const ids=[...pts.keys()];
+      const a=pts.get(ids[0]), b=pts.get(ids[1]);
+      const before=Math.hypot(a.x-b.x, a.y-b.y)||1;
+      pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      const a2=pts.get(ids[0]), b2=pts.get(ids[1]);
+      const after=Math.hypot(a2.x-b2.x, a2.y-b2.y)||1;
+      zoomAt((a2.x+b2.x)/2, (a2.y+b2.y)/2, after/before);
+      return;
+    }
+    vx-=(e.clientX-prev.x)*vw/rect.width;
+    vy-=(e.clientY-prev.y)*vh/rect.height;
+    pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    apply();
+  });
+  function line(text){ const d=document.createElement('div'); d.textContent=text; return d; }
+  function show(node){
+    if(!node){ detail.hidden=true; return; }
+    const id=node.getAttribute('data-id')||'';
+    detail.hidden=false;
+    detail.textContent='';
+    const title=document.createElement('b');
+    title.textContent=node.getAttribute('data-name')||'';
+    detail.appendChild(title);
+    detail.appendChild(line(node.getAttribute('data-ip')||''));
+    detail.appendChild(line(labels.status+': '+(node.getAttribute('data-state')||'')));
+    detail.appendChild(line(labels.seen+': '+(node.getAttribute('data-seen')||'—')));
+    if(/^\\d+$/.test(id)){
+      const link=document.createElement('a');
+      link.href='/host/'+id;
+      link.textContent=labels.open;
+      const wrap=document.createElement('div');
+      wrap.appendChild(link);
+      detail.appendChild(wrap);
+    }
+  }
+  svg.addEventListener('click', function(e){ const n=e.target.closest?e.target.closest('.node'):null; if(n) show(n); });
+  svg.addEventListener('mousemove', function(e){ const n=e.target.closest?e.target.closest('.node'):null; svg.title=n?(n.getAttribute('data-name')+' · '+n.getAttribute('data-ip')+' · '+n.getAttribute('data-state')):''; });
+})();
+</script>"""
+    return page(body, svg=siteops.map_svg(shown, _lang()), sites=sites, site=site)
+
+
+@app.route("/devices")
+@viewer_required
+def device_list():
+    category = request.args.get("category") or ""
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT id, name, host, device_type, category, state FROM hosts ORDER BY name")]
+    _fill_categories(rows)
+    if category in siteops.CATEGORY_IDS:
+        rows = [r for r in rows if r.get("category") == category]
+    body = """<div class="card"><h2>{{ tr.devices }}</h2>
+<table><tr><th>Name</th><th>Address</th><th>Category</th><th>State</th></tr>
+{% for h in rows %}<tr><td><a href="{{ url_for('host_page', hid=h.id) }}">{{ h.name }}</a></td><td>{{ h.host }}</td>
+<td>{{ h.category }}</td><td>{{ h.state }}</td></tr>{% else %}<tr><td colspan="4">{{ tr.empty }}</td></tr>{% endfor %}
+</table></div>"""
+    return page(body, rows=rows)
+
+
+@app.route("/users")
+@viewer_required
+def users_page():
+    s = get_settings()
+    body = """<div class="card"><h2>{{ tr.users }}</h2><p>{{ tr.users_body }}</p>
+<p>Admin: {{ 'set' if s.admin_hash else 'missing' }} · Viewer: {{ 'set' if s.viewer_hash else 'not set' }}</p>
+{% if role()=='admin' %}<p><a href="{{ url_for('settings') }}#password">{{ tr.settings }}</a></p>{% endif %}</div>"""
+    return page(body)
+
+
+@app.route("/vendors")
+@viewer_required
+def vendors_page():
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT device_type, COUNT(*) AS n FROM hosts GROUP BY device_type ORDER BY n DESC")]
+    body = """<div class="card"><h2>{{ tr.vendors_title }}</h2>
+<table><tr><th>Vendor</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ r.device_type }}</td><td>{{ r.n }}</td></tr>{% else %}<tr><td colspan="2">{{ tr.empty }}</td></tr>{% endfor %}
+</table></div>"""
+    return page(body, rows=rows)
+
+
+@app.route("/settings/certs", methods=["GET", "POST"])
+@admin_required
+def cert_page():
+    if request.method == "POST":
+        if request.form.get("delete"):
+            with _db_lock, db() as c:
+                c.execute("DELETE FROM cert_watch WHERE id=?", (request.form.get("delete"),))
+        else:
+            name = (request.form.get("name") or "").strip().lower()
+            kind = "domain" if request.form.get("kind") == "domain" else "tls"
+            try:
+                port = int(request.form.get("port") or 443)
+            except ValueError:
+                port = 443
+            if name:
+                with _db_lock, db() as c:
+                    c.execute("INSERT INTO cert_watch(name, kind, port) VALUES(?,?,?)", (name[:253], kind, port))
+        return redirect(url_for("cert_page"))
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM cert_watch ORDER BY name")]
+    body = """<div class="card"><h2>Certificates and domains</h2>
+<p class="section-intro">Warn once at each configured day threshold. TLS uses the live certificate. Domains use RDAP when the registry publishes an expiration date.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<input name="name" placeholder="host.example.com" required>
+<select name="kind"><option value="tls">TLS certificate</option><option value="domain">Domain (RDAP)</option></select>
+<input type="number" name="port" value="443" style="width:90px"><button>Add</button></form>
+<table><tr><th>Name</th><th>Kind</th><th>Days</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ r.name }}</td><td>{{ r.kind }}</td><td>{{ r.last_days if r.last_days is not none else '—' }}</td>
+<td><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button name="delete" value="{{ r.id }}" class="del">Delete</button></form></td></tr>{% endfor %}
+</table></div>"""
+    return page(body, rows=rows)
+
+
+@app.route("/report/monthly")
+@admin_required
+def monthly_report():
+    lang = request.args.get("lang") if request.args.get("lang") in ("en", "el") else "en"
+    now = datetime.now(tzinfo())
+    end = datetime(now.year, now.month, 1, tzinfo=now.tzinfo)
+    start = end.timestamp() - 31 * 86400
+    data = jobs.report_context(sys.modules[__name__], start, end.timestamp(), lang, get_settings().get("site_name") or "")
+    pdf = reportpdf.build_pdf(data, _logo_file())
+    return Response(pdf, mimetype="application/pdf",
+                    headers={"Content-Disposition": f"attachment; filename=monthly-{lang}.pdf"})
+
+
+def _kiosk_ok(token):
+    return extraops.kiosk_matches(token, get_settings().get("kiosk_token"))
+
+
+def kiosk_payload(lang):
+    """Read-only board data. Names, states and timings only — no passwords or tokens."""
+    lang = "el" if lang == "el" else "en"
+    tr = siteops.strings(lang)
+    tz = tzinfo()
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT name, host, state, category, down_since FROM hosts WHERE enabled=1 ORDER BY name")]
+    _fill_categories(rows)
+    now = time.time()
+    down = []
+    for host in rows:
+        if host.get("state") != "down":
+            continue
+        down.append({
+            "name": host.get("name") or "",
+            "host": host.get("host") or "",
+            "category": siteops.category_label(host.get("category"), lang),
+            "down_for": fmt_dur(now - host["down_since"]) if host.get("down_since") else "",
+        })
+    summary = siteops.summary_counts(rows)
+    categories = []
+    for row in siteops.category_counts(rows):
+        if not row["total"]:
+            continue
+        categories.append({
+            "label": row["el"] if lang == "el" else row["en"],
+            "color": row["color"],
+            "total": row["total"],
+            "online": row["online"],
+            "offline": row["offline"],
+            "pct": round(row["pct"], 1),
+        })
+    events = [{"time": e.get("time") or "", "title": e.get("title") or "", "severity": e.get("severity") or ""}
+              for e in event_rows(limit=12, tz=tz)]
+    moment = datetime.now(tz)
+    days = (("Monday", "Δευτέρα"), ("Tuesday", "Τρίτη"), ("Wednesday", "Τετάρτη"),
+            ("Thursday", "Πέμπτη"), ("Friday", "Παρασκευή"), ("Saturday", "Σάββατο"), ("Sunday", "Κυριακή"))
+    day = days[moment.weekday()][1 if lang == "el" else 0]
+    client = _client_brand()
+    return {
+        "time": moment.strftime("%H:%M:%S"),
+        "date": f"{day} {moment.strftime('%d/%m/%Y')}",
+        "epoch": moment.timestamp(),
+        "offset": moment.utcoffset().total_seconds() if moment.utcoffset() else 0,
+        "availability": summary["availability"],
+        "online": summary["online"],
+        "offline": summary["offline"],
+        "total": summary["total"],
+        "categories": categories,
+        "down": down,
+        "events": events,
+        "client": {"name": client["name"], "subtitle": client["subtitle"], "logo": bool(client["logo"])},
+        "labels": {
+            "online": tr["online"], "offline": tr["offline"], "availability": tr["availability"],
+            "down_title": tr["kiosk_offline"], "none": tr["kiosk_none_down"], "events": tr["kiosk_events"],
+        },
+    }
+
+
+@app.route("/kiosk/<token>")
+def kiosk(token):
+    """Full-screen read-only board. The token is the only credential, and it is not printed again."""
+    if not _kiosk_ok(token):
+        abort(404)
+    theme = "light" if request.args.get("theme") == "light" else "dark"
+    lang = request.args.get("lang") if request.args.get("lang") in ("en", "el") else (get_settings().get("ui_lang") or "en")
+    data = kiosk_payload(lang)
+    other = "dark" if theme == "light" else "light"
+    tr = siteops.strings(lang)
+    page_html = """<!doctype html><html class="{{ theme }}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ data.client.name or '""" + APP_NAME + """' }}</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#07111f;color:#e8eef7}
+html.light body{background:#eef3f9;color:#0f172a}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:14px 20px;background:#0b2a55;color:#fff;flex-wrap:wrap}
+html.light .top{background:#fff;color:#0f172a;box-shadow:0 1px 0 #dbe3ee}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.brand img{height:52px;width:52px;object-fit:cover;border-radius:50%;background:#fff}
+.brand img.client{object-fit:contain;border-radius:10px}
+.brand b{font-size:clamp(18px,2vw,28px)}
+.brand small{display:block;font-weight:500;opacity:.85}
+.clock{text-align:right}
+.clock .t{font-size:clamp(36px,4vw,72px);font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.clock .d{font-size:clamp(14px,1.4vw,22px);opacity:.85}
+.avail{font-size:clamp(28px,3vw,48px);font-weight:700}
+.theme{color:inherit;font-size:14px}
+.layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(280px,.7fr);gap:16px;padding:16px}
+.cats{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px;align-content:start}
+.cat{color:#fff;border-radius:16px;padding:14px 16px;min-height:118px}
+.cat b{font-size:clamp(16px,1.5vw,22px)}
+.cat .n{font-size:clamp(28px,2.4vw,40px);font-weight:700;line-height:1.1}
+.bar{height:10px;background:rgba(255,255,255,.35);border-radius:6px;margin-top:10px}
+.bar span{display:block;height:10px;background:#fff;border-radius:6px}
+.panel{background:#12263f;border-radius:16px;padding:16px}
+html.light .panel{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.panel h2{margin:0 0 10px;font-size:clamp(18px,1.6vw,26px)}
+.down{list-style:none;margin:0;padding:0}
+.down li{padding:10px 0;border-bottom:1px solid rgba(255,255,255,.12);font-size:clamp(16px,1.4vw,22px)}
+html.light .down li{border-color:#e2e8f0}
+.down small{display:block;opacity:.8;font-size:.8em}
+.ticker{margin:0 16px 16px;background:#12263f;border-radius:12px;padding:10px 14px;overflow:hidden;white-space:nowrap}
+html.light .ticker{background:#fff}
+.ticker b{margin-right:8px}
+#events{display:inline-block;padding-left:100%;animation:tick 40s linear infinite}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-100%)}}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.clock{text-align:left}}
+@media(min-width:1800px){body{font-size:20px}.cat{min-height:150px}}
+</style></head><body>
+<header class="top">
+<div class="brand"><img src="{{ url_for('brand_logo') }}" alt="Wirewave">{% if data.client.logo %}<img class="client" src="{{ url_for('client_logo') }}" alt="">{% endif %}
+<div><b id="client-name">{{ data.client.name }}</b><small>""" + APP_NAME + """{% if data.client.subtitle %} · {{ data.client.subtitle }}{% endif %}</small></div></div>
+<div class="clock"><div class="t" id="clock">{{ data.time }}</div><div class="d" id="date">{{ data.date }}</div>
+<div class="avail"><span id="avail">{{ data.availability }}</span>% {{ tr.availability }}</div>
+<a class="theme" href="?theme={{ other }}">{{ theme_label }}</a></div>
+</header>
+<div class="layout">
+<div class="cats" id="cats"></div>
+<section class="panel"><h2 id="down-title">{{ tr.kiosk_offline }}</h2><ul class="down" id="down"></ul></section>
+</div>
+<div class="ticker"><b id="ev-title">{{ tr.kiosk_events }}</b><span id="events"></span></div>
+<script>
+const boot={{ data|tojson }};
+let offset={{ data.offset|tojson }};
+function pad(n){ return String(n).padStart(2,'0'); }
+function tick(){
+  const d=new Date(Date.now()+offset*1000);
+  const el=document.getElementById('clock');
+  if(el) el.textContent=pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds());
+}
+function paint(data){
+  offset=data.offset||0;
+  document.getElementById('date').textContent=data.date||'';
+  document.getElementById('avail').textContent=data.availability;
+  document.getElementById('client-name').textContent=(data.client&&data.client.name)||'';
+  const cats=document.getElementById('cats');
+  cats.textContent='';
+  (data.categories||[]).forEach(function(c){
+    const card=document.createElement('article');
+    card.className='cat';
+    card.style.background=c.color||'#334155';
+    const title=document.createElement('b'); title.textContent=c.label||'';
+    const nums=document.createElement('div'); nums.className='n'; nums.textContent=String(c.total);
+    const sub=document.createElement('div');
+    sub.textContent=(data.labels.online||'')+' '+c.online+' · '+(data.labels.offline||'')+' '+c.offline;
+    const bar=document.createElement('div'); bar.className='bar';
+    const span=document.createElement('span'); span.style.width=(c.pct||0)+'%'; bar.appendChild(span);
+    card.appendChild(title); card.appendChild(nums); card.appendChild(sub); card.appendChild(bar);
+    cats.appendChild(card);
+  });
+  const list=document.getElementById('down');
+  list.textContent='';
+  const rows=data.down||[];
+  if(!rows.length){
+    const li=document.createElement('li'); li.textContent=(data.labels&&data.labels.none)||''; list.appendChild(li);
+  }
+  rows.forEach(function(h){
+    const li=document.createElement('li');
+    const name=document.createElement('b'); name.textContent=h.name||'';
+    const small=document.createElement('small'); small.textContent=(h.host||'')+' · '+(h.category||'')+' · '+(h.down_for||'');
+    li.appendChild(name); li.appendChild(small); list.appendChild(li);
+  });
+  const ev=document.getElementById('events');
+  ev.textContent=(data.events||[]).map(function(e){ return (e.time||'')+' '+(e.title||''); }).join('    ·    ');
+}
+paint(boot);
+setInterval(tick, 1000); tick();
+async function refresh(){
+  try{
+    const res=await fetch(location.pathname.replace(/\\/$/,'')+'/live', {headers:{'Accept':'application/json'}, cache:'no-store'});
+    if(!res.ok) return;
+    paint(await res.json());
+  }catch(e){}
+}
+setInterval(refresh, 10000);
+</script></body></html>"""
+    return render_template_string(page_html, data=data, theme=theme, other=other, tr=tr,
+                                  theme_label=tr["kiosk_theme_dark"] if theme == "light" else tr["kiosk_theme_light"],
+                                  client=_client_brand())
+
+
+@app.route("/kiosk/<token>/live")
+def kiosk_live(token):
+    if not _kiosk_ok(token):
+        abort(404)
+    lang = request.args.get("lang") if request.args.get("lang") in ("en", "el") else (get_settings().get("ui_lang") or "en")
+    return jsonify(kiosk_payload(lang))
+
+
+@app.route("/settings/kiosk", methods=["POST"])
+@admin_required
+def regen_kiosk():
+    if request.form.get("disable"):
+        set_settings(kiosk_token="")
+        flash("Display link turned off." if _lang() != "el" else "Ο σύνδεσμος οθόνης έκλεισε.")
+    else:
+        set_settings(kiosk_token=secrets.token_urlsafe(24))
+        flash("Display link regenerated. The previous link no longer works." if _lang() != "el" else "Νέος σύνδεσμος. Ο προηγούμενος δεν ισχύει.")
+    return redirect(url_for("settings") + "#general")
+
+
+@app.route("/cameras/health")
+@viewer_required
+def camera_health():
+    with db() as c:
+        rows = c.execute("SELECT host_id, data FROM cam_state").fetchall()
+        names = {r["id"]: r["name"] for r in c.execute("SELECT id, name FROM hosts")}
+    cards = []
+    for row in rows:
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        channels = []
+        for ch in data.get("channels") or []:
+            channels.append({
+                "id": ch.get("id"),
+                "loss": ch.get("video_loss") if "video_loss" in ch else None,
+                "tamper": ch.get("tamper") if "tamper" in ch else None,
+                "recording": ch.get("recording") if "recording" in ch else None,
+                "gap": ch.get("gap_min") if "gap_min" in ch else None,
+            })
+        cards.append({"name": names.get(row["host_id"], ""), "channels": channels,
+                      "drift": data.get("clock_drift_s") if "clock_drift_s" in data else None})
+    body = """<div class="card"><h2>{{ tr.camera_health }}</h2>
+<p class="hint">Video loss, tamper, clock drift and recording gaps are shown only when the recorder sent that field. Otherwise they stay {{ tr.unknown }}.</p>
+{% for cam in cards %}<h3>{{ cam.name }}</h3>
+<p>Clock drift: {{ cam.drift if cam.drift is not none else tr.unknown }} s</p>
+<table><tr><th>Ch</th><th>Loss</th><th>Tamper</th><th>Recording</th><th>Gap min</th></tr>
+{% for ch in cam.channels %}<tr><td>{{ ch.id }}</td>
+<td>{{ tr.unknown if ch.loss is none else ch.loss }}</td>
+<td>{{ tr.unknown if ch.tamper is none else ch.tamper }}</td>
+<td>{{ tr.unknown if ch.recording is none else ch.recording }}</td>
+<td>{{ tr.unknown if ch.gap is none else ch.gap }}</td></tr>{% endfor %}</table>
+{% else %}<p>{{ tr.empty }}</p>{% endfor %}</div>"""
+    return page(body, cards=cards)
+
+
+@app.route("/settings/oncall", methods=["GET", "POST"])
+@admin_required
+def oncall_page():
+    if request.method == "POST":
+        try:
+            rows = json.loads(get_settings().get("oncall_json") or "[]")
+        except (TypeError, ValueError):
+            rows = []
+        if request.form.get("delete") is not None and request.form.get("delete") != "":
+            try:
+                del rows[int(request.form.get("delete"))]
+            except (ValueError, IndexError):
+                pass
+        else:
+            rows.append({
+                "name": (request.form.get("name") or "").strip()[:40],
+                "chat_id": (request.form.get("chat_id") or "").strip()[:32],
+                "day": int(request.form.get("day") or 0),
+                "start": request.form.get("start") or "00:00",
+                "end": request.form.get("end") or "24:00",
+            })
+        minutes = int(request.form.get("escalate") or get_settings().get("oncall_escalate_min") or 0)
+        set_settings(oncall_json=json.dumps(rows), oncall_escalate_min=max(0, min(minutes, 1440)))
+        return redirect(url_for("oncall_page"))
+    try:
+        rows = json.loads(get_settings().get("oncall_json") or "[]")
+    except (TypeError, ValueError):
+        rows = []
+    body = """<div class="card"><h2>{{ tr.oncall }}</h2>
+<p class="hint">Alerts use the Telegram chat of the technician whose rota covers now. After the escalation minutes with no /ack, a copy goes to the main chat. 0 disables escalation.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<input name="name" placeholder="Name" required> <input name="chat_id" placeholder="Chat ID" required>
+<select name="day">{% for n, label in days %}<option value="{{ n }}">{{ label }}</option>{% endfor %}</select>
+<input type="time" name="start" value="08:00"> <input type="time" name="end" value="17:00">
+<label>Escalate min <input type="number" name="escalate" value="{{ escalate }}" min="0" max="1440"></label>
+<button>Add</button></form>
+{% for row in rows %}<p>{{ row.name }} · {{ row.chat_id }} · day {{ row.day }} {{ row.start }}–{{ row.end }}
+<form method="post" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button name="delete" value="{{ loop.index0 }}" class="del">Delete</button></form></p>{% endfor %}
+</div>"""
+    days = [(i, name) for i, name in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])]
+    return page(body, rows=rows, days=days, escalate=get_settings().get("oncall_escalate_min") or 0)
+
+
+@app.route("/host/<int:hid>/power", methods=["POST"])
+@admin_required
+def power_cycle(hid):
+    with db() as c:
+        row = c.execute("SELECT * FROM hosts WHERE id=?", (hid,)).fetchone()
+    if not row:
+        abort(404)
+    host = dict(row)
+    try:
+        cfg = json.loads(host.get("iot") or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    if not cfg.get("power_cycle"):
+        flash("Power cycle is off for this device." if _lang() != "el" else "Η επανεκκίνηση ρεύματος είναι κλειστή.")
+        return redirect(url_for("index"))
+    action = request.form.get("action") or "cycle"
+    if action not in ("off", "on", "cycle"):
+        action = "cycle"
+    try:
+        delay = max(1, min(60, int(request.form.get("delay") or cfg.get("power_delay") or 5)))
+    except ValueError:
+        delay = 5
+    kind = "tasmota" if cfg.get("mode") == "tasmota" else ("sonoff-diy" if host.get("device_type") == "sonoff" else "shelly-gen2" if cfg.get("generation") == "gen2" else "shelly-gen1")
+    path = extraops.power_url(kind, 0, action == "on")
+    add_event("iot", "power_cycle", "warning", host, "Power cycle",
+              f"{action} via {path} by admin from {client_ip()}, delay {delay}s.")
+
+    def _run_power():
+        user = cfg.get("user") or ""
+        password = decrypt_secret(cfg.get("password") or "")
+        port = int(cfg.get("port") or (8081 if kind == "sonoff-diy" else 80))
+        base = f"http://{host['host']}:{port}"
+
+        def hit(turn_on):
+            target = extraops.power_url(kind, 0, turn_on)
+            body = None
+            method = "GET"
+            if kind == "shelly-gen2":
+                method = "POST"
+                body = json.dumps({"id": 0, "on": turn_on})
+            elif kind == "sonoff-diy":
+                method = "POST"
+                body = json.dumps({"deviceid": cfg.get("device_id") or "", "data": {"switch": "on" if turn_on else "off"}})
+            iotmon.http_fetch(method, base + target, user, password, body)
+
+        try:
+            if action == "cycle":
+                hit(False)
+                time.sleep(delay)
+                hit(True)
+            else:
+                hit(action == "on")
+        except Exception:
+            log.info("power cycle request failed")
+
+    threading.Thread(target=_run_power, daemon=True).start()
+    flash("Power cycle requested and logged." if _lang() != "el" else "Η εντολή καταγράφηκε.")
+    return redirect(url_for("index"))
 
 
 def main():

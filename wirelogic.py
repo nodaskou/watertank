@@ -231,7 +231,7 @@ def upstream_down(host_id, parent_of, down_ids):
 
 
 def plan_ping(state, consec_fail, alerted_down, last_alert, dep_held, down_since,
-              ok, now, threshold, repeat_min, ancestor_down):
+              ok, now, threshold, repeat_min, ancestor_down, rearm=False):
     """Decide one ping transition.
 
     A down ancestor suppresses the outage notification and later repeats.
@@ -253,7 +253,21 @@ def plan_ping(state, consec_fail, alerted_down, last_alert, dep_held, down_since
         elif state == "down":
             action = "recovered_quiet"
         return {"state": "up", "consec_fail": 0, "alerted_down": 0, "last_alert": 0,
-                "dep_held": 0, "down_since": None, "action": action}
+                "dep_held": 0, "down_since": None, "action": action, "rearm": 0}
+    if rearm:
+        # One fresh alert on the next failed check. The flag is consumed so a
+        # still-down host does not repeat on every following ping.
+        fails = consec_fail + 1
+        downish = state == "down" or fails >= threshold
+        since = now if state != "down" or not down_since else down_since
+        if not downish:
+            return {"state": "warn", "consec_fail": fails, "alerted_down": 0, "last_alert": 0,
+                    "dep_held": 0, "down_since": None, "action": None, "rearm": 0}
+        if ancestor_down:
+            return {"state": "down", "consec_fail": fails, "alerted_down": 0, "last_alert": 0,
+                    "dep_held": 1, "down_since": since, "action": None, "rearm": 0}
+        return {"state": "down", "consec_fail": fails, "alerted_down": 0, "last_alert": 0,
+                "dep_held": 0, "down_since": since, "action": "down", "rearm": 0}
     fails = consec_fail + 1
     if state != "down" and fails < threshold:
         return {"state": "warn", "consec_fail": fails, "alerted_down": 0, "last_alert": 0,

@@ -62,6 +62,7 @@ TEXT = {
         "none": "Nothing in this period.",
         "ongoing": "ongoing",
         "footer": "Wirewave  ·  Lefkada  ·  confidential, for the client",
+        "client": "Client",
     },
     "el": {
         "kicker": "Wirewave Network Infrastructure Monitor",
@@ -98,6 +99,7 @@ TEXT = {
         "none": "Καμία εγγραφή σε αυτή την περίοδο.",
         "ongoing": "σε εξέλιξη",
         "footer": "Wirewave  ·  Λευκάδα  ·  εμπιστευτικό, για τον πελάτη",
+        "client": "Πελάτης",
     },
 }
 
@@ -150,6 +152,10 @@ def _table(headers, rows, styles, col_widths):
     return tbl
 
 
+def _xml(text):
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def build_pdf(data, logo_path=None):
     """data uses already-localised display strings for dates. Structural labels come from lang."""
     lang = data.get("lang") if data.get("lang") in TEXT else "en"
@@ -167,12 +173,26 @@ def build_pdf(data, logo_path=None):
     width = A4[0] - 28 * mm
     story = []
     banner = []
+    widths = []
     if logo_path and os.path.isfile(logo_path):
         img = Image(logo_path, 12 * mm, 12 * mm)
         img.hAlign = "LEFT"
         banner.append(img)
-    banner.append(Paragraph(t["kicker"] + "<br/>" + t["title"], styles["h1"]))
-    head = Table([banner], colWidths=[16 * mm, width - 16 * mm])
+        widths.append(16 * mm)
+    client_logo = data.get("client_logo") or ""
+    if client_logo and os.path.isfile(client_logo) and not str(client_logo).endswith(".svg"):
+        mark = Image(client_logo, 12 * mm, 12 * mm)
+        mark.hAlign = "LEFT"
+        banner.append(mark)
+        widths.append(16 * mm)
+    client_bits = []
+    if data.get("client_name"):
+        client_bits.append("<b>" + _xml(data.get("client_name")) + "</b>")
+    if data.get("client_subtitle"):
+        client_bits.append(_xml(data.get("client_subtitle")))
+    banner.append(Paragraph(t["kicker"] + "<br/>" + t["title"] + ("<br/>" + "<br/>".join(client_bits) if client_bits else ""), styles["h1"]))
+    widths.append(width - sum(widths))
+    head = Table([banner], colWidths=widths if widths else [width])
     head.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), NAVY),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),

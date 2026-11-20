@@ -7,7 +7,9 @@ import os
 import time
 from datetime import datetime
 
+import branding
 import camapi
+import extraops
 import healthmon
 import iotmon
 import mtbackup
@@ -244,6 +246,7 @@ def wan_probe(pm):
         avg = round(sum(samples) / len(samples), 2) if samples else None
         rows.append({"target": target, "loss": loss, "avg_ms": avg, "jitter": wirelogic.jitter_ms(samples)})
     state = wirelogic.judge_wan(rows, s.get("wan_loss_pct") or 0, s.get("wan_latency_ms") or 0)
+    rearm_wan = bool((pm._extra_get("alarm_rearm_wan") or {}).get("on"))
     with pm._db_lock, pm.db() as c:
         for row in rows:
             c.execute("INSERT INTO wan_samples(ts, target, loss, avg_ms, jitter, g) VALUES(?,?,?,?,?,0)",
@@ -281,6 +284,26 @@ def wan_probe(pm):
                 alerted = 0
         elif prev_state is None:
             alerted = 0
+        if rearm_wan and state == "down" and prev_state == "down":
+            how = pm.consider_notify(
+                s, None, "critical", f"[{s['site_name']}] Internet down",
+                "Internet is still down.",
+                pm.build_payload(s, "internet_down", None, None, "down", severity="critical",
+                                 message="Internet down", ts=now))
+            alerted = 1 if how in ("sent", "queued") else 0
+            pm.add_event("wan", "internet_down", "critical", None, "Internet down",
+                         "Internet is still down.", {"targets": rows}, ts=now, conn=c)
+        elif rearm_wan and state == "degraded" and prev_state == "degraded":
+            pm.add_event("wan", "internet_degraded", "warning", None, "Internet degraded",
+                         "Loss or latency is still above the threshold.", {"targets": rows}, ts=now, conn=c)
+            pm.consider_notify(
+                s, None, "warning", f"[{s['site_name']}] Internet degraded",
+                "Packet loss or latency is still above the threshold.",
+                pm.build_payload(s, "internet_degraded", None, None, severity="warning",
+                                 message="Internet degraded", ts=now))
+        if rearm_wan:
+            c.execute("INSERT OR REPLACE INTO extra_state(key, ts, data) VALUES('alarm_rearm_wan', ?, ?)",
+                      (now, json.dumps({"on": False})))
         detail = json.dumps(rows)
         c.execute("INSERT OR REPLACE INTO wan_status(id, state, since_ts, alerted, detail) VALUES(1,?,?,?,?)",
                   (state, since_ts, alerted, detail))
@@ -567,6 +590,11 @@ def apply_iot_result(pm, host, result, prev, now, blocked):
                            prev.get("held"), result.get("observation") or "unknown", now,
                            pm.fail_limit(host, s), pm.repeat_minutes(host, s), blocked)
     action = plan.get("action")
+    if prev.get("rearm") and action is None and plan.get("reach") == "offline" and not blocked:
+        action = "down"
+        plan["action"] = "down"
+        plan["alerted"] = 0
+        plan["last_alert"] = 0
     label = f"{host['name']} ({host['host']})"
     if action in ("down", "release"):
         msg = f"{label} is not answering its status API ({result.get('detail') or plan.get('diag')})."
@@ -620,7 +648,7 @@ def apply_iot_result(pm, host, result, prev, now, blocked):
         "last_alert": plan["last_alert"], "held": plan["held"], "diag": result.get("detail") or plan.get("diag"),
         "observation": result.get("observation"), "parsed": result.get("parsed"),
         "mode": result.get("mode"), "brand": result.get("brand"), "calls": result.get("calls") or [],
-        "notified": notified, "limits": prev.get("limits") or {}, "ts": now,
+        "notified": notified, "limits": prev.get("limits") or {}, "rearm": 0, "ts": now,
         "last_seen": now if result.get("observation") == "online" else prev.get("last_seen"),
     }
     with pm._db_lock, pm.db() as c:
@@ -790,6 +818,7 @@ def run_backup(pm, host, reason="schedule"):
         except OSError:
             previous = ""
     changed, diff = mtbackup.compare_exports(previous, text)
+    diff = extraops.mask_secrets(diff)
     with pm._db_lock, pm.db() as c:
         c.execute(
             "INSERT INTO backups(host_id, ts, ok, error, path, bin_path, sha, changed, diff, bytes) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -814,6 +843,10 @@ def run_backup(pm, host, reason="schedule"):
                            pm.build_payload(s, "device_alert", None, host, severity="warning", message=bin_err[:400]))
     pm.add_event("backup", "backup_ok", "info", host, "Config backup saved",
                  f"Saved via {via}." + (" Config changed." if changed else " No config change."))
+    if changed and diff:
+        pm.add_event("backup", "config_changed", "warning", host, "Config changed", diff[:800])
+        pm.consider_notify(s, host, "warning", f"[{s['site_name']}] Config changed: {host['name']}", diff[:800],
+                           pm.build_payload(s, "device_alert", None, host, severity="warning", message=diff[:800]))
     return {"via": via, "changed": changed, "path": path}
 
 
@@ -964,4 +997,7 @@ def report_context(pm, start, end, lang, site):
         "power": power,
         "alerts": counts,
         "version": getattr(pm, "VERSION", ""),
+        "client_name": s.get("site_name") or "",
+        "client_subtitle": s.get("client_subtitle") or "",
+        "client_logo": branding.find(getattr(pm, "DATA_DIR", None), s.get("client_logo") or "") or "",
     }

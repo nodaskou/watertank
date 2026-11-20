@@ -3,7 +3,9 @@
 `check_device` talks to a recorder. Tests pass a fake `fetch(path) -> (status, body)`
 so no camera is required. Passwords are not logged.
 """
+import extraops
 import hashlib
+from datetime import datetime
 import os
 import re
 import socket
@@ -395,6 +397,17 @@ def check_hikvision(fetch):
     result = _result("hikvision", ok_any, info, disks, channels, errors)
     if recording_note:
         result["recording_note"] = recording_note
+    status, body = fetch("/ISAPI/System/time")
+    if status == 200 and body:
+        device_time = extraops.parse_device_time(body)
+        if device_time is not None:
+            result["clock_drift_s"] = extraops.clock_drift_seconds(device_time, datetime.utcnow())
+    status, body = fetch("/ISAPI/Smart/VideoTamper/channels/1")
+    if status == 200 and body:
+        flag = extraops.parse_hik_tamper(body)
+        if flag is not None and channels:
+            channels[0]["tamper"] = flag
+            result["channels"] = channels
     return result
 
 

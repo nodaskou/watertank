@@ -1,6 +1,6 @@
 # Wirewave Network Infrastructure Monitor
 
-Version 3.1.0. The feature history is in [CHANGELOG.md](CHANGELOG.md).
+Version 3.2.0. The feature history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick install (Debian)
 
